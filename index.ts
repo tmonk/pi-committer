@@ -477,7 +477,8 @@ export function ensureGoalsExtension(ctx: ExtensionContext): boolean {
     warnedMissingGoals = true;
     ctx.ui.notify(
       "[pi-committer] trigger_mode 'on_goal' requires pi-goal extension. " +
-      "Install pi-goal or switch trigger_mode to 'manual' in .pi-committer.toml.",
+      "Install from https://pi.dev/packages/@capyup/pi-goal or switch " +
+      "trigger_mode to 'manual' in .pi-committer.toml.",
       "warning",
     );
   }

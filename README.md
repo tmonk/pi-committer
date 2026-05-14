@@ -47,7 +47,7 @@ Create `.pi-committer.toml` (or `.pi-committer.json`) in your project root. The 
 
 ```toml
 [committer]
-enabled           = false             # disabled by default; set to true to auto-commit
+enabled           = false             # off by default; set to true to enable
 trigger_mode      = "on_goal"       # on_goal | agent_sensible | after_tool | manual
 detailed_body     = true
 min_changes       = 1
@@ -66,14 +66,24 @@ exclude_patterns  = ["*.log", "node_modules/"]
 
 | Mode | Behaviour |
 |---|---|
-| `on_goal` (default) | Commits when a goal transitions to `completed` |
+| `on_goal` | Commits when a goal transitions to `completed` |
 | `agent_sensible` | Commits after every agent turn |
 | `after_tool` | Commits after each tool call |
-| `manual` | Never auto-commits; use `/commit` or `commit_changes` only |
+| `manual` (default) | Never auto-commits; use `/commit` or `commit_changes` only |
 
 ## Usage
 
+First, enable auto-commit in your project config:
+
+```toml
+# .pi-committer.toml
+[committer]
+enabled = true
+```
+
 ### Auto-commit on goal completion
+
+With `enabled = true` and `trigger_mode = "on_goal"`:
 
 ```
 /goal "Add user authentication"

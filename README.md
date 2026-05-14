@@ -17,15 +17,25 @@ Creates commits as you work. By default, commits when a goal completes.
 
 ## Quick start
 
-```bash
-git clone <this-repo> ~/projects/pi-committer
-cd ~/projects/pi-committer && npm install
+### Install from npm (recommended)
 
-# Load it in a session
-pi -e ~/projects/pi-committer/index.ts
+```bash
+pi install npm:pi-committer
 ```
 
-### Global auto-discovery
+This installs the package globally. Pi auto-loads it on startup.
+
+### Install from source
+
+```bash
+git clone https://github.com/tmonk/pi-committer.git
+cd pi-committer && npm install
+
+# Load it in a session
+pi -e ./index.ts
+```
+
+### Global auto-discovery (source install)
 
 ```bash
 ln -s ~/projects/pi-committer ~/.pi/agent/extensions/pi-committer

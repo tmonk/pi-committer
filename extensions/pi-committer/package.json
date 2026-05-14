@@ -1,0 +1,25 @@
+{
+  "name": "pi-committer",
+  "version": "2.0.0",
+  "description": "Conventional commit automation for the pi coding agent — auto-commits on goal completion with intelligent, subagent-generated messages",
+  "private": true,
+  "license": "MIT",
+  "author": "pi-committer contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/user/pi-committer.git"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "git",
+    "conventional-commits",
+    "automation"
+  ],
+  "dependencies": {
+    "smol-toml": "^1.3.0"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

@@ -83,13 +83,15 @@ enabled = true
 
 ### Auto-commit on goal completion
 
-With `enabled = true` and `trigger_mode = "on_goal"`:
+With `enabled = true` and `trigger_mode = "on_goal"` (default), the extension hooks into pi-goal's lifecycle. When a goal managed by pi-goal transitions to **completed** status, pi-committer automatically stages and commits the changes:
 
 ```
-/goal "Add user authentication"
-> agent implements auth logic
-/goal complete   ← auto-commits with staged grouping
+/goals "Add user authentication"   ← start a goal via /goals
+> agent implements auth logic       ← work happens
+> pi-goal marks the goal complete   ← pi-committer auto-commits
 ```
+
+The commit is triggered by the goal state transition — no manual `/commit` needed.
 
 ### Manual commit
 

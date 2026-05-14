@@ -117,11 +117,7 @@ The subagent decides the grouping from the diff content, not from file extension
 
 ## Multi-repo
 
-If the agent edits files in multiple git repositories during a session, `commit_changes` finds and commits in all of them. Detection works via:
-
-1. Subdirectory scanning from the working directory.
-2. Sibling repo scanning from the common parent directory.
-3. Session tool-call history (repos referenced by `write`, `read`, `bash` tools).
+If the agent edits files in multiple git repositories during a session, `commit_changes` finds and commits in all of them. Detection works via session tool-call history — repos where the agent created or modified files using `write` or `edit` tools are detected and added on top of the primary working directory.
 
 ## Architecture
 

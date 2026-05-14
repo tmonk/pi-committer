@@ -3,6 +3,7 @@ import {
   it,
   before,
   after,
+  afterEach,
   mock,
 } from "node:test";
 import assert from "node:assert";
@@ -44,6 +45,8 @@ import {
   findDirtyRepos,
   checkGoalEvents,
   hasGoalsExtension,
+  ensureGoalsExtension,
+  _resetWarnedMissingGoals,
   _clearGoalStatuses,
   _resetGoalScanCount,
   _restoreGoalScanCount,
@@ -591,6 +594,88 @@ describe("hasGoalsExtension", () => {
   it("returns false when no pi-goal-state entries", () => {
     const ctx = mockCtx({ sessionManager: { getEntries: () => [] } });
     assert.strictEqual(hasGoalsExtension(ctx), false);
+  });
+});
+
+// ===========================================================================
+// ensureGoalsExtension
+// ===========================================================================
+
+describe("ensureGoalsExtension", () => {
+  afterEach(() => {
+    _resetWarnedMissingGoals();
+  });
+
+  it("returns true when pi-goal is present (no warning)", () => {
+    let notified = false;
+    const ctx = mockCtx({
+      sessionManager: {
+        getEntries: () => [
+          { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1" } } },
+        ],
+      },
+      ui: {
+        notify: (_msg: string, _level: string) => { notified = true; },
+      },
+    });
+    assert.strictEqual(ensureGoalsExtension(ctx), true);
+    assert.strictEqual(notified, false, "should not warn when pi-goal is present");
+  });
+
+  it("returns false and warns when pi-goal is missing (first call)", () => {
+    let notifyMsg = "";
+    const ctx = mockCtx({
+      sessionManager: {
+        getEntries: () => [],
+      },
+      ui: {
+        notify: (msg: string, _level: string) => { notifyMsg = msg; },
+      },
+    });
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.ok(notifyMsg.includes("pi-goal"), "warning should mention pi-goal");
+  });
+
+  it("warns only once per session (subsequent calls silent)", () => {
+    let notifyCount = 0;
+    const ctx = mockCtx({
+      sessionManager: {
+        getEntries: () => [],
+      },
+      ui: {
+        notify: (_msg: string, _level: string) => { notifyCount++; },
+      },
+    });
+
+    // First call warns
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.strictEqual(notifyCount, 1);
+
+    // Subsequent calls should not warn
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.strictEqual(notifyCount, 1, "should warn only once");
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.strictEqual(notifyCount, 1, "should warn only once");
+  });
+
+  it("resets warning flag after _resetWarnedMissingGoals", () => {
+    let notifyCount = 0;
+    const ctx = mockCtx({
+      sessionManager: {
+        getEntries: () => [],
+      },
+      ui: {
+        notify: (_msg: string, _level: string) => { notifyCount++; },
+      },
+    });
+
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.strictEqual(notifyCount, 1);
+
+    _resetWarnedMissingGoals();
+
+    assert.strictEqual(ensureGoalsExtension(ctx), false);
+    assert.strictEqual(notifyCount, 2, "should warn again after reset");
   });
 });
 

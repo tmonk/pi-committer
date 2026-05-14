@@ -34,6 +34,11 @@ export function setConfig(c: CommitterConfig): void {
 let lastTurnEntryCount = 0;
 let committedThisTurn = false;
 
+/** Once-per-session flag: warn if on_goal mode is set without pi-goal installed. */
+let warnedMissingGoals = false;
+/** Exported for unit test access. */
+export function _resetWarnedMissingGoals(): void { warnedMissingGoals = false; }
+
 /** Track last known goal status per goal ID for detecting completion transitions. */
 const goalStatuses = new Map<string, string>();
 let lastGoalScanEntryCount = 0;
@@ -459,6 +464,24 @@ export function hasGoalsExtension(ctx: ExtensionContext): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Check if pi-goal is available. Warns once per session when goals
+ * extension is missing but the trigger mode requires it.
+ * Returns true when pi-goal is present.
+ */
+export function ensureGoalsExtension(ctx: ExtensionContext): boolean {
+  if (hasGoalsExtension(ctx)) return true;
+  if (!warnedMissingGoals) {
+    warnedMissingGoals = true;
+    ctx.ui.notify(
+      "[pi-committer] trigger_mode 'on_goal' requires pi-goal extension. " +
+      "Install pi-goal or switch trigger_mode to 'manual' in .pi-committer.toml.",
+      "warning",
+    );
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1048,7 @@ export default function (pi: ExtensionAPI) {
     lastGoalScanEntryCount = 0;
     goalStatuses.clear();
     committedThisTurn = false;
+    warnedMissingGoals = false;
     selectedSubagentModel = undefined;
 
     // Reconstruct previously selected commit-message model from session entries
@@ -1073,8 +1097,8 @@ export default function (pi: ExtensionAPI) {
       await commitAllRepos(ctx.cwd, ctx);
     }
 
-    if (hasGoalsExtension(ctx) && checkGoalEvents(ctx)) {
-      if (shouldCommitOnTrigger(config.triggerMode, "goal_event")) {
+    if (shouldCommitOnTrigger(config.triggerMode, "goal_event")) {
+      if (ensureGoalsExtension(ctx) && checkGoalEvents(ctx)) {
         await commitAllRepos(ctx.cwd, ctx);
       }
     }

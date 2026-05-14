@@ -1,6 +1,6 @@
 {
   "name": "pi-committer",
-  "version": "2.0.0",
+  "version": "0.1.0",
   "description": "Conventional commit automation for the pi coding agent — auto-commits on goal completion with intelligent, subagent-generated messages",
   "type": "module",
   "license": "MIT",

@@ -2,7 +2,6 @@
   "name": "pi-committer",
   "version": "2.0.0",
   "description": "Conventional commit automation for the pi coding agent — auto-commits on goal completion with intelligent, subagent-generated messages",
-  "private": true,
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -13,11 +12,12 @@
   "author": "pi-committer contributors",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/user/pi-committer.git"
+    "url": "git+https://github.com/tmonk/pi-committer.git"
   },
   "keywords": [
     "pi",
     "pi-extension",
+    "pi-package",
     "git",
     "conventional-commits",
     "automation"
@@ -28,7 +28,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://github.com/tmonk/pi-committer/raw/main/screenshot.png"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0"

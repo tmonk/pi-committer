@@ -6,7 +6,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { loadConfig, type CommitterConfig } from "./config.ts";
@@ -16,6 +16,10 @@ import { loadConfig, type CommitterConfig } from "./config.ts";
 // ---------------------------------------------------------------------------
 
 export { loadConfig, type CommitterConfig } from "./config.ts";
+
+// Tool parameter schemas — exported for isToolCallEventType support
+const commitChangesSchema = Type.Object({});
+export type CommitChangesInput = Static<typeof commitChangesSchema>;
 
 let config: CommitterConfig;
 
@@ -1023,6 +1027,20 @@ export default function (pi: ExtensionAPI) {
     committedThisTurn = false;
     selectedSubagentModel = undefined;
 
+    // Reconstruct previously selected commit-message model from session entries
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type === "custom" && entry.customType === "pi-committer-model") {
+        const data = (entry as any).data ?? {};
+        if (data.provider && data.id) {
+          const model = ctx.modelRegistry.find(data.provider, data.id);
+          if (model) {
+            selectedSubagentModel = model;
+          }
+        }
+        break; // latest entry wins
+      }
+    }
+
     if (config.enabled) {
       ctx.ui.notify(
         `[pi-committer] Active (mode: ${config.triggerMode})${
@@ -1031,6 +1049,17 @@ export default function (pi: ExtensionAPI) {
         "info",
       );
     }
+  });
+
+  // -----------------------------------------------------------------------
+  // Model select — update status bar
+  // -----------------------------------------------------------------------
+  pi.on("model_select", async (event, ctx) => {
+    if (!config.enabled) return;
+    const modelLabel = selectedSubagentModel
+      ? `${selectedSubagentModel.provider}/${selectedSubagentModel.id}`
+      : `${event.model.provider}/${event.model.id} (default)`;
+    ctx.ui.setStatus("pi-committer", `commit model: ${modelLabel}`);
   });
 
   // -----------------------------------------------------------------------
@@ -1081,8 +1110,14 @@ export default function (pi: ExtensionAPI) {
       "Use commit_changes when the user asks to commit, save progress, or checkpoint work.",
       "Call commit_changes when completing significant work, before switching tasks, or on user request.",
     ],
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+    parameters: commitChangesSchema,
+    async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+      if (signal?.aborted) {
+        return {
+          content: [{ type: "text" as const, text: "Commit cancelled." }],
+          details: { commitCount: 0, cancelled: true },
+        };
+      }
       const count = await commitAllRepos(ctx.cwd, ctx, true);
       if (count > 0) {
         return {
@@ -1149,6 +1184,7 @@ export default function (pi: ExtensionAPI) {
       if (selected === "(default — use current agent model)") {
         selectedSubagentModel = undefined;
         config.subagentModel = undefined;
+        pi.appendEntry("pi-committer-model", null);
         ctx.ui.notify(
           "[pi-committer] Using default agent model for commit messages",
           "info",
@@ -1161,6 +1197,10 @@ export default function (pi: ExtensionAPI) {
       if (idx < 1) return;
       const chosenModel = models[idx - 1];
       selectedSubagentModel = chosenModel;
+      pi.appendEntry("pi-committer-model", {
+        provider: chosenModel.provider,
+        id: chosenModel.id,
+      });
 
       ctx.ui.notify(
         `[pi-committer] Commit messages will use ${chosenModel.provider}/${chosenModel.id}`,
@@ -1183,5 +1223,13 @@ export default function (pi: ExtensionAPI) {
         "info",
       );
     },
+  });
+
+  // -----------------------------------------------------------------------
+  // Session shutdown — clean up per-session state
+  // -----------------------------------------------------------------------
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    // Module-level state is naturally reset on the next session_start.
+    // No external resources (timers, connections, file watchers) to clean up.
   });
 }

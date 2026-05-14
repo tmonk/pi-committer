@@ -3,7 +3,13 @@
   "version": "2.0.0",
   "description": "Conventional commit automation for the pi coding agent — auto-commits on goal completion with intelligent, subagent-generated messages",
   "private": true,
+  "type": "module",
   "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types --test ../../tests/unit.test.ts",
+    "test:e2e": "PI_COMMITTER_E2E=1 node --experimental-strip-types --test ../../tests/e2e.test.ts",
+    "test:all": "node --experimental-strip-types --test ../../tests/*.test.ts"
+  },
   "author": "pi-committer contributors",
   "repository": {
     "type": "git",

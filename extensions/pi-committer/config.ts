@@ -83,7 +83,19 @@ function parseConfigFile(filePath: string): Record<string, unknown> {
   const content = fs.readFileSync(filePath, "utf-8").trim();
 
   if (filePath.endsWith(".json")) {
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    // Flatten committer section like TOML path does
+    const raw: Record<string, unknown> = {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if (obj.committer && typeof obj.committer === "object") {
+        const committer = obj.committer as Record<string, unknown>;
+        for (const [key, value] of Object.entries(committer)) {
+          raw[key] = value;
+        }
+      }
+    }
+    return raw;
   }
 
   // TOML parsing via smol-toml

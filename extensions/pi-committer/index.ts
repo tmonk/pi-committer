@@ -15,7 +15,18 @@ import { loadConfig, type CommitterConfig } from "./config.ts";
 // State
 // ---------------------------------------------------------------------------
 
+export { loadConfig, type CommitterConfig } from "./config.ts";
+
 let config: CommitterConfig;
+
+/** Exported for unit test access. */
+export function getConfig(): CommitterConfig {
+  return config;
+}
+/** Exported for unit test access. */
+export function setConfig(c: CommitterConfig): void {
+  config = c;
+}
 let lastTurnEntryCount = 0;
 let committedThisTurn = false;
 
@@ -23,14 +34,62 @@ let committedThisTurn = false;
 const goalStatuses = new Map<string, string>();
 let lastGoalScanEntryCount = 0;
 
+let _prevLastGoalScanEntryCount: number | undefined;
+/** Clear stored goal statuses (for test setup). */
+export function _clearGoalStatuses(): void {
+  goalStatuses.clear();
+}
+/** Called by setUp in tests to snapshot then reset the scan offset. */
+export function _resetGoalScanCount(): number {
+  _prevLastGoalScanEntryCount = lastGoalScanEntryCount;
+  lastGoalScanEntryCount = 0;
+  return _prevLastGoalScanEntryCount ?? 0;
+}
+/** Restore the scan offset after a test that called _resetGoalScanCount. */
+export function _restoreGoalScanCount(saved: number): void {
+  lastGoalScanEntryCount = saved;
+}
+
 /** User-selected model override for the commit-message subagent (set via /commit-model). */
 let selectedSubagentModel: Model<any> | undefined;
+
+/** Exported for unit test access. Returns current selected model (if any). */
+export function getSelectedSubagentModel(): Model<any> | undefined {
+  return selectedSubagentModel;
+}
+/** Exported for unit test access. */
+export function setSelectedSubagentModel(m: Model<any> | undefined): void {
+  selectedSubagentModel = m;
+}
+
+// ---------------------------------------------------------------------------
+// Mock injection for unit tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Override for createAgentSession used in unit tests to avoid real API calls.
+ * When set, all functions that call createAgentSession will use this mock instead.
+ * Reset to undefined to restore real behaviour.
+ */
+export let __createAgentSessionMock: typeof createAgentSession | undefined;
+
+/** Set a mock for createAgentSession (replaces the real one in test-scoped calls). */
+export function __setCreateAgentSessionMock(
+  mock: typeof createAgentSession | undefined,
+): void {
+  __createAgentSessionMock = mock;
+}
+
+/** Resolve the current createAgentSession — mock if set, real otherwise. */
+function resolveCreateAgentSession(): typeof createAgentSession {
+  return __createAgentSessionMock ?? createAgentSession;
+}
 
 // ---------------------------------------------------------------------------
 // Git helpers
 // ---------------------------------------------------------------------------
 
-function isGitRepo(dir: string): boolean {
+export function isGitRepo(dir: string): boolean {
   try {
     execSync("git rev-parse --git-dir", {
       cwd: dir,
@@ -43,7 +102,7 @@ function isGitRepo(dir: string): boolean {
   }
 }
 
-function getHeadHash(dir: string): string {
+export function getHeadHash(dir: string): string {
   return execSync("git rev-parse HEAD", {
     cwd: dir,
     encoding: "utf-8",
@@ -51,7 +110,7 @@ function getHeadHash(dir: string): string {
   }).trim();
 }
 
-function getBranch(dir: string): string {
+export function getBranch(dir: string): string {
   return execSync("git rev-parse --abbrev-ref HEAD", {
     cwd: dir,
     encoding: "utf-8",
@@ -60,7 +119,7 @@ function getBranch(dir: string): string {
 }
 
 /** Stage all changes and return the diff. */
-function stageAll(dir: string): { diffStat: string; diffContent: string } {
+export function stageAll(dir: string): { diffStat: string; diffContent: string } {
   execSync("git add -A", { cwd: dir, stdio: "ignore" });
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
@@ -77,7 +136,7 @@ function stageAll(dir: string): { diffStat: string; diffContent: string } {
 }
 
 /** Check for any changes (staged or unstaged). */
-function hasAnyChanges(dir: string): boolean {
+export function hasAnyChanges(dir: string): boolean {
   const status = execSync("git status --porcelain", {
     cwd: dir,
     encoding: "utf-8",
@@ -87,7 +146,7 @@ function hasAnyChanges(dir: string): boolean {
 }
 
 /** Extract changed file list from diff stat. */
-function getChangedFiles(diffStat: string): string[] {
+export function getChangedFiles(diffStat: string): string[] {
   return diffStat
     .split("\n")
     .map((l) => l.trim())
@@ -103,7 +162,7 @@ function getChangedFiles(diffStat: string): string[] {
  * Unstage files that match any exclude pattern.
  * Returns the list of files that were NOT excluded.
  */
-function unstageExcludedFiles(
+export function unstageExcludedFiles(
   dir: string,
   files: string[],
   excludePatterns: string[],
@@ -140,7 +199,7 @@ function unstageExcludedFiles(
 }
 
 /** Reset all staged files (leave working tree untouched). */
-function unstageAll(dir: string): void {
+export function unstageAll(dir: string): void {
   execSync("git reset HEAD -- .", { cwd: dir, stdio: "ignore" });
 }
 
@@ -168,7 +227,7 @@ interface CommitGroup {
  * --- COMMIT GROUP 2 ---
  * ...
  */
-function parseCommitGroups(output: string, allFiles: string[]): CommitGroup[] {
+export function parseCommitGroups(output: string, allFiles: string[]): CommitGroup[] {
   const groups: CommitGroup[] = [];
 
   // Split on the commit group delimiter
@@ -211,7 +270,7 @@ function parseCommitGroups(output: string, allFiles: string[]): CommitGroup[] {
  * If the subagent didn't return parseable commit groups, fall back to
  * treating all remaining files as one group with a generated message.
  */
-function singleGroupFallback(
+export function singleGroupFallback(
   ctx: ExtensionContext,
   diffStat: string,
   diffContent: string,
@@ -228,7 +287,7 @@ function singleGroupFallback(
  * The subagent decides the grouping based on semantic understanding of the diff,
  * rather than hardcoded file-category rules.
  */
-async function generateStagedCommitGroups(
+export async function generateStagedCommitGroups(
   ctx: ExtensionContext,
   diffStat: string,
   diffContent: string,
@@ -278,7 +337,8 @@ async function generateStagedCommitGroups(
 
   try {
     const model = resolveSubagentModel(ctx);
-    const result = await createAgentSession({
+    const cas = resolveCreateAgentSession();
+    const result = await cas({
       cwd: repoDir || ctx.cwd,
       model,
       modelRegistry: ctx.modelRegistry,
@@ -347,7 +407,7 @@ async function generateStagedCommitGroups(
  * Returns true only when a goal transitions to "completed" status.
  * Does NOT throw — returns false on any error, so the integration is non-blocking.
  */
-function checkGoalEvents(ctx: ExtensionContext): boolean {
+export function checkGoalEvents(ctx: ExtensionContext): boolean {
   try {
     const entries = ctx.sessionManager.getEntries();
     const entryCount = entries.length;
@@ -386,7 +446,7 @@ function checkGoalEvents(ctx: ExtensionContext): boolean {
   }
 }
 
-function hasGoalsExtension(ctx: ExtensionContext): boolean {
+export function hasGoalsExtension(ctx: ExtensionContext): boolean {
   try {
     const entries = ctx.sessionManager.getEntries();
     return entries.some(
@@ -424,7 +484,7 @@ function makeMessageResourceLoader(): ResourceLoader {
  * Select the model for the commit-message subagent.
  * Priority: 1) user-selected via /commit-model  2) config subagent_model  3) current ctx.model
  */
-function resolveSubagentModel(ctx: ExtensionContext): Model<any> | undefined {
+export function resolveSubagentModel(ctx: ExtensionContext): Model<any> | undefined {
   if (selectedSubagentModel) return selectedSubagentModel;
 
   const cfgModel = config.subagentModel;
@@ -451,7 +511,7 @@ function resolveSubagentModel(ctx: ExtensionContext): Model<any> | undefined {
  * Uses createAgentSession with no tools — the diff is passed inline.
  * Falls back to deterministic generation if the subagent fails.
  */
-async function generateCommitMessageViaSubagent(
+export async function generateCommitMessageViaSubagent(
   ctx: ExtensionContext,
   diffStat: string,
   diffContent: string,
@@ -486,7 +546,8 @@ async function generateCommitMessageViaSubagent(
 
   try {
     const model = resolveSubagentModel(ctx);
-    const result = await createAgentSession({
+    const cas = resolveCreateAgentSession();
+    const result = await cas({
       cwd: repoDir || ctx.cwd,
       model,
       modelRegistry: ctx.modelRegistry,
@@ -523,7 +584,7 @@ async function generateCommitMessageViaSubagent(
   return deterministicCommitMessage(diffStat, diffContent);
 }
 
-function deterministicCommitMessage(
+export function deterministicCommitMessage(
   diffStat: string,
   diffContent: string,
 ): string {
@@ -583,7 +644,7 @@ function deterministicCommitMessage(
 // Commit trigger logic
 // ---------------------------------------------------------------------------
 
-function shouldCommitOnTrigger(
+export function shouldCommitOnTrigger(
   mode: string,
   event: "turn_end" | "tool_result" | "goal_event",
 ): boolean {
@@ -609,7 +670,7 @@ function shouldCommitOnTrigger(
  * Commit all currently staged files as a single commit.
  * Uses the subagent to generate the commit message.
  */
-async function commitStaged(
+export async function commitStaged(
   dir: string,
   ctx: ExtensionContext,
   files: string[],
@@ -672,7 +733,7 @@ async function commitStaged(
  *
  * Returns the number of successful commits, or 0 on no-op.
  */
-async function tryCommit(
+export async function tryCommit(
   dir: string,
   ctx: ExtensionContext,
   force = false,
@@ -794,7 +855,7 @@ async function tryCommit(
  * Resolve a path to its git repository root.
  * Returns undefined if the path is not inside a git repo.
  */
-function gitRoot(dir: string): string | undefined {
+export function gitRoot(dir: string): string | undefined {
   try {
     return execSync("git rev-parse --show-toplevel", {
       cwd: dir,
@@ -810,7 +871,7 @@ function gitRoot(dir: string): string | undefined {
  * Scan recent session entries for tool calls that operated in other directories.
  * Returns unique git repo roots that are different from the primary repo.
  */
-function findOtherReposFromSession(
+export function findOtherReposFromSession(
   ctx: ExtensionContext,
   primaryRoot: string,
 ): string[] {
@@ -836,14 +897,8 @@ function findOtherReposFromSession(
         if (part.type !== "toolCall") continue;
         const args = part.arguments || {};
 
-        // Bash tool: look for cwd in arguments
-        if (part.name === "bash" && args.cwd) {
-          const root = gitRoot(args.cwd);
-          if (root && root !== primaryRoot) repoRoots.add(root);
-        }
-
-        // write/read/edit: look for path in arguments, resolve its dir
-        if (["write", "read", "edit"].includes(part.name) && args.path) {
+        // write/edit: look for path in arguments, resolve its dir
+        if (["write", "edit"].includes(part.name) && args.path) {
           const dir = path.dirname(args.path);
           const root = gitRoot(dir);
           if (root && root !== primaryRoot) repoRoots.add(root);
@@ -858,42 +913,12 @@ function findOtherReposFromSession(
 }
 
 /**
- * Find all git repos by scanning from a base directory with find.
- * Returns unique repo roots (parent of .git).
+ * Find all dirty git repositories.
+ * Detection uses only session tool-call history: repos where the agent
+ * created or modified files via write or edit tools are detected and
+ * added on top of the primary working directory.
  */
-function findRepoRoots(baseDir: string): string[] {
-  try {
-    const gitDirs = execSync(
-      `find "${baseDir}" -name .git -maxdepth 3 -type d 2>/dev/null`,
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
-    )
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((d) => path.dirname(d));
-
-    // Filter out nested repos (repos inside other repos)
-    const result: string[] = [];
-    for (const repoDir of gitDirs) {
-      const isNested = gitDirs.some(
-        (other) => other !== repoDir && repoDir.startsWith(other + "/"),
-      );
-      if (!isNested) result.push(repoDir);
-    }
-    return result;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Find all dirty git repositories by scanning multiple sources:
- * 1. The primary (ctx.cwd) repo
- * 2. Subdirectory repos via find from ctx.cwd
- * 3. Sibling repos via find from the parent of the primary repo root
- * 4. Other repos detected from session tool call directories
- */
-function findDirtyRepos(ctx: ExtensionContext): string[] {
+export function findDirtyRepos(ctx: ExtensionContext): string[] {
   const repos = new Set<string>();
   const cwd = ctx.cwd;
   const primaryRoot = gitRoot(cwd);
@@ -903,24 +928,9 @@ function findDirtyRepos(ctx: ExtensionContext): string[] {
     repos.add(primaryRoot);
   }
 
-  try {
-    // 1. Subdirectory repos from cwd
-    for (const r of findRepoRoots(cwd)) repos.add(r);
-
-    // 2. Sibling repos from the parent of the primary repo root
-    if (primaryRoot) {
-      const parentDir = path.dirname(primaryRoot);
-      if (parentDir && parentDir !== primaryRoot && !parentDir.endsWith("/")) {
-        for (const r of findRepoRoots(parentDir)) repos.add(r);
-      }
-    }
-
-    // 3. Session tool call detection for repos outside the cwd tree
-    const sessionRepos = findOtherReposFromSession(ctx, primaryRoot ?? cwd);
-    for (const r of sessionRepos) repos.add(r);
-  } catch {
-    // Just use primary
-  }
+  // Session tool call detection for repos outside the cwd tree
+  const sessionRepos = findOtherReposFromSession(ctx, primaryRoot ?? cwd);
+  for (const r of sessionRepos) repos.add(r);
 
   // Sort: primary first, then alphabetically
   const sorted = [...repos].sort();
@@ -938,7 +948,7 @@ function findDirtyRepos(ctx: ExtensionContext): string[] {
 /**
  * Check if a repo has any uncommitted changes.
  */
-function isDirtyRepo(repoDir: string): boolean {
+export function isDirtyRepo(repoDir: string): boolean {
   try {
     const status = execSync("git status --porcelain", {
       cwd: repoDir,
@@ -955,7 +965,7 @@ function isDirtyRepo(repoDir: string): boolean {
  * Commit changes across all dirty git repos.
  * Returns total commits created across all repos.
  */
-async function commitAllRepos(
+export async function commitAllRepos(
   dir: string,
   ctx: ExtensionContext,
   force = false,

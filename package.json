@@ -6,9 +6,9 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --experimental-strip-types --test ../../tests/unit.test.ts",
-    "test:e2e": "PI_COMMITTER_E2E=1 node --experimental-strip-types --test ../../tests/e2e.test.ts",
-    "test:all": "node --experimental-strip-types --test ../../tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/unit.test.ts",
+    "test:e2e": "PI_COMMITTER_E2E=1 node --experimental-strip-types --test tests/e2e.test.ts",
+    "test:all": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "author": "pi-committer contributors",
   "repository": {
@@ -26,6 +26,11 @@
     "smol-toml": "^1.3.0"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0"
   }
 }

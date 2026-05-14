@@ -51,7 +51,7 @@ import {
   // State
   getSelectedSubagentModel,
   setSelectedSubagentModel,
-} from "../extensions/pi-committer/index.ts";
+} from "../index.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers

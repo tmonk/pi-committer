@@ -108,7 +108,7 @@ describe("config loading", () => {
 
   it("loads default config when no file exists", () => {
     const cfg = loadConfig(dir);
-    assert.strictEqual(cfg.enabled, true);
+    assert.strictEqual(cfg.enabled, false);
     assert.strictEqual(cfg.triggerMode, "on_goal");
     assert.strictEqual(cfg.stagedCommits, true);
     assert.deepStrictEqual(cfg.excludePatterns, []);
@@ -148,7 +148,7 @@ describe("config loading", () => {
   it("falls back to defaults on invalid TOML", () => {
     writeFileSync(path.join(dir, ".pi-committer.toml"), "[[[invalid toml", "utf-8");
     const cfg = loadConfig(dir);
-    assert.strictEqual(cfg.enabled, true);
+    assert.strictEqual(cfg.enabled, false);
     assert.strictEqual(cfg.triggerMode, "on_goal");
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });

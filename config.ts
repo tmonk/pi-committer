@@ -26,7 +26,7 @@ export interface CommitterConfig {
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
-  enabled: true,
+  enabled: false,
   triggerMode: "on_goal",
   detailedBody: true,
   minChanges: 1,

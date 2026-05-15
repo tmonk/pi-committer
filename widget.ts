@@ -13,7 +13,7 @@ export interface SubagentProgress {
   recentOutput: string[];
 }
 
-export type CommitterPhase = "idle" | "analyzing" | "committing" | "done";
+export type CommitterPhase = "idle" | "analyzing" | "committing" | "done" | "cancelled";
 
 export interface CommitterProgress {
   phase: CommitterPhase;
@@ -130,6 +130,11 @@ export function renderCommitterWidgetLines(
       color = "success";
       const commitWord = progress.totalCommits === 1 ? "commit" : "commits";
       label = `complete  ${progress.totalCommits ?? 0} ${commitWord}`;
+      break;
+    case "cancelled":
+      icon = theme.fg("warning", "⊘");
+      color = "warning";
+      label = "cancelled";
       break;
     default:
       icon = theme.fg("accent", spinnerFrame());
@@ -262,6 +267,48 @@ export function renderCommitterWidgetLines(
           safeWidth,
           true,
           `${theme.fg("warning", "Esc to cancel")}${theme.fg("dim", " — cancel commit operation")}`,
+        ),
+      );
+    }
+  }
+
+  if (progress.phase === "cancelled") {
+    // Cancelled: show error and short log if any
+    if (progress.commitLog.length > 0) {
+      for (const [index, entry] of progress.commitLog.entries()) {
+        const isLast = index === progress.commitLog.length - 1;
+        const icon = entry.success
+          ? theme.fg("success", "✓")
+          : theme.fg("error", "✗");
+        const hash = theme.fg("dim", entry.hash.slice(0, 7));
+        const summary = entry.message.split("\n")[0];
+        lines.push(
+          branchLine(
+            theme,
+            safeWidth,
+            false,
+            `${icon} ${hash} ${theme.fg("text", truncateText(summary, Math.max(10, safeWidth - 20)))}`,
+          ),
+        );
+      }
+    }
+
+    if (progress.error) {
+      lines.push(
+        branchLine(
+          theme,
+          safeWidth,
+          true,
+          `${theme.fg("warning", "⊘")} ${theme.fg("warning", truncateText(progress.error, Math.max(10, safeWidth - 8)))}`,
+        ),
+      );
+    } else {
+      lines.push(
+        branchLine(
+          theme,
+          safeWidth,
+          true,
+          theme.fg("warning", "Operation cancelled."),
         ),
       );
     }

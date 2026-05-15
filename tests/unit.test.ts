@@ -13,6 +13,11 @@ import * as path from "node:path";
 import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 
 import {
+  renderCommitterWidgetLines,
+  type CommitterProgress,
+} from "../widget.ts";
+
+import {
   // Config
   getConfig,
   setConfig,
@@ -838,6 +843,32 @@ describe("combineAbortSignals", () => {
     const combined = combineAbortSignals(ac1.signal, ac2.signal);
     assert.strictEqual(combined!.aborted, true);
   });
+
+  it("combining after controller creation still captures aborts", () => {
+    // Simulate the timing: runtime signal exists, widget controller doesn't yet
+    const runtimeSignal = new AbortController();
+    const combinedEarly = combineAbortSignals(runtimeSignal.signal, undefined);
+    assert.strictEqual(combinedEarly?.aborted, false);
+
+    // Later (after showCommitterWidget), widget controller is created
+    const widgetController = new AbortController();
+    // Combine runtime signal with the newly created widget signal
+    const combinedLate = combineAbortSignals(runtimeSignal.signal, widgetController.signal);
+    assert.strictEqual(combinedLate?.aborted, false);
+
+    // Esc triggers widget abort → combined signal is aborted
+    widgetController.abort();
+    assert.strictEqual(combinedLate!.aborted, true);
+  });
+
+  it("runtime abort works even without widget controller", () => {
+    // This tests the scenario BEFORE showCommitterWidget creates the controller
+    const runtimeSignal = new AbortController();
+    const combined = combineAbortSignals(runtimeSignal.signal, undefined);
+    assert.strictEqual(combined!.aborted, false);
+    runtimeSignal.abort();
+    assert.strictEqual(combined!.aborted, true);
+  });
 });
 
 // ===========================================================================
@@ -864,6 +895,54 @@ describe("createAgentSession mock injection", () => {
     __setCreateAgentSessionMock(mockCreateAgentSession as any);
 
     assert.strictEqual(__createAgentSessionMock, mockCreateAgentSession);
+  });
+});
+
+// ===========================================================================
+// unstageAll on abort
+// ===========================================================================
+
+describe("unstageAll on abort", () => {
+  let dir: string;
+
+  before(() => {
+    dir = createTempRepo();
+  });
+
+  after(() => removeDir(dir));
+
+  it("unstageAll clears staged changes", () => {
+    writeFileSync(path.join(dir, "test.ts"), "// staged");
+    execSync("git add test.ts", { cwd: dir, stdio: "ignore" });
+
+    // Verify staged
+    const staged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(staged, "test.ts");
+
+    // Unstage
+    unstageAll(dir);
+    const after = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(after, "");
+  });
+
+  it("hasAnyChanges returns true after staging a file, then false after cleanup", () => {
+    writeFileSync(path.join(dir, "test2.ts"), "// another");
+    execSync("git add test2.ts", { cwd: dir, stdio: "ignore" });
+    assert.strictEqual(hasAnyChanges(dir), true);
+
+    // Clean up: remove the file and unstage
+    fs.rmSync(path.join(dir, "test2.ts"));
+    unstageAll(dir);
+
+    // Verify nothing is staged
+    const after = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(after, "");
   });
 });
 

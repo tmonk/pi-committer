@@ -54,6 +54,11 @@ min_changes       = 1
 staged_commits    = true
 exclude_patterns  = ["*.log", "node_modules/"]
 
+# When true (default) and trigger_mode is "on_goal", the commit_changes tool
+# will skip when pi-goal has an active goal and defer to the automatic
+# commit-after-audit flow. Prevents premature commits before audit passes.
+# defer_to_goal_audit = true
+
 # Optional: override the model used by the commit-message subagent
 # subagent_model = "openai/gpt-4o-mini"
 

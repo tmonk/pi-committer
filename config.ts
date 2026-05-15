@@ -23,6 +23,13 @@ export interface CommitterConfig {
    * When false, commit all changes in a single monolithic commit.
    */
   stagedCommits: boolean;
+  /**
+   * When true (default) and trigger_mode is "on_goal" with pi-goal present,
+   * the commit_changes tool will skip committing if a goal is active and
+   * defer to the automatic on_goal trigger (which runs after the goal audit passes).
+   * This prevents premature commits before the pi-goal auditor has verified completion.
+   */
+  deferToGoalAudit: boolean;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -35,6 +42,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   excludePatterns: [],
   subagentModel: undefined,
   stagedCommits: true,
+  deferToGoalAudit: true,
 };
 
 const CONVENTIONAL_TYPES = [
@@ -170,6 +178,10 @@ function applyConfig(
 
   if (typeof raw.staged_commits === "boolean") {
     config.stagedCommits = raw.staged_commits;
+  }
+
+  if (typeof raw.defer_to_goal_audit === "boolean") {
+    config.deferToGoalAudit = raw.defer_to_goal_audit;
   }
 
   return config;

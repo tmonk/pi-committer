@@ -644,6 +644,34 @@ export function hasGoalsExtension(ctx: ExtensionContext): boolean {
 }
 
 /**
+ * Check if pi-goal has an active (non-completed) goal.
+ * Scans session entries for the latest pi-goal-state with a status other than "completed".
+ * Returns false if pi-goal is not present or all goals are completed.
+ */
+export function hasActiveGoal(ctx: ExtensionContext): boolean {
+  try {
+    const entries = ctx.sessionManager.getEntries();
+    // Scan backward to find the latest state entry for each goal
+    const seen = new Set<string>();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry.type === "custom" && entry.customType === "pi-goal-state") {
+        const goalData = (entry as any).data?.goal;
+        if (goalData && goalData.id && !seen.has(goalData.id)) {
+          seen.add(goalData.id);
+          if (goalData.status && goalData.status !== "completed") {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Check if pi-goal is available. Warns once per session when goals
  * extension is missing but the trigger mode requires it.
  * Returns true when pi-goal is present.
@@ -1498,7 +1526,8 @@ export default function (pi: ExtensionAPI) {
       "Stage and commit changes with conventional commit messages",
     promptGuidelines: [
       "Use commit_changes when the user asks to commit, save progress, or checkpoint work.",
-      "Call commit_changes when completing significant work, before switching tasks, or on user request.",
+      "Call commit_changes when completing significant work or on user request.",
+      "When pi-goal is active with trigger_mode=on_goal, do NOT call commit_changes before marking the goal complete — the automatic on_goal trigger will commit after the goal audit passes. Calling commit_changes preemptively bypasses the audit.",
     ],
     parameters: commitChangesSchema,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
@@ -1508,6 +1537,31 @@ export default function (pi: ExtensionAPI) {
           details: { commitCount: 0, cancelled: true },
         };
       }
+
+      // Defer to goal audit: if on_goal mode is active and pi-goal has an
+      // active (non-completed) goal, skip committing and let the automatic
+      // on_goal trigger handle it after the goal audit passes.
+      if (
+        config.deferToGoalAudit &&
+        config.triggerMode === "on_goal" &&
+        hasGoalsExtension(ctx) &&
+        hasActiveGoal(ctx)
+      ) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: [
+                "Commit deferred: pi-goal has an active goal with on_goal trigger mode.",
+                "Changes will be automatically committed when the goal completes and the audit passes.",
+                "If you need to commit immediately, set defer_to_goal_audit = false in .pi-committer.toml.",
+              ].join("\n"),
+            },
+          ],
+          details: { commitCount: 0, deferred: true },
+        };
+      }
+
       const count = await commitAllRepos(ctx.cwd, ctx, true);
       if (count > 0) {
         return {

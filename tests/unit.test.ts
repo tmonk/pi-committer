@@ -45,6 +45,7 @@ import {
   findDirtyRepos,
   checkGoalEvents,
   hasGoalsExtension,
+  hasActiveGoal,
   ensureGoalsExtension,
   _resetWarnedMissingGoals,
   _clearGoalStatuses,
@@ -116,6 +117,49 @@ describe("config loading", () => {
     assert.strictEqual(cfg.stagedCommits, true);
     assert.deepStrictEqual(cfg.excludePatterns, []);
     assert.strictEqual(cfg.minChanges, 1);
+    assert.strictEqual(cfg.deferToGoalAudit, true);
+  });
+
+  it("parses defer_to_goal_audit from .pi-committer.toml", () => {
+    const toml = `[committer]
+enabled = true
+trigger_mode = "on_goal"
+defer_to_goal_audit = false
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.deferToGoalAudit, false);
+    assert.strictEqual(cfg.enabled, true);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("parses defer_to_goal_audit from .pi-committer.json", () => {
+    const json = JSON.stringify({
+      committer: {
+        defer_to_goal_audit: false,
+        enabled: true,
+      },
+    });
+    writeFileSync(path.join(dir, ".pi-committer.json"), json, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.deferToGoalAudit, false);
+
+    fs.rmSync(path.join(dir, ".pi-committer.json"));
+  });
+
+  it("defaults defer_to_goal_audit to true when not in config", () => {
+    const toml = `[committer]
+enabled = true
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.deferToGoalAudit, true);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
 
   it("loads .pi-committer.toml", () => {
@@ -680,6 +724,72 @@ describe("ensureGoalsExtension", () => {
 });
 
 // ===========================================================================
+// hasActiveGoal
+// ===========================================================================
+
+describe("hasActiveGoal", () => {
+  it("returns true when there is an active (non-completed) goal", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    assert.strictEqual(hasActiveGoal(ctx), true);
+  });
+
+  it("returns false when all goals are completed", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    assert.strictEqual(hasActiveGoal(ctx), false);
+  });
+
+  it("returns false when there are no pi-goal-state entries", () => {
+    const ctx = mockCtx({ sessionManager: { getEntries: () => [] } });
+    assert.strictEqual(hasActiveGoal(ctx), false);
+  });
+
+  it("returns true for paused goals (not completed)", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "paused" } } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    assert.strictEqual(hasActiveGoal(ctx), true);
+  });
+
+  it("scans backward and finds the latest goal status", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "active" } } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    // g1 is completed, g2 is active
+    assert.strictEqual(hasActiveGoal(ctx), true);
+  });
+
+  it("returns false when last state of all goals is completed", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "active" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "completed" } } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    assert.strictEqual(hasActiveGoal(ctx), false);
+  });
+
+  it("handles bad entry data gracefully", () => {
+    const entries = [
+      { type: "custom", customType: "pi-goal-state", data: null },
+      { type: "message", message: { role: "assistant" } },
+    ];
+    const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
+    assert.strictEqual(hasActiveGoal(ctx), false);
+  });
+});
+
+// ===========================================================================
 // Mocked subagent — test that createAgentSession is properly mocked
 // ===========================================================================
 
@@ -717,11 +827,23 @@ describe("config state accessors", () => {
     assert.ok("enabled" in cfg && "triggerMode" in cfg);
   });
 
+  it("deferToGoalAudit defaults to true", () => {
+    assert.strictEqual(getConfig().deferToGoalAudit, true);
+  });
+
   it("setConfig replaces config", () => {
     const original = getConfig();
     const testCfg: CommitterConfig = { ...original, triggerMode: "manual" };
     setConfig(testCfg);
     assert.strictEqual(getConfig().triggerMode, "manual");
+    setConfig(original);
+  });
+
+  it("setConfig preserves deferToGoalAudit", () => {
+    const original = getConfig();
+    const testCfg: CommitterConfig = { ...original, deferToGoalAudit: false };
+    setConfig(testCfg);
+    assert.strictEqual(getConfig().deferToGoalAudit, false);
     setConfig(original);
   });
 });

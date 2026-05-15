@@ -585,6 +585,25 @@ export async function generateStagedCommitGroups(
 }
 
 // ---------------------------------------------------------------------------
+// Abort signal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Combine two AbortSignals into one. If either signal is undefined, returns the other.
+ * Uses AbortSignal.any() (available natively in Node 15+).
+ * Returns undefined only when both inputs are undefined.
+ */
+export function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  // Node 22+ native; for older Node we could use a manual wrapper
+  return AbortSignal.any([a, b]);
+}
+
+// ---------------------------------------------------------------------------
 // Goals integration
 // ---------------------------------------------------------------------------
 
@@ -750,6 +769,7 @@ export async function generateCommitMessageViaSubagent(
   diffContent: string,
   repoDir?: string,
   onProgress?: (progress: SubagentProgress) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   const truncatedDiff =
     diffContent.length > 8000
@@ -859,8 +879,17 @@ export async function generateCommitMessageViaSubagent(
       }
     });
 
-    await session.prompt(prompt);
-    unsubscribe();
+    // Wire external abort signal to abort the running session (matching pi-goal auditor pattern)
+    const abortSession = () => { session.abort(); };
+    signal?.addEventListener("abort", abortSession, { once: true });
+
+    try {
+      if (signal?.aborted) return deterministicCommitMessage(diffStat, diffContent);
+      await session.prompt(prompt);
+    } finally {
+      signal?.removeEventListener("abort", abortSession);
+      unsubscribe();
+    }
 
     const generated = outputParts.join("\n\n").trim();
     if (generated.length > 10) return generated;
@@ -963,6 +992,7 @@ export async function commitStaged(
   ctx: ExtensionContext,
   files: string[],
   onProgress?: (progress: SubagentProgress) => void,
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
@@ -986,6 +1016,7 @@ export async function commitStaged(
       diffContent,
       dir,
       onProgress,
+      signal,
     );
     const finalMessage =
       message.length > 10
@@ -1027,7 +1058,10 @@ export async function tryCommit(
   dir: string,
   ctx: ExtensionContext,
   force = false,
+  signal?: AbortSignal,
 ): Promise<number> {
+  if (signal?.aborted) return 0;
+
   if (!isGitRepo(dir)) {
     ctx.ui.notify("[pi-committer] Not a git repository — skipping", "info");
     return 0;
@@ -1074,6 +1108,13 @@ export async function tryCommit(
         : `Generating commit message for ${allFiles.length} file(s)...`,
   });
 
+  // Check for abort before starting the commit operation
+  if (signal?.aborted) {
+    unstageAll(dir);
+    ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
+    return 0;
+  }
+
   let commitCount = 0;
 
   try {
@@ -1092,14 +1133,14 @@ export async function tryCommit(
             updateCommitterWidget();
           }
         },
-        getAbortSignal(),
+        signal,
       );
 
-      // If aborted, re-stage all files and fall through to single-commit mode
-      if (isAborted()) {
-        execSync("git add -A", { cwd: dir, stdio: "ignore" });
-        commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress);
-        return commitCount;
+      // If aborted, unstage all and cancel fully (not fallthrough to single commit)
+      if (signal?.aborted || isAborted()) {
+        unstageAll(dir);
+        ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
+        return 0;
       }
 
       if (__committerProgress) {
@@ -1111,6 +1152,12 @@ export async function tryCommit(
       }
 
       for (const group of groups) {
+        if (signal?.aborted || isAborted()) {
+          unstageAll(dir);
+          ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
+          return commitCount;
+        }
+
         // Only stage this group's files
         unstageAll(dir);
         for (const f of group.files) {
@@ -1183,7 +1230,12 @@ export async function tryCommit(
       }
     } else {
       // ---- Single commit mode ----
-      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress);
+      if (signal?.aborted || isAborted()) {
+        unstageAll(dir);
+        ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
+        return 0;
+      }
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, signal);
     }
   } finally {
     // Mark as done and schedule cleanup
@@ -1214,6 +1266,7 @@ async function doSingleCommit(
   ctx: ExtensionContext,
   allFiles: string[],
   progress: CommitterProgress | null,
+  signal?: AbortSignal,
 ): Promise<number> {
   if (progress) {
     progress.phase = "committing";
@@ -1233,6 +1286,7 @@ async function doSingleCommit(
         updateCommitterWidget();
       }
     },
+    signal,
   );
 
   if (hash && progress) {
@@ -1381,13 +1435,16 @@ export async function commitAllRepos(
   dir: string,
   ctx: ExtensionContext,
   force = false,
+  signal?: AbortSignal,
 ): Promise<number> {
   const repos = findDirtyRepos(ctx);
   let totalCommits = 0;
 
+  if (signal?.aborted) return 0;
+
   if (repos.length === 1) {
     // Single repo — normal behavior
-    return tryCommit(dir, ctx, force);
+    return tryCommit(dir, ctx, force, signal);
   }
 
   // Filter to only dirty repos
@@ -1398,7 +1455,7 @@ export async function commitAllRepos(
   });
 
   if (dirtyRepos.length <= 1) {
-    return tryCommit(dir, ctx, force);
+    return tryCommit(dir, ctx, force, signal);
   }
 
   ctx.ui.notify(
@@ -1407,9 +1464,10 @@ export async function commitAllRepos(
   );
 
   for (const repoDir of dirtyRepos) {
+    if (signal?.aborted) break;
     const label = repoDir === dir ? "primary" : repoDir.split("/").pop() ?? "";
     ctx.ui.notify(`[pi-committer] Committing in ${label}...`, "info");
-    const count = await tryCommit(repoDir, ctx, force);
+    const count = await tryCommit(repoDir, ctx, force, signal);
     totalCommits += count;
   }
 
@@ -1531,7 +1589,12 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: commitChangesSchema,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
-      if (signal?.aborted) {
+      // Combine the runtime abort signal with the committer's own abort controller.
+      // This ensures Esc (which triggers __committerAbortController) and the
+      // runtime turn-cancellation signal both cancel the commit operation.
+      const combinedSignal = combineAbortSignals(signal, getAbortSignal());
+
+      if (combinedSignal?.aborted) {
         return {
           content: [{ type: "text" as const, text: "Commit cancelled." }],
           details: { commitCount: 0, cancelled: true },
@@ -1562,7 +1625,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const count = await commitAllRepos(ctx.cwd, ctx, true);
+      const count = await commitAllRepos(ctx.cwd, ctx, true, combinedSignal);
+      if (combinedSignal?.aborted) {
+        return {
+          content: [{ type: "text" as const, text: "Commit cancelled." }],
+          details: { commitCount: 0, cancelled: true },
+        };
+      }
       if (count > 0) {
         return {
           content: [
@@ -1592,7 +1661,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("commit", {
     description: "Create one or more conventional commits",
     handler: async (_args, ctx) => {
-      await commitAllRepos(ctx.cwd, ctx, true);
+      // Use the widget's abort signal so Esc-to-cancel works via /commit too
+      await commitAllRepos(ctx.cwd, ctx, true, getAbortSignal());
     },
   });
 

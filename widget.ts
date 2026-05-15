@@ -215,7 +215,7 @@ export function renderCommitterWidgetLines(
           theme,
           safeWidth,
           true,
-          `${theme.fg("warning", "Esc to skip")}${theme.fg("dim", " — skip subagent, commit all at once")}`,
+          `${theme.fg("warning", "Esc to cancel")}${theme.fg("dim", " — cancel commit operation")}`,
         ),
       );
     }
@@ -248,8 +248,20 @@ export function renderCommitterWidgetLines(
         branchLine(
           theme,
           safeWidth,
-          true,
+          false,
           `${theme.fg("muted", "○")} ${theme.fg("dim", progress.statusMessage)}`,
+        ),
+      );
+    }
+
+    // Esc hint during committing phase too
+    if (isActive) {
+      lines.push(
+        branchLine(
+          theme,
+          safeWidth,
+          true,
+          `${theme.fg("warning", "Esc to cancel")}${theme.fg("dim", " — cancel commit operation")}`,
         ),
       );
     }

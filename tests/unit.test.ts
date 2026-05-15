@@ -43,6 +43,7 @@ import {
   // Session / goals
   findOtherReposFromSession,
   findDirtyRepos,
+  combineAbortSignals,
   checkGoalEvents,
   hasGoalsExtension,
   hasActiveGoal,
@@ -786,6 +787,56 @@ describe("hasActiveGoal", () => {
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
     assert.strictEqual(hasActiveGoal(ctx), false);
+  });
+});
+
+// ===========================================================================
+// combineAbortSignals
+// ===========================================================================
+
+describe("combineAbortSignals", () => {
+  it("returns undefined when both signals are undefined", () => {
+    assert.strictEqual(combineAbortSignals(undefined, undefined), undefined);
+  });
+
+  it("returns the first signal when second is undefined", () => {
+    const ac = new AbortController();
+    assert.strictEqual(combineAbortSignals(ac.signal, undefined), ac.signal);
+  });
+
+  it("returns the second signal when first is undefined", () => {
+    const ac = new AbortController();
+    assert.strictEqual(combineAbortSignals(undefined, ac.signal), ac.signal);
+  });
+
+  it("combines two signals and both trigger the combined signal", () => {
+    const ac1 = new AbortController();
+    const ac2 = new AbortController();
+    const combined = combineAbortSignals(ac1.signal, ac2.signal);
+    assert.ok(combined);
+    assert.strictEqual(combined.aborted, false);
+
+    ac1.abort();
+    assert.strictEqual(combined!.aborted, true);
+  });
+
+  it("aborting either original signal aborts the combined signal", () => {
+    const ac1 = new AbortController();
+    const ac2 = new AbortController();
+    const combined = combineAbortSignals(ac1.signal, ac2.signal);
+    assert.ok(combined);
+    assert.strictEqual(combined.aborted, false);
+
+    ac2.abort();
+    assert.strictEqual(combined!.aborted, true);
+  });
+
+  it("works with an already-aborted signal", () => {
+    const ac1 = new AbortController();
+    ac1.abort();
+    const ac2 = new AbortController();
+    const combined = combineAbortSignals(ac1.signal, ac2.signal);
+    assert.strictEqual(combined!.aborted, true);
   });
 });
 

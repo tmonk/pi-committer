@@ -597,8 +597,8 @@ export async function generateStagedCommitGroups(
 
 /**
  * Combine two AbortSignals into one. If either signal is undefined, returns the other.
- * Uses AbortSignal.any() (available natively in Node 15+).
  * Returns undefined only when both inputs are undefined.
+ * Uses AbortSignal.any() (available natively in Node 20.3+).
  */
 export function combineAbortSignals(
   a: AbortSignal | undefined,
@@ -606,7 +606,6 @@ export function combineAbortSignals(
 ): AbortSignal | undefined {
   if (!a) return b;
   if (!b) return a;
-  // Node 22+ native; for older Node we could use a manual wrapper
   return AbortSignal.any([a, b]);
 }
 
@@ -1254,7 +1253,10 @@ export async function tryCommit(
         ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
         return 0;
       }
-      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, runtimeSignal);
+      // Combine signals for single-commit path too, so Esc (via __committerAbortController)
+      // and the runtime signal both flow through to abort the subagent and prevent the commit.
+      const opSignal = combineAbortSignals(runtimeSignal, getAbortSignal());
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal);
     }
   } finally {
     // Mark as done or cancelled and schedule cleanup

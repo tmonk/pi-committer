@@ -6,10 +6,16 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { loadConfig, type CommitterConfig } from "./config.ts";
+import {
+  CommitterWidgetComponent,
+  type CommitterProgress,
+  type SubagentProgress,
+} from "./widget.ts";
 
 // ---------------------------------------------------------------------------
 // State
@@ -34,6 +40,17 @@ export function setConfig(c: CommitterConfig): void {
 let lastTurnEntryCount = 0;
 let committedThisTurn = false;
 
+// ---------------------------------------------------------------------------
+// Widget state
+// ---------------------------------------------------------------------------
+
+const COMMITTER_WIDGET_KEY = "pi-committer";
+let __committerProgress: CommitterProgress | null = null;
+let __committerWidgetComponent: CommitterWidgetComponent | null = null;
+let __committerAnimationTimer: ReturnType<typeof setInterval> | null = null;
+let __committerAbortController: AbortController | null = null;
+let __committerTerminalInputUnsub: (() => void) | null = null;
+
 /** Once-per-session flag: warn if on_goal mode is set without pi-goal installed. */
 let warnedMissingGoals = false;
 /** Exported for unit test access. */
@@ -57,6 +74,95 @@ export function _resetGoalScanCount(): number {
 /** Restore the scan offset after a test that called _resetGoalScanCount. */
 export function _restoreGoalScanCount(saved: number): void {
   lastGoalScanEntryCount = saved;
+}
+
+// ---------------------------------------------------------------------------
+// Widget helpers
+// ---------------------------------------------------------------------------
+
+function startCommitterAnimation(): void {
+  stopCommitterAnimation();
+  __committerAnimationTimer = setInterval(() => {
+    if (__committerWidgetComponent) {
+      __committerWidgetComponent.update();
+    }
+  }, 80);
+  __committerAnimationTimer.unref?.();
+}
+
+function stopCommitterAnimation(): void {
+  if (__committerAnimationTimer) {
+    clearInterval(__committerAnimationTimer);
+    __committerAnimationTimer = null;
+  }
+}
+
+function showCommitterWidget(
+  ctx: ExtensionContext,
+  initial: Omit<CommitterProgress, "startedAt" | "commitLog">,
+): void {
+  if (__committerProgress) hideCommitterWidget(ctx);
+
+  __committerAbortController = new AbortController();
+  __committerProgress = {
+    ...initial,
+    startedAt: Date.now(),
+    commitLog: [],
+  };
+
+  if (ctx.hasUI) {
+    __committerTerminalInputUnsub = ctx.ui.onTerminalInput((data) => {
+      if (
+        matchesKey(data, "escape") &&
+        __committerProgress &&
+        __committerProgress.phase !== "done"
+      ) {
+        __committerAbortController?.abort();
+        return { consume: true };
+      }
+      return undefined;
+    });
+
+    ctx.ui.setWidget(
+      COMMITTER_WIDGET_KEY,
+      (tui, theme) => {
+        __committerWidgetComponent = new CommitterWidgetComponent({
+          tui,
+          theme,
+          getProgress: () => __committerProgress,
+        });
+        return __committerWidgetComponent;
+      },
+      { placement: "aboveEditor" },
+    );
+    startCommitterAnimation();
+  }
+}
+
+function updateCommitterWidget(): void {
+  __committerWidgetComponent?.update();
+}
+
+function hideCommitterWidget(ctx: ExtensionContext): void {
+  stopCommitterAnimation();
+  if (__committerTerminalInputUnsub) {
+    __committerTerminalInputUnsub();
+    __committerTerminalInputUnsub = null;
+  }
+  if (ctx.hasUI) {
+    ctx.ui.setWidget(COMMITTER_WIDGET_KEY, undefined);
+  }
+  __committerWidgetComponent = null;
+  __committerAbortController = null;
+  __committerProgress = null;
+}
+
+function getAbortSignal(): AbortSignal | undefined {
+  return __committerAbortController?.signal;
+}
+
+function isAborted(): boolean {
+  return __committerAbortController?.signal.aborted ?? false;
 }
 
 /** User-selected model override for the commit-message subagent (set via /commit-model). */
@@ -302,6 +408,8 @@ export async function generateStagedCommitGroups(
   diffContent: string,
   allFiles: string[],
   repoDir?: string,
+  onProgress?: (progress: SubagentProgress) => void,
+  signal?: AbortSignal,
 ): Promise<CommitGroup[]> {
   const truncatedDiff =
     diffContent.length > 12000
@@ -361,18 +469,87 @@ export async function generateStagedCommitGroups(
 
     const session = result.session;
     const outputParts: string[] = [];
+
+    // Wire external abort signal to session.abort()
+    const abortSession = () => { session.abort(); };
+    signal?.addEventListener("abort", abortSession, { once: true });
+
     const unsubscribe = session.subscribe((event: any) => {
-      if (event.type !== "message_end") return;
-      if (event.message?.role !== "assistant") return;
-      for (const part of event.message.content ?? []) {
-        if (part.type === "text" && typeof part.text === "string") {
-          outputParts.push(part.text);
+      // Collect output (existing logic)
+      if (event.type === "message_end") {
+        if (event.message?.role !== "assistant") return;
+        for (const part of event.message.content ?? []) {
+          if (part.type === "text" && typeof part.text === "string") {
+            outputParts.push(part.text);
+          }
+        }
+        // Show accumulated output in progress
+        const fullText = outputParts.join("\n\n");
+        const lines = fullText.split("\n").filter((l: string) => l.trim());
+        onProgress?.({ recentOutput: lines.slice(-8) });
+        return;
+      }
+
+      // Progress reporting
+      if (!onProgress) return;
+      if (event.type === "tool_execution_start") {
+        onProgress({
+          currentTool: event.toolName,
+          currentToolArgs:
+            typeof event.args === "object" && event.args !== null
+              ? JSON.stringify(event.args).slice(0, 120)
+              : String(event.args ?? "").slice(0, 120),
+          currentToolStartedAt: Date.now(),
+          recentOutput: [],
+        });
+        return;
+      }
+      if (event.type === "tool_execution_end") {
+        onProgress({
+          currentTool: undefined,
+          currentToolArgs: undefined,
+          currentToolStartedAt: undefined,
+          recentOutput: [],
+        });
+        return;
+      }
+      if (event.type === "message_update") {
+        const message = event.message as any;
+        if (message?.role === "assistant") {
+          const recentLines: string[] = [];
+          for (const part of message.content ?? []) {
+            if (
+              part.type === "text" &&
+              typeof part.text === "string" &&
+              part.text.trim()
+            ) {
+              recentLines.push(
+                ...part.text
+                  .split("\n")
+                  .filter((l: string) => l.trim()),
+              );
+            }
+          }
+          if (recentLines.length > 0) {
+            onProgress({ recentOutput: recentLines.slice(-5) });
+          }
         }
       }
     });
 
-    await session.prompt(prompt);
-    unsubscribe();
+    try {
+      if (signal?.aborted) {
+        return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir);
+      }
+      await session.prompt(prompt);
+    } finally {
+      signal?.removeEventListener("abort", abortSession);
+      unsubscribe();
+    }
+
+    if (signal?.aborted) {
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir);
+    }
 
     const output = outputParts.join("\n\n").trim();
     if (output.length < 20) {
@@ -544,6 +721,7 @@ export async function generateCommitMessageViaSubagent(
   diffStat: string,
   diffContent: string,
   repoDir?: string,
+  onProgress?: (progress: SubagentProgress) => void,
 ): Promise<string> {
   const truncatedDiff =
     diffContent.length > 8000
@@ -589,12 +767,66 @@ export async function generateCommitMessageViaSubagent(
 
     const session = result.session;
     const outputParts: string[] = [];
+
     const unsubscribe = session.subscribe((event: any) => {
-      if (event.type !== "message_end") return;
-      if (event.message?.role !== "assistant") return;
-      for (const part of event.message.content ?? []) {
-        if (part.type === "text" && typeof part.text === "string") {
-          outputParts.push(part.text);
+      // Collect output (existing logic)
+      if (event.type === "message_end") {
+        if (event.message?.role !== "assistant") return;
+        for (const part of event.message.content ?? []) {
+          if (part.type === "text" && typeof part.text === "string") {
+            outputParts.push(part.text);
+          }
+        }
+        // Show accumulated output in progress
+        const fullText = outputParts.join("\n\n");
+        const lines = fullText.split("\n").filter((l: string) => l.trim());
+        onProgress?.({ recentOutput: lines.slice(-8) });
+        return;
+      }
+
+      // Progress reporting
+      if (!onProgress) return;
+      if (event.type === "tool_execution_start") {
+        onProgress({
+          currentTool: event.toolName,
+          currentToolArgs:
+            typeof event.args === "object" && event.args !== null
+              ? JSON.stringify(event.args).slice(0, 120)
+              : String(event.args ?? "").slice(0, 120),
+          currentToolStartedAt: Date.now(),
+          recentOutput: [],
+        });
+        return;
+      }
+      if (event.type === "tool_execution_end") {
+        onProgress({
+          currentTool: undefined,
+          currentToolArgs: undefined,
+          currentToolStartedAt: undefined,
+          recentOutput: [],
+        });
+        return;
+      }
+      if (event.type === "message_update") {
+        const message = event.message as any;
+        if (message?.role === "assistant") {
+          const recentLines: string[] = [];
+          for (const part of message.content ?? []) {
+            if (
+              part.type === "text" &&
+              typeof part.text === "string" &&
+              part.text.trim()
+            ) {
+              recentLines.push(
+                ...part.text
+                  .split("\n")
+                  .filter((l: string) => l.trim()),
+              );
+            }
+          }
+          if (recentLines.length > 0) {
+            onProgress({ recentOutput: recentLines.slice(-5) });
+          }
         }
       }
     });
@@ -702,6 +934,7 @@ export async function commitStaged(
   dir: string,
   ctx: ExtensionContext,
   files: string[],
+  onProgress?: (progress: SubagentProgress) => void,
 ): Promise<string | undefined> {
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
@@ -724,6 +957,7 @@ export async function commitStaged(
       diffStat,
       diffContent,
       dir,
+      onProgress,
     );
     const finalMessage =
       message.length > 10
@@ -801,78 +1035,200 @@ export async function tryCommit(
     return 0;
   }
 
-  if (config.stagedCommits && allFiles.length > 1) {
-    // ---- Agent-decided staged commit mode ----
-    ctx.ui.notify(
-      `[pi-committer] Analyzing ${allFiles.length} file(s) for logical commit grouping...`,
-      "info",
-    );
+  // Show the committer widget
+  const initialPhase = config.stagedCommits && allFiles.length > 1 ? "analyzing" : "committing";
+  showCommitterWidget(ctx, {
+    phase: initialPhase,
+    fileCount: allFiles.length,
+    statusMessage:
+      initialPhase === "analyzing"
+        ? `Analyzing ${allFiles.length} file(s) for logical commit grouping...`
+        : `Generating commit message for ${allFiles.length} file(s)...`,
+  });
 
-    const groups = await generateStagedCommitGroups(
-      ctx,
-      diffStat,
-      diffContent,
-      allFiles,
-      dir,
-    );
-    let commitCount = 0;
+  let commitCount = 0;
 
-    for (const group of groups) {
-      // Only stage this group's files
-      unstageAll(dir);
-      for (const f of group.files) {
-        execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
-      }
+  try {
+    if (config.stagedCommits && allFiles.length > 1) {
+      // ---- Agent-decided staged commit mode ----
 
-      // Create commit with the group's message
-      try {
-        execSync("git commit -F -", {
-          cwd: dir,
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "ignore"],
-          input: group.message,
-        });
-
-        const hash = getHeadHash(dir);
-        const shortHash = hash.slice(0, 7);
-        const summary = group.message.split("\n")[0];
-
-        ctx.ui.notify(`[pi-committer] \u2713 ${shortHash} ${summary}`, "success");
-        commitCount++;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.ui.notify(`[pi-committer] Commit failed: ${msg}`, "error");
-      }
-    }
-
-    // Re-stage remaining changes, then re-apply exclusion patterns to prevent
-    // previously excluded files from being re-added
-    execSync("git add -A", { cwd: dir, stdio: "ignore" });
-    if (config.excludePatterns.length > 0) {
-      const remainingStat = execSync("git diff --cached --stat", {
-        cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-      if (remainingStat) {
-        const remainingFiles = getChangedFiles(remainingStat);
-        unstageExcludedFiles(dir, remainingFiles, config.excludePatterns);
-      }
-    }
-
-    if (commitCount === 0) {
-      ctx.ui.notify("[pi-committer] No commits created", "info");
-    } else if (commitCount > 1) {
-      ctx.ui.notify(
-        `[pi-committer] ${commitCount} commits created`,
-        "success",
+      const groups = await generateStagedCommitGroups(
+        ctx,
+        diffStat,
+        diffContent,
+        allFiles,
+        dir,
+        (subProgress) => {
+          if (__committerProgress) {
+            __committerProgress.subagent = subProgress;
+            updateCommitterWidget();
+          }
+        },
+        getAbortSignal(),
       );
+
+      // If aborted, re-stage all files and fall through to single-commit mode
+      if (isAborted()) {
+        execSync("git add -A", { cwd: dir, stdio: "ignore" });
+        commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress);
+        return commitCount;
+      }
+
+      if (__committerProgress) {
+        __committerProgress.phase = "committing";
+        __committerProgress.totalCommits = groups.length;
+        __committerProgress.completedCommits = 0;
+        __committerProgress.subagent = undefined;
+        updateCommitterWidget();
+      }
+
+      for (const group of groups) {
+        // Only stage this group's files
+        unstageAll(dir);
+        for (const f of group.files) {
+          execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
+        }
+
+        // Create commit with the group's message
+        try {
+          execSync("git commit -F -", {
+            cwd: dir,
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "ignore"],
+            input: group.message,
+          });
+
+          const hash = getHeadHash(dir);
+          const shortHash = hash.slice(0, 7);
+          const summary = group.message.split("\n")[0];
+
+          commitCount++;
+          if (__committerProgress) {
+            __committerProgress.commitLog.push({
+              hash,
+              message: group.message,
+              success: true,
+            });
+            __committerProgress.completedCommits = commitCount;
+            __committerProgress.statusMessage =
+              commitCount < groups.length
+                ? `Committing ${commitCount + 1}/${groups.length}...`
+                : "All commits created";
+            updateCommitterWidget();
+          }
+
+          ctx.ui.notify(`[pi-committer] ✓ ${shortHash} ${summary}`, "success");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.ui.notify(`[pi-committer] Commit failed: ${msg}`, "error");
+          if (__committerProgress) {
+            __committerProgress.commitLog.push({
+              hash: "",
+              message: group.message,
+              success: false,
+            });
+            updateCommitterWidget();
+          }
+        }
+      }
+
+      // Re-stage remaining changes, then re-apply exclusion patterns to prevent
+      // previously excluded files from being re-added
+      execSync("git add -A", { cwd: dir, stdio: "ignore" });
+      if (config.excludePatterns.length > 0) {
+        const remainingStat = execSync("git diff --cached --stat", {
+          cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        if (remainingStat) {
+          const remainingFiles = getChangedFiles(remainingStat);
+          unstageExcludedFiles(dir, remainingFiles, config.excludePatterns);
+        }
+      }
+
+      if (commitCount === 0) {
+        ctx.ui.notify("[pi-committer] No commits created", "info");
+      } else if (commitCount > 1) {
+        ctx.ui.notify(
+          `[pi-committer] ${commitCount} commits created`,
+          "success",
+        );
+      }
+    } else {
+      // ---- Single commit mode ----
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress);
+    }
+  } finally {
+    // Mark as done and schedule cleanup
+    if (__committerProgress) {
+      __committerProgress.phase = "done";
+      __committerProgress.totalCommits = commitCount;
+      __committerProgress.completedCommits = commitCount;
+      __committerProgress.statusMessage = undefined;
+      updateCommitterWidget();
     }
 
-    return commitCount;
-  } else {
-    // ---- Single commit mode ----
-    const hash = await commitStaged(dir, ctx, allFiles);
-    return hash ? 1 : 0;
+    // Auto-hide the widget after 6 seconds (unless abort was triggered, then hide immediately)
+    if (isAborted()) {
+      hideCommitterWidget(ctx);
+    } else {
+      setTimeout(() => hideCommitterWidget(ctx), 6000);
+    }
   }
+
+  return commitCount;
+}
+
+/**
+ * Perform a single commit with subagent-generated message, tracking progress.
+ */
+async function doSingleCommit(
+  dir: string,
+  ctx: ExtensionContext,
+  allFiles: string[],
+  progress: CommitterProgress | null,
+): Promise<number> {
+  if (progress) {
+    progress.phase = "committing";
+    progress.totalCommits = 1;
+    progress.completedCommits = 0;
+    progress.subagent = undefined;
+    updateCommitterWidget();
+  }
+
+  const hash = await commitStaged(
+    dir,
+    ctx,
+    allFiles,
+    (subProgress) => {
+      if (__committerProgress) {
+        __committerProgress.subagent = subProgress;
+        updateCommitterWidget();
+      }
+    },
+  );
+
+  if (hash && progress) {
+    // Get the actual commit message from git
+    let message = hash;
+    try {
+      message = execSync("git log -1 --format=%B", {
+        cwd: dir,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // fallback to hash
+    }
+    progress.commitLog.push({
+      hash,
+      message,
+      success: true,
+    });
+    progress.completedCommits = 1;
+    updateCommitterWidget();
+  }
+
+  return hash ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1407,15 @@ export default function (pi: ExtensionAPI) {
     committedThisTurn = false;
     warnedMissingGoals = false;
     selectedSubagentModel = undefined;
+    // Clean up any stale widget state
+    stopCommitterAnimation();
+    if (__committerTerminalInputUnsub) {
+      __committerTerminalInputUnsub();
+      __committerTerminalInputUnsub = null;
+    }
+    __committerWidgetComponent = null;
+    __committerAbortController = null;
+    __committerProgress = null;
 
     // Reconstruct previously selected commit-message model from session entries
     for (const entry of ctx.sessionManager.getEntries()) {

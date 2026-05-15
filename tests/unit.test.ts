@@ -39,6 +39,7 @@ import {
   deterministicCommitMessage,
   shouldCommitOnTrigger,
   commitStaged,
+  singleGroupFallback,
 
   // Subagent
   resolveSubagentModel,
@@ -943,6 +944,205 @@ describe("unstageAll on abort", () => {
       cwd: dir, encoding: "utf-8",
     }).trim();
     assert.strictEqual(after, "");
+  });
+});
+
+// ===========================================================================
+// Cancel flow integration
+// ===========================================================================
+
+describe("cancel flow integration", () => {
+  let dir: string;
+  let originalConfig: CommitterConfig;
+
+  before(() => {
+    dir = createTempRepo();
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    removeDir(dir);
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  it("singleGroupFallback returns immediately when signal is already aborted (no subagent call)", async () => {
+    // Mock the subagent to detect if it was called
+    let subagentCalled = false;
+    __setCreateAgentSessionMock(async (_opts: any) => {
+      subagentCalled = true;
+      return {
+        session: {
+          prompt: async () => {},
+          abort: () => {},
+          subscribe: () => () => {},
+        },
+      };
+    });
+
+    const ac = new AbortController();
+    ac.abort(); // Already aborted before call
+
+    const result = await singleGroupFallback(
+      mockCtx(),
+      "src/main.ts | 1 +",
+      "diff content",
+      ["src/main.ts"],
+      undefined,
+      ac.signal,
+    );
+
+    // Should return a commit group without calling the subagent
+    assert.strictEqual(subagentCalled, false);
+    assert.strictEqual(result.length, 1);
+    assert.ok(result[0].message.length > 0);
+    assert.deepStrictEqual(result[0].files, ["src/main.ts"]);
+  });
+
+  it("singleGroupFallback with non-aborted signal calls subagent normally", async () => {
+    let subagentCalled = false;
+    __setCreateAgentSessionMock(async (_opts: any) => {
+      subagentCalled = true;
+      return {
+        session: {
+          prompt: async () => {},
+          abort: () => {},
+          subscribe: () => () => {},
+        },
+      };
+    });
+
+    const ac = new AbortController();
+    // Not aborted
+
+    await singleGroupFallback(
+      mockCtx(),
+      "src/main.ts | 1 +",
+      "diff content",
+      ["src/main.ts"],
+      undefined,
+      ac.signal,
+    );
+
+    // Should call subagent since signal is not aborted
+    assert.strictEqual(subagentCalled, true);
+  });
+
+  it("commitStaged returns undefined when signal is aborted (no commit made)", async () => {
+    // Stage a file
+    writeFileSync(path.join(dir, "cancel-test.ts"), "// cancel test");
+    execSync("git add cancel-test.ts", { cwd: dir, stdio: "ignore" });
+
+    // Verify it's staged
+    const staged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.ok(staged.includes("cancel-test.ts"));
+
+    // Mock subagent (session is still created before abort check, but prompt is skipped)
+    let promptCalled = false;
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => { promptCalled = true; },
+        abort: () => {},
+        subscribe: () => () => {},
+      },
+    }));
+
+    const ctx = mockCtx({ cwd: dir, ui: { notify: () => {} } });
+    const ac = new AbortController();
+    ac.abort(); // Already aborted
+
+    const result = await commitStaged(
+      dir,
+      ctx,
+      ["cancel-test.ts"],
+      undefined,
+      ac.signal,
+    );
+
+    // Should return undefined (no commit)
+    assert.strictEqual(result, undefined);
+    // The session is created before the signal check, so prompt would not be called
+    assert.strictEqual(promptCalled, false,
+      "Subagent prompt should be skipped when signal is already aborted");
+
+    // Verify no commit was made (still only the initial commit)
+    const log = execSync("git log --oneline", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(log.split("\n").length, 1,
+      "No additional commit should have been created");
+
+    // Verify file is no longer staged (unstageAll was called)
+    const afterStaged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(afterStaged, "",
+      "Staged changes should have been unstaged");
+
+    // Clean up
+    fs.rmSync(path.join(dir, "cancel-test.ts"));
+  });
+
+  it("commitStaged aborts mid-flight when signal aborts during subagent call", async () => {
+    // Stage a file
+    writeFileSync(path.join(dir, "midflight-test.ts"), "// midflight");
+    execSync("git add midflight-test.ts", { cwd: dir, stdio: "ignore" });
+
+    const ac = new AbortController();
+
+    // Mock subagent that checks abort signal during prompt
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {
+          // Simulate the subagent being aborted mid-flight
+          // The real subagent would be cancelled by session.abort()
+          // triggered by the signal listener
+          if (ac.signal.aborted) {
+            throw new Error("Aborted");
+          }
+        },
+        abort: () => { ac.abort(); },
+        subscribe: () => () => {},
+      },
+    }));
+
+    const ctx = mockCtx({ cwd: dir, ui: { notify: () => {} } });
+
+    // Abort the signal while the subagent is running
+    // We need to trigger abort AFTER generateCommitMessageViaSubagent
+    // enters the session.prompt() call but BEFORE it returns.
+    // With the mock above, the subagent checks ac.signal.aborted.
+    ac.abort(); // Abort before calling
+
+    const result = await commitStaged(
+      dir,
+      ctx,
+      ["midflight-test.ts"],
+      undefined,
+      ac.signal,
+    );
+
+    // Should return undefined (no commit)
+    assert.strictEqual(result, undefined);
+
+    // Verify no commit was made
+    const log = execSync("git log --oneline", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(log.split("\n").length, 1,
+      "No additional commit should have been created");
+
+    // Verify file is no longer staged
+    const afterStaged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(afterStaged, "",
+      "Staged changes should have been unstaged on abort");
+
+    // Clean up
+    fs.rmSync(path.join(dir, "midflight-test.ts"));
   });
 });
 

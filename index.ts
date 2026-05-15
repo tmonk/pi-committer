@@ -391,8 +391,15 @@ export function singleGroupFallback(
   diffContent: string,
   allFiles: string[],
   repoDir?: string,
+  signal?: AbortSignal,
 ): Promise<CommitGroup[]> {
-  return generateCommitMessageViaSubagent(ctx, diffStat, diffContent, repoDir).then(
+  // If the signal is already aborted, return a deterministic fallback immediately
+  // instead of spawning a new subagent session that will just be cancelled.
+  if (signal?.aborted) {
+    const message = deterministicCommitMessage(diffStat, diffContent);
+    return Promise.resolve([{ message, files: allFiles }]);
+  }
+  return generateCommitMessageViaSubagent(ctx, diffStat, diffContent, repoDir, undefined, signal).then(
     (message) => [{ message, files: allFiles }],
   );
 }
@@ -539,7 +546,7 @@ export async function generateStagedCommitGroups(
 
     try {
       if (signal?.aborted) {
-        return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir);
+        return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
       }
       await session.prompt(prompt);
     } finally {
@@ -548,12 +555,12 @@ export async function generateStagedCommitGroups(
     }
 
     if (signal?.aborted) {
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
     }
 
     const output = outputParts.join("\n\n").trim();
     if (output.length < 20) {
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
     }
 
     const groups = parseCommitGroups(output, allFiles);
@@ -573,14 +580,14 @@ export async function generateStagedCommitGroups(
     }
 
     if (groups.length === 0) {
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
     }
 
     return groups;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[pi-committer] Staged commit grouping failed: ${msg}`);
-    return singleGroupFallback(ctx, diffStat, diffContent, allFiles);
+    return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
   }
 }
 
@@ -1018,6 +1025,14 @@ export async function commitStaged(
       onProgress,
       signal,
     );
+
+    // Check for abort before actually committing — the subagent may have been
+    // aborted mid-flight and returned a fallback message. We must not commit.
+    if (signal?.aborted) {
+      unstageAll(dir);
+      return undefined;
+    }
+
     const finalMessage =
       message.length > 10
         ? message

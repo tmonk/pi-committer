@@ -260,6 +260,22 @@ export function hasAnyChanges(dir: string): boolean {
   return status.length > 0;
 }
 
+/**
+ * Given a list of file paths, return only those that are NOT gitignored.
+ * Uses `git check-ignore -q` which exits 0 for ignored files, 1 for non-ignored.
+ */
+export function filterGitignoredFiles(dir: string, files: string[]): string[] {
+  if (files.length === 0) return [];
+  return files.filter((f) => {
+    try {
+      execSync(`git check-ignore -q -- "${f}"`, { cwd: dir, stdio: "pipe" });
+      return false; // exit 0 = ignored
+    } catch {
+      return true; // exit non-zero = not ignored
+    }
+  });
+}
+
 /** Extract changed file list from diff stat. */
 export function getChangedFiles(diffStat: string): string[] {
   return diffStat
@@ -615,7 +631,7 @@ export function combineAbortSignals(
 
 /**
  * Track last known status of each goal ID so we can detect completion.
- * Returns true only when a goal transitions to "completed" status.
+ * Returns true only when a goal transitions to "complete" status.
  * Does NOT throw — returns false on any error, so the integration is non-blocking.
  */
 export function checkGoalEvents(ctx: ExtensionContext): boolean {
@@ -646,7 +662,7 @@ export function checkGoalEvents(ctx: ExtensionContext): boolean {
 
       goalStatuses.set(goalId, currentStatus);
 
-      if (currentStatus === "completed" && previousStatus !== "completed") {
+      if (currentStatus === "complete" && previousStatus !== "complete") {
         return true;
       }
     }
@@ -669,9 +685,9 @@ export function hasGoalsExtension(ctx: ExtensionContext): boolean {
 }
 
 /**
- * Check if pi-goal has an active (non-completed) goal.
- * Scans session entries for the latest pi-goal-state with a status other than "completed".
- * Returns false if pi-goal is not present or all goals are completed.
+ * Check if pi-goal has an active (non-complete) goal.
+ * Scans session entries for the latest pi-goal-state with a status other than "complete".
+ * Returns false if pi-goal is not present or all goals are complete.
  */
 export function hasActiveGoal(ctx: ExtensionContext): boolean {
   try {
@@ -684,7 +700,7 @@ export function hasActiveGoal(ctx: ExtensionContext): boolean {
         const goalData = (entry as any).data?.goal;
         if (goalData && goalData.id && !seen.has(goalData.id)) {
           seen.add(goalData.id);
-          if (goalData.status && goalData.status !== "completed") {
+          if (goalData.status && goalData.status !== "complete") {
             return true;
           }
         }
@@ -1099,9 +1115,12 @@ export async function tryCommit(
   // Apply exclusion patterns
   allFiles = unstageExcludedFiles(dir, allFiles, config.excludePatterns);
 
+  // Filter out gitignored files before proceeding
+  allFiles = filterGitignoredFiles(dir, allFiles);
+
   if (allFiles.length === 0) {
     unstageAll(dir);
-    ctx.ui.notify("[pi-committer] All changes excluded — skipping", "info");
+    ctx.ui.notify("[pi-committer] All changes excluded or gitignored — skipping", "info");
     return 0;
   }
 
@@ -1178,7 +1197,15 @@ export async function tryCommit(
 
         // Only stage this group's files
         unstageAll(dir);
-        for (const f of group.files) {
+
+        // Filter out any gitignored files from this group
+        const groupFiles = filterGitignoredFiles(dir, group.files);
+        if (groupFiles.length === 0) {
+          ctx.ui.notify("[pi-committer] Skipping group — all files are gitignored", "info");
+          continue;
+        }
+
+        for (const f of groupFiles) {
           execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
         }
 
@@ -1623,7 +1650,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Defer to goal audit: if on_goal mode is active and pi-goal has an
-      // active (non-completed) goal, skip committing and let the automatic
+      // active (non-complete) goal, skip committing and let the automatic
       // on_goal trigger handle it after the goal audit passes.
       if (
         config.deferToGoalAudit &&

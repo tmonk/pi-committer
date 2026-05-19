@@ -30,6 +30,7 @@ import {
   isDirtyRepo,
   stageAll,
   getChangedFiles,
+  filterGitignoredFiles,
   unstageExcludedFiles,
   unstageAll,
   hasAnyChanges,
@@ -279,6 +280,43 @@ describe("isDirtyRepo", () => {
     writeFileSync(path.join(dir, "new.ts"), "// new");
     assert.strictEqual(isDirtyRepo(dir), true);
   });
+
+  it("returns true after modifying a tracked file", () => {
+    writeFileSync(path.join(dir, "README.md"), "# modified\n");
+    assert.strictEqual(isDirtyRepo(dir), true);
+  });
+
+  it("returns true after deleting a tracked file", () => {
+    // Reset: remove the file we created above and commit
+    execSync("git checkout -- .", { cwd: dir, stdio: "ignore" });
+    const fileToDelete = path.join(dir, "temp_delete.ts");
+    writeFileSync(fileToDelete, "// to delete");
+    execSync("git add -A && git commit -m 'add temp'", { cwd: dir, stdio: "ignore" });
+    fs.rmSync(fileToDelete);
+    assert.strictEqual(isDirtyRepo(dir), true);
+  });
+
+  it("returns false for a repo with only gitignored changes", () => {
+    execSync("git checkout -- .", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, ".gitignore"), "*.log\n");
+    execSync("git add -A && git commit -m 'add gitignore'", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, "build.log"), "# log");
+    // Only gitignored files changed — the repo should still be clean
+    assert.strictEqual(isDirtyRepo(dir), false);
+  });
+
+  it("returns false for non-existent directory", () => {
+    assert.strictEqual(isDirtyRepo("/nonexistent/path"), false);
+  });
+
+  it("returns false for non-git directory", () => {
+    const nonGitDir = mkdtempSync(path.join(tmpDir(), "pi-committer-nongit-"));
+    try {
+      assert.strictEqual(isDirtyRepo(nonGitDir), false);
+    } finally {
+      removeDir(nonGitDir);
+    }
+  });
 });
 
 describe("getChangedFiles", () => {
@@ -290,6 +328,124 @@ describe("getChangedFiles", () => {
 
   it("returns empty array for empty stat", () => {
     assert.deepStrictEqual(getChangedFiles(""), []);
+  });
+});
+
+describe("filterGitignoredFiles", () => {
+  function freshRepo(): string {
+    const d = createTempRepo();
+    after(() => removeDir(d));
+    return d;
+  }
+
+  it("keeps non-ignored files", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, ".gitignore"), "*.log\n");
+    writeFileSync(path.join(dir, "keep.ts"), "// keep");
+    writeFileSync(path.join(dir, "ignored.log"), "# log");
+
+    const result = filterGitignoredFiles(dir, ["keep.ts", "ignored.log"]);
+    assert.deepStrictEqual(result, ["keep.ts"]);
+  });
+
+  it("returns all files when none are gitignored", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, "a.ts"), "// a");
+    writeFileSync(path.join(dir, "b.ts"), "// b");
+
+    const result = filterGitignoredFiles(dir, ["a.ts", "b.ts"]);
+    assert.deepStrictEqual(result, ["a.ts", "b.ts"]);
+  });
+
+  it("returns empty array when all files are gitignored", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(dir, "data.json"), "{}");
+    writeFileSync(path.join(dir, "config.json"), "{}");
+
+    const result = filterGitignoredFiles(dir, ["data.json", "config.json"]);
+    assert.deepStrictEqual(result, []);
+  });
+
+  it("returns empty array for empty input", () => {
+    const dir = freshRepo();
+    assert.deepStrictEqual(filterGitignoredFiles(dir, []), []);
+  });
+
+  it("respects nested .gitignore", () => {
+    const dir = freshRepo();
+    const subdir = path.join(dir, "benchmarks");
+    fs.mkdirSync(subdir);
+    writeFileSync(path.join(subdir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(subdir, "data.json"), "{}");
+    writeFileSync(path.join(dir, "keep.ts"), "// keep");
+
+    const result = filterGitignoredFiles(dir, [
+      "benchmarks/data.json",
+      "keep.ts",
+    ]);
+    assert.deepStrictEqual(result, ["keep.ts"]);
+  });
+
+  it("does not filter tracked files even if they match .gitignore", () => {
+    const dir = freshRepo();
+    // Create and commit a tracked .json file first
+    writeFileSync(path.join(dir, "tracked.json"), "{}");
+    execSync("git add tracked.json && git commit -m 'add tracked json'", {
+      cwd: dir, stdio: "ignore",
+    });
+    // Now add *.json to .gitignore — tracked files should NOT be ignored
+    writeFileSync(path.join(dir, ".gitignore"), "*.json\n");
+
+    // tracked.json is still tracked, so it should NOT be filtered
+    const result = filterGitignoredFiles(dir, ["tracked.json"]);
+    assert.deepStrictEqual(result, ["tracked.json"]);
+  });
+});
+
+describe("stageAll", () => {
+  function freshRepo(): string {
+    const d = createTempRepo();
+    after(() => removeDir(d));
+    return d;
+  }
+
+  it("stages modified tracked files", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, "README.md"), "# modified\n");
+
+    const { diffStat, diffContent } = stageAll(dir);
+    assert.ok(diffStat.includes("README.md"), "diffStat should contain the modified file");
+    assert.ok(diffContent.includes("# modified"), "diffContent should include the change");
+  });
+
+  it("stages new untracked files", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, "new.ts"), "// new file");
+
+    const { diffStat, diffContent } = stageAll(dir);
+    assert.ok(diffStat.includes("new.ts"), "diffStat should contain new file");
+    assert.ok(diffContent.includes("+// new file"), "diffContent should show the new file");
+  });
+
+  it("does not stage gitignored untracked files", () => {
+    const dir = freshRepo();
+    writeFileSync(path.join(dir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(dir, "ignored.json"), "{}");
+    writeFileSync(path.join(dir, "keep.ts"), "// keep");
+
+    const { diffStat, diffContent } = stageAll(dir);
+    assert.ok(!diffStat.includes("ignored.json"), "diffStat should NOT contain gitignored file");
+    assert.ok(diffStat.includes("keep.ts"), "diffStat should contain non-ignored file");
+    assert.ok(!diffContent.includes("ignored.json"), "diffContent should NOT contain gitignored file");
+  });
+
+  it("returns empty strings when nothing is staged", () => {
+    const dir = freshRepo();
+    const { diffStat, diffContent } = stageAll(dir);
+    // Clean repo — nothing to stage
+    assert.strictEqual(diffStat, "");
+    assert.strictEqual(diffContent, "");
   });
 });
 
@@ -586,10 +742,10 @@ describe("checkGoalEvents", () => {
     _clearGoalStatuses();
   });
 
-  it("returns true when a goal transitions to completed", () => {
+  it("returns true when a goal transitions to complete", () => {
     const entries = [
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "complete" } } },
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
     const saved = _resetGoalScanCount();
@@ -599,9 +755,9 @@ describe("checkGoalEvents", () => {
     assert.strictEqual(result, true);
   });
 
-  it("returns false when goal stays completed (no transition)", () => {
+  it("returns false when goal stays complete (no transition)", () => {
     const entries = [
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "complete" } } },
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
     const saved = _resetGoalScanCount();
@@ -735,7 +891,7 @@ describe("ensureGoalsExtension", () => {
 // ===========================================================================
 
 describe("hasActiveGoal", () => {
-  it("returns true when there is an active (non-completed) goal", () => {
+  it("returns true when there is an active (non-complete) goal", () => {
     const entries = [
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
     ];
@@ -743,9 +899,9 @@ describe("hasActiveGoal", () => {
     assert.strictEqual(hasActiveGoal(ctx), true);
   });
 
-  it("returns false when all goals are completed", () => {
+  it("returns false when all goals are complete", () => {
     const entries = [
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "complete" } } },
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
     assert.strictEqual(hasActiveGoal(ctx), false);
@@ -756,7 +912,7 @@ describe("hasActiveGoal", () => {
     assert.strictEqual(hasActiveGoal(ctx), false);
   });
 
-  it("returns true for paused goals (not completed)", () => {
+  it("returns true for paused goals (not complete)", () => {
     const entries = [
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "paused" } } },
     ];
@@ -767,20 +923,20 @@ describe("hasActiveGoal", () => {
   it("scans backward and finds the latest goal status", () => {
     const entries = [
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "complete" } } },
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "active" } } },
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
-    // g1 is completed, g2 is active
+    // g1 is complete, g2 is active
     assert.strictEqual(hasActiveGoal(ctx), true);
   });
 
-  it("returns false when last state of all goals is completed", () => {
+  it("returns false when last state of all goals is complete", () => {
     const entries = [
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "running" } } },
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g1", status: "complete" } } },
       { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "active" } } },
-      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "completed" } } },
+      { type: "custom", customType: "pi-goal-state", data: { goal: { id: "g2", status: "complete" } } },
     ];
     const ctx = mockCtx({ sessionManager: { getEntries: () => entries } });
     assert.strictEqual(hasActiveGoal(ctx), false);
@@ -1143,6 +1299,209 @@ describe("cancel flow integration", () => {
 
     // Clean up
     fs.rmSync(path.join(dir, "midflight-test.ts"));
+  });
+});
+
+// ===========================================================================
+// commitStaged with gitignored files (unit-level integration)
+// ===========================================================================
+
+describe("gitignore commit integration", () => {
+  let dir: string;
+  let originalConfig: CommitterConfig;
+
+  before(() => {
+    dir = createTempRepo();
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    removeDir(dir);
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  /**
+   * Helper: directly test that filterGitignoredFiles prevents the grouped
+   * commit loop from crashing. We set up a gitignored file and verify that
+   * the individual `git add -- "<file>"` calls never touch ignored files.
+   */
+  it("filterGitignoredFiles prevents git add crash for gitignored untracked files", () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Set up .gitignore and create an untracked file that matches it
+    writeFileSync(path.join(repoDir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(repoDir, "ignored.json"), "{}");
+    writeFileSync(path.join(repoDir, "keep.ts"), "// keep");
+
+    // Stage everything so ignored.json doesn't get staged
+    execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+    const stagedFiles = execSync("git diff --cached --name-only", {
+      cwd: repoDir, encoding: "utf-8",
+    }).trim().split("\n").filter(Boolean);
+
+    // ignored.json should NOT be staged by git add -A (it's gitignored)
+    assert.ok(!stagedFiles.includes("ignored.json"),
+      "gitignored file should not be staged by git add -A");
+
+    // Now simulate the grouped commit loop: unstage + individual git add
+    execSync("git reset HEAD -- .", { cwd: repoDir, stdio: "ignore" });
+
+    // Filter through filterGitignoredFiles
+    const safeFiles = filterGitignoredFiles(repoDir, ["ignored.json", "keep.ts"]);
+    assert.deepStrictEqual(safeFiles, ["keep.ts"]);
+
+    // These should succeed without error
+    for (const f of safeFiles) {
+      execSync(`git add -- "${f}"`, { cwd: repoDir, stdio: "ignore" });
+    }
+
+    // Verify only keep.ts is staged
+    const afterStaged = execSync("git diff --cached --name-only", {
+      cwd: repoDir, encoding: "utf-8",
+    }).trim();
+    assert.strictEqual(afterStaged, "keep.ts");
+  });
+
+  it("handles .gitignore change mid-flow (after stageAll, before individual add)", () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Step 1: Set up .gitignore that does NOT ignore .json files
+    writeFileSync(path.join(repoDir, ".gitignore"), "# empty\n");
+    execSync("git add -A && git commit -m 'init gitignore'", {
+      cwd: repoDir, stdio: "ignore",
+    });
+
+    // Step 2: Create an untracked .json file (NOT gitignored at this point)
+    writeFileSync(path.join(repoDir, "data.json"), "{}");
+
+    // Step 3: Run stageAll — data.json is NOT gitignored, so it gets staged
+    execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+    const stagedBefore = execSync("git diff --cached --name-only", {
+      cwd: repoDir, encoding: "utf-8",
+    }).trim();
+    assert.ok(stagedBefore.includes("data.json"),
+      "data.json should be staged before .gitignore change");
+
+    // Step 4: NOW modify .gitignore to ignore *.json (simulating mid-flow change)
+    writeFileSync(path.join(repoDir, ".gitignore"), "*.json\n");
+
+    // Step 5: Simulate grouped commit loop: unstageAll, then individual git add
+    execSync("git reset HEAD -- .", { cwd: repoDir, stdio: "ignore" });
+
+    // WITHOUT filterGitignoredFiles, this would crash:
+    //   execSync(`git add -- "${f}"`, { cwd: repoDir, stdio: "ignore" });
+    // would fail because .gitignore now says *.json and data.json is untracked.
+    //
+    // WITH filterGitignoredFiles, data.json should be filtered out:
+    const safeFiles = filterGitignoredFiles(repoDir, ["data.json"]);
+    assert.deepStrictEqual(safeFiles, [],
+      "data.json should be filtered out because .gitignore now matches it");
+
+    // Verify that git add on the filtered list would NOT crash
+    for (const f of safeFiles) {
+      execSync(`git add -- "${f}"`, { cwd: repoDir, stdio: "ignore" });
+    }
+    // No crash means the fix works
+  });
+
+  it("group with all gitignored files is silently skipped", () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    writeFileSync(path.join(repoDir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(repoDir, "all.json"), "{}");
+    writeFileSync(path.join(repoDir, "data.json"), "[]");
+
+    // All files are gitignored → empty after filtering
+    const safeFiles = filterGitignoredFiles(repoDir, ["all.json", "data.json"]);
+    assert.deepStrictEqual(safeFiles, []);
+  });
+
+  it("nested .gitignore is respected", () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    const benchmarksDir = path.join(repoDir, "benchmarks");
+    fs.mkdirSync(benchmarksDir);
+    writeFileSync(path.join(benchmarksDir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(benchmarksDir, "results.json"), "{}");
+    writeFileSync(path.join(repoDir, "keep.ts"), "// keep");
+
+    const safeFiles = filterGitignoredFiles(repoDir, [
+      "benchmarks/results.json",
+      "keep.ts",
+    ]);
+    assert.deepStrictEqual(safeFiles, ["keep.ts"]);
+  });
+
+  /**
+   * Verify commitStaged returns undefined when there's nothing staged
+   * (e.g., all files were gitignored and never made it into the index).
+   */
+  it("commitStaged basic success case with mocked subagent", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Create and stage a file
+    writeFileSync(path.join(repoDir, "feat.ts"), "// new feature");
+    execSync("git add feat.ts", { cwd: repoDir, stdio: "ignore" });
+
+    // Mock subagent to return a commit message
+    const originalMock = __createAgentSessionMock;
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await commitStaged(
+        repoDir,
+        mockCtx(),
+        ["feat.ts"],
+        undefined,
+        undefined,
+      );
+
+      // commitStaged should return a hash (commit succeeded)
+      assert.ok(result, "Expected commitStaged to return a hash");
+      assert.strictEqual(result.length, 40, "Expected a 40-char SHA hash");
+
+      // Verify the commit was created
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      assert.strictEqual(count, 2, "Expected 2 commits (initial + created)");
+    } finally {
+      __setCreateAgentSessionMock(originalMock);
+    }
+  });
+
+  it("commitStaged returns undefined when gitignored files cannot be staged", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Add a .gitignore that matches a tracked file's NEW extension
+    // The file won't be modified, so diff --cached will be empty
+    writeFileSync(path.join(repoDir, ".gitignore"), "*.json\n");
+    writeFileSync(path.join(repoDir, "untracked.txt"), "hello");
+    // Don't stage it — simulate the case where all files were filtered out
+
+    const result = await commitStaged(
+      repoDir,
+      mockCtx(),
+      ["untracked.txt"],
+      undefined,
+      undefined,
+    );
+    // Nothing was staged, so commitStaged returns undefined (no commit)
+    assert.strictEqual(result, undefined);
   });
 });
 

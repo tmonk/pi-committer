@@ -71,7 +71,7 @@ exclude_patterns  = ["*.log", "node_modules/"]
 
 | Mode | Behaviour |
 |---|---|
-| `on_goal` | Commits when a goal transitions to `completed` |
+| `on_goal` | Commits when a goal transitions to `complete` |
 | `agent_sensible` | Commits after every agent turn |
 | `after_tool` | Commits after each tool call |
 | `manual` (default) | Never auto-commits; use `/commit` or `commit_changes` only |
@@ -88,7 +88,7 @@ enabled = true
 
 ### Auto-commit on goal completion
 
-With `enabled = true` and `trigger_mode = "on_goal"` (default), the extension hooks into [pi-goal](https://pi.dev/packages/@capyup/pi-goal)'s lifecycle. When a goal managed by pi-goal transitions to **completed** status, pi-committer automatically stages and commits the changes:
+With `enabled = true` and `trigger_mode = "on_goal"` (default), the extension hooks into [pi-goal](https://pi.dev/packages/@capyup/pi-goal)'s lifecycle. When a goal managed by pi-goal transitions to **complete** status, pi-committer automatically stages and commits the changes:
 
 ```
 /goals "Add user authentication"   ← start a goal via /goals

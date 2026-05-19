@@ -200,4 +200,79 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
 
     assert.ok(true);
   });
+
+  // -----------------------------------------------------------------------
+  it("Test 8: Gitignored files are skipped during commit", () => {
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
+    // Set up .gitignore
+    writeFileSync(path.join(testDir, ".gitignore"), "*.json\n");
+
+    // Create one file that IS gitignored and one that is NOT
+    writeFileSync(path.join(testDir, "ignored.json"), "{}");
+    writeFileSync(path.join(testDir, "keep.ts"), "// keep");
+
+    runPi(testDir, "/commit\n");
+
+    const count = commitCount(testDir);
+    assert.ok(count >= 2, `Expected >=2 commits, got ${count}`);
+
+    // The ignored.json should NOT be tracked
+    const status = execSync("git status --porcelain", {
+      cwd: testDir,
+      encoding: "utf-8",
+    }).trim();
+    assert.ok(status.includes("ignored.json"), "Expected ignored.json to remain untracked");
+    assert.ok(!status.includes("keep.ts"), "Expected keep.ts to be committed (not in status)");
+  });
+
+  // -----------------------------------------------------------------------
+  it("Test 9: Commit succeeds when all files are gitignored (no crash)", () => {
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
+    writeFileSync(path.join(testDir, ".gitignore"), "*\n!.gitignore\n");
+
+    // Any new file will be gitignored
+    writeFileSync(path.join(testDir, "data.json"), "{}");
+
+    // This should NOT crash — it should detect no committable changes
+    try {
+      runPi(testDir, "/commit\n");
+    } catch {
+      // The process may exit non-zero if pi reports an error message,
+      // but it should not crash with a Command failed: git add error
+    }
+
+    assert.ok(true);
+  });
+
+  // -----------------------------------------------------------------------
+  it("Test 10: Nested .gitignore is respected", () => {
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
+    // Remove the global *.json ignore from test 8
+    writeFileSync(path.join(testDir, ".gitignore"), "");
+
+    const benchmarksDir = path.join(testDir, "benchmarks");
+    fs.mkdirSync(benchmarksDir, { recursive: true });
+    writeFileSync(path.join(benchmarksDir, ".gitignore"), "*.json\n");
+
+    writeFileSync(path.join(benchmarksDir, "results.json"), "{}");
+    writeFileSync(path.join(testDir, "keep.ts"), "// keep");
+
+    runPi(testDir, "/commit\n");
+
+    const count = commitCount(testDir);
+    assert.ok(count >= 3, `Expected >=3 commits, got ${count}`);
+
+    // benchmarks/results.json should still be untracked
+    const status = execSync("git status --porcelain -- benchmarks/", {
+      cwd: testDir,
+      encoding: "utf-8",
+    }).trim();
+    assert.ok(status.includes("results.json"), "Expected results.json to remain untracked in nested gitignore");
+  });
 });

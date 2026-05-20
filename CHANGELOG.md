@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] — 2026-05-20
+
+### Fixed
+
+- **ENOBUFS (pipe buffer overflow) on large git diffs:** Replaced pipe-based `execSync` capture
+  of `git diff --cached` with file-based `--output=<file>` via a new `getDiffContent()` helper.
+  The file-based approach writes the diff directly to a temp file, bypassing the OS pipe buffer
+  entirely. This fixes `spawnSync /bin/sh ENOBUFS` errors on macOS when committing repos with
+  very large working trees (e.g. monorepos with thousands of changes).
+- **Missing `maxBuffer` on git commands:** Added `maxBuffer: 10MB` to all `git diff --cached --stat`
+  (3 call sites) and `git status --porcelain` (2 call sites) calls to prevent Node.js buffer
+  overflow on large outputs.
+
+### Changed
+
+- **Bumped version to 0.4.0** — minor release with the ENOBUFS fix.
+
 ## [0.3.0] — 2026-05-20
 
 ### Changed
@@ -57,6 +74,7 @@
 - Config loading with directory-walking discovery.
 - Comprehensive unit and E2E test suite.
 
+[0.4.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.4.0
 [0.3.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.3.0
 [0.2.1]: https://github.com/tmonk/pi-committer/releases/tag/v0.2.1
 [0.2.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.2.0

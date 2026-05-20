@@ -9,6 +9,8 @@ import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { execSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { loadConfig, type CommitterConfig } from "./config.ts";
 import {
@@ -233,20 +235,31 @@ export function getBranch(dir: string): string {
   }).trim();
 }
 
+/**
+ * Get the full staged diff by writing to a temp file via --output, avoiding the
+ * OS pipe buffer limit that causes ENOBUFS errors on macOS.
+ */
+function getDiffContent(dir: string): string {
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-committer-"));
+  const diffFile = path.join(tmpDir, "diff-cached.txt");
+  try {
+    execSync(`git diff --cached --output="${diffFile}"`, { cwd: dir, stdio: "ignore" });
+    return readFileSync(diffFile, "utf-8").trim();
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 /** Stage all changes and return the diff. */
 export function stageAll(dir: string): { diffStat: string; diffContent: string } {
   execSync("git add -A", { cwd: dir, stdio: "ignore" });
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
     encoding: "utf-8",
+    maxBuffer: 10 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
-  const diffContent = execSync("git diff --cached", {
-    cwd: dir,
-    encoding: "utf-8",
-    maxBuffer: 50 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  }).trim();
+  const diffContent = getDiffContent(dir);
   return { diffStat, diffContent };
 }
 
@@ -255,6 +268,7 @@ export function hasAnyChanges(dir: string): boolean {
   const status = execSync("git status --porcelain", {
     cwd: dir,
     encoding: "utf-8",
+    maxBuffer: 10 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
   return status.length > 0;
@@ -1044,17 +1058,13 @@ export async function commitStaged(
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
     encoding: "utf-8",
+    maxBuffer: 10 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
 
   if (!diffStat) return undefined;
 
-  const diffContent = execSync("git diff --cached", {
-    cwd: dir,
-    encoding: "utf-8",
-    maxBuffer: 50 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  }).trim();
+  const diffContent = getDiffContent(dir);
 
   try {
     const message = await generateCommitMessageViaSubagent(
@@ -1282,7 +1292,7 @@ export async function tryCommit(
       execSync("git add -A", { cwd: dir, stdio: "ignore" });
       if (config.excludePatterns.length > 0) {
         const remainingStat = execSync("git diff --cached --stat", {
-          cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+          cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
         }).trim();
         if (remainingStat) {
           const remainingFiles = getChangedFiles(remainingStat);
@@ -1497,6 +1507,7 @@ export function isDirtyRepo(repoDir: string): boolean {
     const status = execSync("git status --porcelain", {
       cwd: repoDir,
       encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     return status.length > 0;

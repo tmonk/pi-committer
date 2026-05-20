@@ -33,6 +33,14 @@ export interface CommitterConfig {
    * explicitly opts in to deferral by setting defer_to_goal_audit = true.
    */
   deferToGoalAudit: boolean;
+  /**
+   * Minimum number of changed files to trigger async (subprocess) mode.
+   * When the changed file count >= this threshold, the commit is forked into a
+   * detached child process so the conversation can continue immediately.
+   * Set to 0 to disable async mode entirely (always synchronous).
+   * Default: 10
+   */
+  asyncThreshold: number;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -46,6 +54,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   subagentModel: undefined,
   stagedCommits: true,
   deferToGoalAudit: false,
+  asyncThreshold: 10,
 };
 
 const CONVENTIONAL_TYPES = [
@@ -185,6 +194,10 @@ function applyConfig(
 
   if (typeof raw.defer_to_goal_audit === "boolean") {
     config.deferToGoalAudit = raw.defer_to_goal_audit;
+  }
+
+  if (typeof raw.async_threshold === "number") {
+    config.asyncThreshold = raw.async_threshold;
   }
 
   return config;

@@ -8,10 +8,11 @@ import {
 import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { execSync } from "node:child_process";
+import { execSync, fork } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig, type CommitterConfig } from "./config.ts";
 import {
   CommitterWidgetComponent,
@@ -41,6 +42,26 @@ export function setConfig(c: CommitterConfig): void {
 }
 let lastTurnEntryCount = 0;
 let committedThisTurn = false;
+
+// ---------------------------------------------------------------------------
+// Async commit subprocess state
+// ---------------------------------------------------------------------------
+
+/** Path to the async commit worker script (resolved relative to this module). */
+const __workerPath = (() => {
+  try {
+    return fileURLToPath(new URL("./async-commit-worker.ts", import.meta.url));
+  } catch {
+    return path.join(process.cwd(), "async-commit-worker.ts");
+  }
+})();
+
+/** Reference to the forked child process for async commits. */
+let __asyncChildProcess: import("node:child_process").ChildProcess | null = null;
+
+/** Flag set when an async commit is launched, checked by the tool handler. */
+let __asyncCommitStarted = false;
+let __asyncCommitFileCount = 0;
 
 // ---------------------------------------------------------------------------
 // Widget state
@@ -76,6 +97,15 @@ export function _resetGoalScanCount(): number {
 /** Restore the scan offset after a test that called _resetGoalScanCount. */
 export function _restoreGoalScanCount(saved: number): void {
   lastGoalScanEntryCount = saved;
+}
+
+/** Exported for unit test access. */
+export function _getAsyncCommitStarted(): boolean {
+  return __asyncCommitStarted;
+}
+/** Exported for unit test access. */
+export function _getAsyncCommitFileCount(): number {
+  return __asyncCommitFileCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +149,10 @@ function showCommitterWidget(
         __committerProgress &&
         __committerProgress.phase !== "done"
       ) {
+        // Kill async subprocess if running
+        if (__asyncChildProcess && !__asyncChildProcess.killed) {
+          __asyncChildProcess.kill("SIGTERM");
+        }
         __committerAbortController?.abort();
         return { consume: true };
       }
@@ -145,8 +179,20 @@ function updateCommitterWidget(): void {
   __committerWidgetComponent?.update();
 }
 
+function killAsyncSubprocess(): void {
+  if (__asyncChildProcess && !__asyncChildProcess.killed) {
+    try {
+      __asyncChildProcess.kill("SIGTERM");
+    } catch {
+      // Process may have already exited
+    }
+    __asyncChildProcess = null;
+  }
+}
+
 function hideCommitterWidget(ctx: ExtensionContext): void {
   stopCommitterAnimation();
+  killAsyncSubprocess();
   if (__committerTerminalInputUnsub) {
     __committerTerminalInputUnsub();
     __committerTerminalInputUnsub = null;
@@ -157,6 +203,8 @@ function hideCommitterWidget(ctx: ExtensionContext): void {
   __committerWidgetComponent = null;
   __committerAbortController = null;
   __committerProgress = null;
+  __asyncCommitStarted = false;
+  __asyncCommitFileCount = 0;
 }
 
 function getAbortSignal(): AbortSignal | undefined {
@@ -200,6 +248,23 @@ export function __setCreateAgentSessionMock(
 /** Resolve the current createAgentSession — mock if set, real otherwise. */
 function resolveCreateAgentSession(): typeof createAgentSession {
   return __createAgentSessionMock ?? createAgentSession;
+}
+
+// ---------------------------------------------------------------------------
+// Fork mock injection for unit tests
+// ---------------------------------------------------------------------------
+
+/** Override for fork() used in async commit tests. */
+export let __forkMock: typeof fork | undefined;
+
+/** Set a mock for fork (replaces the real one in test-scoped calls). */
+export function __setForkMock(mock: typeof fork | undefined): void {
+  __forkMock = mock;
+}
+
+/** Resolve the current fork — mock if set, real otherwise. */
+function resolveFork(): typeof fork {
+  return __forkMock ?? fork;
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1189,7 @@ export async function tryCommit(
   ctx: ExtensionContext,
   force = false,
   runtimeSignal?: AbortSignal,
+  allowAsync = true,
 ): Promise<number> {
   if (runtimeSignal?.aborted) return 0;
 
@@ -1163,6 +1229,12 @@ export async function tryCommit(
   if (!force && allFiles.length < config.minChanges) {
     unstageAll(dir);
     return 0;
+  }
+
+  // Check async threshold: for explicit commits (force=true) with enough files,
+  // fork the commit into a subprocess so the conversation can continue immediately.
+  if (allowAsync && config.asyncThreshold > 0 && force && allFiles.length >= config.asyncThreshold) {
+    return tryCommitAsync(dir, ctx, diffStat, diffContent, allFiles, runtimeSignal);
   }
 
   // Show the committer widget
@@ -1344,6 +1416,151 @@ export async function tryCommit(
   }
 
   return commitCount;
+}
+
+/**
+ * Fork the commit pipeline into a detached subprocess for large changes.
+ * Returns immediately (does not await the subprocess).
+ */
+async function tryCommitAsync(
+  dir: string,
+  ctx: ExtensionContext,
+  diffStat: string,
+  diffContent: string,
+  allFiles: string[],
+  runtimeSignal?: AbortSignal,
+): Promise<number> {
+  // Show widget with "preparing" phase — file count visible immediately
+  showCommitterWidget(ctx, {
+    phase: "preparing",
+    fileCount: allFiles.length,
+    statusMessage: `Preparing commit for ${allFiles.length} file(s)...`,
+  });
+
+  __asyncCommitStarted = true;
+  __asyncCommitFileCount = allFiles.length;
+
+  // Resolve model for the subprocess
+  const model = resolveSubagentModel(ctx);
+  const modelStr = model ? `${model.provider}/${model.id}` : undefined;
+
+  try {
+    const child = resolveFork()(__workerPath, [], {
+      execArgv: ["--experimental-strip-types"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      detached: true,
+    });
+
+    __asyncChildProcess = child;
+
+    // Update widget with PID immediately
+    if (__committerProgress && child.pid) {
+      __committerProgress.subprocessPid = child.pid;
+      updateCommitterWidget();
+    }
+
+    // Handle early exit (process died before sending result)
+    let resultReceived = false;
+
+    child.on("message", (msg: any) => {
+      if (!msg || !__committerProgress) return;
+
+      if (msg.type === "progress") {
+        __committerProgress.phase = msg.phase;
+        if (msg.fileCount !== undefined) __committerProgress.fileCount = msg.fileCount;
+        if (msg.statusMessage !== undefined) __committerProgress.statusMessage = msg.statusMessage;
+        if (msg.subagent !== undefined) __committerProgress.subagent = msg.subagent;
+        if (msg.totalCommits !== undefined) __committerProgress.totalCommits = msg.totalCommits;
+        if (msg.completedCommits !== undefined) __committerProgress.completedCommits = msg.completedCommits;
+        updateCommitterWidget();
+      } else if (msg.type === "commit") {
+        __committerProgress.commitLog.push(msg.commit);
+        __committerProgress.completedCommits = (__committerProgress.completedCommits ?? 0) + 1;
+        updateCommitterWidget();
+      } else if (msg.type === "result") {
+        resultReceived = true;
+        __asyncCommitStarted = false;
+        __asyncCommitFileCount = 0;
+        if (msg.error) {
+          __committerProgress.phase = "done";
+          __committerProgress.error = msg.error;
+          __committerProgress.totalCommits = msg.commitCount;
+          __committerProgress.completedCommits = msg.commitCount;
+          __committerProgress.commitLog = msg.commitLog || [];
+        } else {
+          __committerProgress.phase = "done";
+          __committerProgress.totalCommits = msg.commitCount;
+          __committerProgress.completedCommits = msg.commitCount;
+          __committerProgress.commitLog = msg.commitLog || [];
+        }
+        updateCommitterWidget();
+        setTimeout(() => hideCommitterWidget(ctx), 6000);
+        __asyncChildProcess = null;
+      }
+    });
+
+    child.on("error", (err: Error) => {
+      __asyncCommitStarted = false;
+      __asyncCommitFileCount = 0;
+      if (__committerProgress && !resultReceived) {
+        __committerProgress.phase = "done";
+        __committerProgress.error = `Subprocess error: ${err.message}`;
+        updateCommitterWidget();
+        setTimeout(() => hideCommitterWidget(ctx), 6000);
+      }
+      __asyncChildProcess = null;
+    });
+
+    child.on("exit", (code: number | null) => {
+      __asyncCommitStarted = false;
+      __asyncCommitFileCount = 0;
+      if (__committerProgress && !resultReceived) {
+        __committerProgress.phase = "done";
+        __committerProgress.error = code === 0 ? undefined : `Subprocess exited with code ${code ?? "unknown"}`;
+        if (!__committerProgress.error) {
+          // Clean exit without result — likely no changes
+          __committerProgress.totalCommits = 0;
+          __committerProgress.completedCommits = 0;
+        }
+        updateCommitterWidget();
+        setTimeout(() => hideCommitterWidget(ctx), 6000);
+      }
+      __asyncChildProcess = null;
+    });
+
+    // Send params to the worker
+    child.send({
+      type: "start",
+      params: {
+        dir,
+        diffStat,
+        diffContent,
+        allFiles,
+        stagedCommits: config.stagedCommits,
+        excludePatterns: config.excludePatterns,
+        minChanges: config.minChanges,
+        subagentModel: modelStr,
+      },
+    });
+
+    // Unref the child so it doesn't keep the process alive if the parent would otherwise exit
+    child.unref();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[pi-committer] Failed to fork async worker: ${msg}`);
+    // Fall back to sync path
+    hideCommitterWidget(ctx);
+    __asyncCommitStarted = false;
+    __asyncCommitFileCount = 0;
+    return 0;
+  }
+
+  // Return immediately — the subprocess runs in the background
+  ctx.ui.notify(
+    `[pi-committer] Commit started in background for ${allFiles.length} file(s). Progress visible in widget.`,
+    "info",
+  );
+  return -1;
 }
 
 /**
@@ -1556,8 +1773,9 @@ export async function commitAllRepos(
     if (runtimeSignal?.aborted) break;
     const label = repoDir === dir ? "primary" : repoDir.split("/").pop() ?? "";
     ctx.ui.notify(`[pi-committer] Committing in ${label}...`, "info");
-    const count = await tryCommit(repoDir, ctx, force, runtimeSignal);
-    totalCommits += count;
+    // Allow async only for single-repo (multi-repo async is out of scope)
+    const count = await tryCommit(repoDir, ctx, force, runtimeSignal, false);
+    if (count > 0) totalCommits += count;
   }
 
   return totalCommits;
@@ -1705,6 +1923,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       const count = await commitAllRepos(ctx.cwd, ctx, true, signal);
+
+      // Async commit started in background
+      if (count === -1) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Commit started in background for ${__asyncCommitFileCount} file(s). Progress visible in widget.`,
+            },
+          ],
+          details: { commitCount: 0, async: true },
+        };
+      }
+
       // Check for cancellation from any source (runtime signal or Esc via widget)
       if (signal?.aborted || isAborted()) {
         return {
@@ -1822,7 +2054,7 @@ export default function (pi: ExtensionAPI) {
   // Session shutdown — clean up per-session state
   // -----------------------------------------------------------------------
   pi.on("session_shutdown", async (_event, _ctx) => {
-    // Module-level state is naturally reset on the next session_start.
-    // No external resources (timers, connections, file watchers) to clean up.
+    // Kill any running async subprocess
+    killAsyncSubprocess();
   });
 }

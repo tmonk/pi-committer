@@ -47,6 +47,9 @@ import {
   __setCreateAgentSessionMock,
   __createAgentSessionMock,
 
+  // Fork mock
+  __setForkMock,
+
   // Session / goals
   findOtherReposFromSession,
   findDirtyRepos,
@@ -59,10 +62,15 @@ import {
   _clearGoalStatuses,
   _resetGoalScanCount,
   _restoreGoalScanCount,
+  _getAsyncCommitStarted,
+  _getAsyncCommitFileCount,
 
   // State
   getSelectedSubagentModel,
   setSelectedSubagentModel,
+
+  // Commit
+  tryCommit,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
@@ -166,6 +174,52 @@ enabled = true
 
     const cfg = loadConfig(dir);
     assert.strictEqual(cfg.deferToGoalAudit, false);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("defaults async_threshold to 10", () => {
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.asyncThreshold, 10);
+  });
+
+  it("parses async_threshold from .pi-committer.toml", () => {
+    const toml = `[committer]
+enabled = true
+async_threshold = 25
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.asyncThreshold, 25);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("parses async_threshold from .pi-committer.json", () => {
+    const json = JSON.stringify({
+      committer: {
+        async_threshold: 50,
+        enabled: true,
+      },
+    });
+    writeFileSync(path.join(dir, ".pi-committer.json"), json, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.asyncThreshold, 50);
+
+    fs.rmSync(path.join(dir, ".pi-committer.json"));
+  });
+
+  it("respects async_threshold = 0 to disable async", () => {
+    const toml = `[committer]
+enabled = true
+async_threshold = 0
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.asyncThreshold, 0);
 
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
@@ -1534,5 +1588,472 @@ describe("config state accessors", () => {
     setConfig(testCfg);
     assert.strictEqual(getConfig().deferToGoalAudit, false);
     setConfig(original);
+  });
+});
+
+// ===========================================================================
+// Async commit threshold tests
+// ===========================================================================
+
+describe("async commit threshold", () => {
+  let originalConfig: CommitterConfig;
+  let repoDir: string;
+
+  before(() => {
+    originalConfig = getConfig();
+    repoDir = createTempRepo();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+    removeDir(repoDir);
+  });
+
+  it("skips async when asyncThreshold is 0 (disabled)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set asyncThreshold to 0 (disabled)
+    setConfig({ ...originalConfig, asyncThreshold: 0 });
+
+    // Create some files
+    for (let i = 0; i < 15; i++) {
+      writeFileSync(path.join(dir, `file-${i}.ts`), `// file ${i}\n`);
+    }
+
+    // This would try to commit (no subagent mock), but should NOT trigger async
+    // since asyncThreshold is 0. Without a subagent mock, commitStaged will fail
+    // so it returns 0.
+    const result = await tryCommit(dir, mockCtx(), true, undefined);
+    assert.strictEqual(typeof result, "number");
+    // -1 = async started. We should NOT see -1 since asyncThreshold=0
+    assert.notStrictEqual(result, -1, "should NOT trigger async when asyncThreshold=0");
+  });
+
+  it("skips async when file count is below threshold", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set asyncThreshold to 20
+    setConfig({ ...originalConfig, asyncThreshold: 20 });
+
+    // Create 3 files (below threshold)
+    writeFileSync(path.join(dir, "a.ts"), "// a\n");
+    writeFileSync(path.join(dir, "b.ts"), "// b\n");
+    writeFileSync(path.join(dir, "c.ts"), "// c\n");
+
+    // Should NOT trigger async since file count (3) < threshold (20)
+    const result = await tryCommit(dir, mockCtx(), true, undefined);
+    assert.notStrictEqual(result, -1, "should NOT trigger async when files < threshold");
+    // Without subagent mock, commit may fail, but result should be 0 (not -1)
+    assert.ok(result >= 0, "result should be >= 0 when not async");
+  });
+
+  it("skips async when force=false (auto-trigger mode)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set low asyncThreshold so normally it would trigger
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    // Create 5 files
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `auto-${i}.ts`), `// auto ${i}\n`);
+    }
+
+    // Call without force (simulates auto-trigger) — should NOT trigger async
+    const result = await tryCommit(dir, mockCtx(), false, undefined);
+    assert.notStrictEqual(result, -1, "should NOT trigger async when force=false");
+  });
+
+  it("triggers async when conditions are met (with fork mock)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set low asyncThreshold
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    // Create 5 files
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `async-${i}.ts`), `// async ${i}\n`);
+    }
+
+    // Mock fork to return a fake child process
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99999;
+    mockChild.kill = () => {};
+    mockChild.send = () => true;
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    // Set the fork mock
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    try {
+      // Trigger async — should return -1
+      const result = await tryCommit(dir, mockCtx(), true, undefined);
+
+      // Should return -1 (async started)
+      assert.strictEqual(result, -1, "should return -1 when async started");
+
+      // The async started flag should be set
+      assert.ok(_getAsyncCommitStarted(), "async commit flag should be set");
+    } finally {
+      // Restore fork mock
+      __setForkMock(undefined);
+      // Reset config
+      setConfig(originalConfig);
+    }
+  });
+
+  it("Esc cancellation kills the async subprocess", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set low asyncThreshold
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    // Create 5 files
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `esc-${i}.ts`), `// esc ${i}\n`);
+    }
+
+    // Track if kill was called
+    let killCalled = false;
+    let killSignal = "";
+
+    // Mock fork to return a fake child process
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99998;
+    mockChild.kill = (signal?: string) => {
+      killCalled = true;
+      killSignal = signal || "";
+      // Simulate SIGTERM by emitting exit
+      setImmediate(() => mockChild.emit("exit", null));
+    };
+    mockChild.send = () => true;
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    // Capture the Esc handler
+    let capturedEscHandler: ((data: any) => any) | null = null;
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: (handler: (data: any) => any) => {
+          capturedEscHandler = handler;
+          return () => {}; // unsubscribe
+        },
+        setWidget: () => {},
+      },
+    });
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    try {
+      // Trigger async
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1 when async started");
+
+      // The Esc handler should have been registered
+      assert.ok(capturedEscHandler, "Esc handler should be registered");
+
+      // Simulate Esc key press with raw terminal escape character
+      const consumeResult = capturedEscHandler!("\x1b");
+      assert.ok(consumeResult, "Esc handler should return a result");
+      assert.ok(consumeResult?.consume, "Esc should consume the event");
+
+      // Verify kill was called on the child process
+      assert.ok(killCalled, "child.kill should be called on Esc");
+      assert.strictEqual(killSignal, "SIGTERM", "should send SIGTERM");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("simulates subprocess progress and result IPC", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `ipc-${i}.ts`), `// ipc ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99997;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    let capturedSend: ((msg: any) => boolean) | null = null;
+    mockChild.send = (msg: any) => {
+      capturedSend = msg;
+      return true;
+    };
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Verify the start message was sent to the worker
+      assert.ok(capturedSend, "child.send should be called");
+      assert.strictEqual(capturedSend!.type, "start", "should send 'start' message");
+      assert.ok(capturedSend!.params, "should include params");
+      assert.strictEqual(capturedSend!.params.dir, dir, "params should include dir");
+      assert.ok(Array.isArray(capturedSend!.params.allFiles), "params should include allFiles array");
+      assert.strictEqual(capturedSend!.params.stagedCommits, originalConfig.stagedCommits, "params should include stagedCommits");
+      assert.ok(capturedSend!.params.allFiles.length >= 5, "should have at least 5 files");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("handles worker error result via IPC", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `err-${i}.ts`), `// err ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99996;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Clear the flag so we can check result handling
+      assert.ok(_getAsyncCommitStarted(), "async started");
+
+      // Simulate worker sending error result
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Something went wrong in the worker",
+      });
+
+      // The flag should be cleared after result
+      assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after error result");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("handles worker crash (error event)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `crash-${i}.ts`), `// crash ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99995;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Simulate worker crash
+      mockChild.emit("error", new Error("Worker process crashed"));
+
+      // The flag should eventually be cleared
+      assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after crash");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("handles unexpected worker exit without result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `exit-${i}.ts`), `// exit ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99994;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Simulate worker exit without sending result
+      mockChild.emit("exit", 1);
+
+      // The flag should be cleared after exit
+      assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after exit");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+});
+
+// ===========================================================================
+// Async commit widget rendering tests
+// ===========================================================================
+
+describe("async commit widget rendering", () => {
+  it("renders preparing phase with file count", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "preparing",
+      fileCount: 25,
+      statusMessage: "Preparing commit for 25 file(s)...",
+      commitLog: [],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines.length > 0, "should render at least one line");
+    assert.ok(lines[0].includes("preparing"), "header should show preparing");
+    assert.ok(lines[0].includes("25"), "header should show file count");
+    assert.ok(lines.some((l) => l.includes("Esc")), "should show Esc hint");
+  });
+
+  it("renders preparing phase with subprocess PID", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "preparing",
+      fileCount: 25,
+      statusMessage: "Preparing commit for 25 file(s)...",
+      subprocessPid: 12345,
+      commitLog: [],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines.some((l) => l.includes("12345") || l.includes("pid")), "should show subprocess PID");
   });
 });

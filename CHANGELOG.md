@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0] — 2026-05-20
+
+### Added
+
+- **Async (background subprocess) commits:** When the number of changed files reaches a
+  configurable threshold (`async_threshold`, default 10), `/commit` and `commit_changes`
+  now fork the full commit pipeline into a detached child process and return immediately.
+  The conversation can continue while the commit runs in the background. A progress widget
+  shows real-time status (preparing → analyzing → committing → done). Pressing Esc sends
+  SIGTERM to the subprocess and cleans up. The worker has a 5-minute timeout safeguard.
+
+### Changed
+
+- **Bumped version to 0.5.0** — minor release with async commit support.
+
 ## [0.4.0] — 2026-05-20
 
 ### Fixed

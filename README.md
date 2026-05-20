@@ -63,6 +63,12 @@ exclude_patterns  = ["*.log", "node_modules/"]
 # Optional: override the model used by the commit-message subagent
 # subagent_model = "openai/gpt-4o-mini"
 
+# Threshold for async (background subprocess) commits. When the number of changed
+# files >= this value, /commit and commit_changes fork the commit pipeline into a
+# detached subprocess so the conversation continues immediately. The widget shows
+# progress and Esc cancels. Default: 10. Set to 0 to disable async (always sync).
+# async_threshold = 10
+
 # Optional: extend conventional commit types / restrict scopes
 # custom_types    = ["api", "wip"]
 # allowed_scopes  = ["api", "cli", "core"]

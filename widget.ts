@@ -13,7 +13,7 @@ export interface SubagentProgress {
   recentOutput: string[];
 }
 
-export type CommitterPhase = "idle" | "analyzing" | "committing" | "done" | "cancelled";
+export type CommitterPhase = "idle" | "preparing" | "analyzing" | "committing" | "done" | "cancelled";
 
 export interface CommitterProgress {
   phase: CommitterPhase;
@@ -33,6 +33,10 @@ export interface CommitterProgress {
   startedAt: number;
   /** Optional error message */
   error?: string;
+  /** PID of the background subprocess (for async commits) */
+  subprocessPid?: number;
+  /** Model being used by the subprocess (for display) */
+  subprocessModel?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +119,11 @@ export function renderCommitterWidgetLines(
   let label: string;
 
   switch (progress.phase) {
+    case "preparing":
+      icon = theme.fg("accent", spinnerFrame());
+      color = "accent";
+      label = `preparing${progress.fileCount ? `  ${progress.fileCount} files` : ""}`;
+      break;
     case "analyzing":
       icon = theme.fg("accent", spinnerFrame());
       color = "accent";
@@ -156,6 +165,41 @@ export function renderCommitterWidgetLines(
   ];
 
   // Phase-specific content
+  if (progress.phase === "preparing") {
+    if (progress.statusMessage) {
+      lines.push(
+        branchLine(
+          theme,
+          safeWidth,
+          false,
+          `${theme.fg("muted", "○")} ${theme.fg("dim", progress.statusMessage)}`,
+        ),
+      );
+    }
+
+    // Subprocess PID if available
+    if (progress.subprocessPid) {
+      lines.push(
+        branchLine(
+          theme,
+          safeWidth,
+          false,
+          `${theme.fg("accent", "pid")} ${theme.fg("dim", String(progress.subprocessPid))}`,
+        ),
+      );
+    }
+
+    // Esc hint
+    lines.push(
+      branchLine(
+        theme,
+        safeWidth,
+        true,
+        `${theme.fg("warning", "Esc to cancel")}${theme.fg("dim", " — cancel commit operation")}`,
+      ),
+    );
+  }
+
   if (progress.phase === "analyzing") {
     if (progress.statusMessage) {
       lines.push(

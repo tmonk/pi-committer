@@ -24,10 +24,13 @@ export interface CommitterConfig {
    */
   stagedCommits: boolean;
   /**
-   * When true (default) and trigger_mode is "on_goal" with pi-goal present,
+   * When true and trigger_mode is "on_goal" with pi-goal present,
    * the commit_changes tool will skip committing if a goal is active and
    * defer to the automatic on_goal trigger (which runs after the goal audit passes).
    * This prevents premature commits before the pi-goal auditor has verified completion.
+   *
+   * Defaults to false — commit_changes always proceeds immediately unless the user
+   * explicitly opts in to deferral by setting defer_to_goal_audit = true.
    */
   deferToGoalAudit: boolean;
 }
@@ -42,7 +45,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   excludePatterns: [],
   subagentModel: undefined,
   stagedCommits: true,
-  deferToGoalAudit: true,
+  deferToGoalAudit: false,
 };
 
 const CONVENTIONAL_TYPES = [

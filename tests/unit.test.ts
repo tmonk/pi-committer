@@ -125,7 +125,7 @@ describe("config loading", () => {
     assert.strictEqual(cfg.stagedCommits, true);
     assert.deepStrictEqual(cfg.excludePatterns, []);
     assert.strictEqual(cfg.minChanges, 1);
-    assert.strictEqual(cfg.deferToGoalAudit, true);
+    assert.strictEqual(cfg.deferToGoalAudit, false);
   });
 
   it("parses defer_to_goal_audit from .pi-committer.toml", () => {
@@ -158,14 +158,14 @@ defer_to_goal_audit = false
     fs.rmSync(path.join(dir, ".pi-committer.json"));
   });
 
-  it("defaults defer_to_goal_audit to true when not in config", () => {
+  it("defaults defer_to_goal_audit to false when not in config", () => {
     const toml = `[committer]
 enabled = true
 `;
     writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
 
     const cfg = loadConfig(dir);
-    assert.strictEqual(cfg.deferToGoalAudit, true);
+    assert.strictEqual(cfg.deferToGoalAudit, false);
 
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
@@ -1516,8 +1516,8 @@ describe("config state accessors", () => {
     assert.ok("enabled" in cfg && "triggerMode" in cfg);
   });
 
-  it("deferToGoalAudit defaults to true", () => {
-    assert.strictEqual(getConfig().deferToGoalAudit, true);
+  it("deferToGoalAudit defaults to false", () => {
+    assert.strictEqual(getConfig().deferToGoalAudit, false);
   });
 
   it("setConfig replaces config", () => {

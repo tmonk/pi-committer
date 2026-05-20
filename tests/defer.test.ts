@@ -363,15 +363,15 @@ staged_commits = true
   // Edge case: What if the config file has an error and falls back to defaults?
   // This is a potential root cause for the reported bug.
   // -----------------------------------------------------------------------
-  it("loadConfig returns defaults (deferToGoalAudit=true) when config file has syntax errors", () => {
+  it("loadConfig returns defaults (deferToGoalAudit=false) when config file has syntax errors", () => {
     const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-cfg-bad-"));
     try {
       // Invalid TOML — missing value
       writeFileSync(path.join(dir, ".pi-committer.toml"), "[committer]\n  defer_to_goal_audit = \n", "utf-8");
 
       const cfg = loadConfig(dir);
-      assert.strictEqual(cfg.deferToGoalAudit, true,
-        "should fall back to default deferToGoalAudit=true when config has syntax errors");
+      assert.strictEqual(cfg.deferToGoalAudit, false,
+        "should fall back to default deferToGoalAudit=false when config has syntax errors");
     } finally {
       removeDir(dir);
     }
@@ -391,8 +391,8 @@ defer_to_goal_audit = "false"
       writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
 
       const cfg = loadConfig(dir);
-      assert.strictEqual(cfg.deferToGoalAudit, true,
-        "should stay at default true when defer_to_goal_audit is a string, not boolean");
+      assert.strictEqual(cfg.deferToGoalAudit, false,
+        "should stay at default false when defer_to_goal_audit is a string, not boolean");
     } finally {
       removeDir(dir);
     }

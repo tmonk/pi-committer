@@ -2,15 +2,29 @@
 
 ## [0.3.0] — 2026-05-20
 
+### Changed
+
+- **Default `defer_to_goal_audit` is now `false`** (was `true`). `commit_changes` always proceeds
+  immediately unless the user explicitly opts in to deferral with `defer_to_goal_audit = true`.
+  This fixes a common scenario where the session cwd differs from the project root, causing
+  the config file to be missed and `config.deferToGoalAudit` to silently stay at the old default
+  of `true`.
+
 ### Fixed
 
-- **Defer-to-goal-audit bypass:** Refactored defer check into `shouldDeferToGoalAudit()` function. The `commit_changes` tool now correctly honours `defer_to_goal_audit = false` in `.pi-committer.toml` — when set to `false`, commits proceed immediately even with an active pi-goal goal instead of deferring.
+- **Defer-to-goal-audit bypass:** Refactored defer check into `shouldDeferToGoalAudit()` function.
+  The `commit_changes` tool now correctly honours `defer_to_goal_audit = false` in
+  `.pi-committer.toml` — when set to `false`, commits proceed immediately even with an active
+  pi-goal goal instead of deferring.
 - **Duplicate `try {`:** Fixed syntax artifact in `hasActiveGoal()`.
 
 ### Added
 
-- **shouldDeferToGoalAudit(cfg, ctx):** New exported function encapsulating the defer decision logic for testability and clarity.
-- **Comprehensive defer-logic tests:** 11 new unit tests (107 total) covering every combination of `deferToGoalAudit`, trigger mode, goal presence, and goal status, including config file round-trips, syntax-error fallbacks, and boolean-string edge cases.
+- **shouldDeferToGoalAudit(cfg, ctx):** New exported function encapsulating the defer decision
+  logic for testability and clarity.
+- **Comprehensive defer-logic tests:** 11 new unit tests (107 total) covering every combination
+  of `deferToGoalAudit`, trigger mode, goal presence, and goal status, including config file
+  round-trips, syntax-error fallbacks, and boolean-string edge cases.
 - **`.pi-committer.toml` in pystata-x:** Created project config with `defer_to_goal_audit = false`.
 
 ## [0.2.1] — 2026-05-19

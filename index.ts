@@ -731,6 +731,31 @@ export function ensureGoalsExtension(ctx: ExtensionContext): boolean {
   return false;
 }
 
+/**
+ * Determine whether commit_changes should defer to the automatic on_goal
+ * trigger instead of committing immediately.
+ *
+ * Returns true only when ALL of the following hold:
+ * 1. config.deferToGoalAudit is true (i.e., the user hasn't opted out)
+ * 2. trigger mode is "on_goal"
+ * 3. pi-goal extension is present in the session
+ * 4. pi-goal has an active (non-complete) goal
+ *
+ * When deferToGoalAudit is false (set in .pi-committer.toml), this always
+ * returns false, allowing commit_changes to proceed immediately.
+ */
+export function shouldDeferToGoalAudit(
+  cfg: CommitterConfig,
+  ctx: ExtensionContext,
+): boolean {
+  return (
+    cfg.deferToGoalAudit &&
+    cfg.triggerMode === "on_goal" &&
+    hasGoalsExtension(ctx) &&
+    hasActiveGoal(ctx)
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Commit message generation via subagent
 // ---------------------------------------------------------------------------
@@ -1649,15 +1674,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Defer to goal audit: if on_goal mode is active and pi-goal has an
+        // Defer to goal audit: if on_goal mode is active and pi-goal has an
       // active (non-complete) goal, skip committing and let the automatic
       // on_goal trigger handle it after the goal audit passes.
-      if (
-        config.deferToGoalAudit &&
-        config.triggerMode === "on_goal" &&
-        hasGoalsExtension(ctx) &&
-        hasActiveGoal(ctx)
-      ) {
+      if (shouldDeferToGoalAudit(config, ctx)) {
         return {
           content: [
             {

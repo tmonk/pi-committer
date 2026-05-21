@@ -146,16 +146,27 @@ function unstageAll(dir: string): void {
 }
 
 function getDiffContent(dir: string): string {
-  const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-committer-worker-"));
-  const diffFile = path.join(tmpDir, "diff-cached.txt");
+  // Fast path: pipe the diff through execSync with a 10MB buffer.
   try {
-    execSync(`git diff --cached --output="${diffFile}"`, {
+    return execSync("git diff --cached", {
       cwd: dir,
-      stdio: "ignore",
-    });
-    return readFileSync(diffFile, "utf-8").trim();
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    // Fallback: use file-based approach to bypass pipe limits on very large diffs
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-committer-worker-"));
+    const diffFile = path.join(tmpDir, "diff-cached.txt");
+    try {
+      execSync(`git diff --cached --output="${diffFile}"`, {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      return readFileSync(diffFile, "utf-8").trim();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -237,11 +248,20 @@ function unstageExcludedFiles(
     }
   }
 
-  for (const f of toUnstage) {
+  // Batch-unstage all excluded files in one command
+  if (toUnstage.length > 0) {
+    const paths = toUnstage.map((f) => `${JSON.stringify(f)}`).join(" ");
     try {
-      execSync(`git reset HEAD -- "${f}"`, { cwd: dir, stdio: "ignore" });
+      execSync(`git reset HEAD -- ${paths}`, { cwd: dir, stdio: "ignore" });
     } catch {
-      // File might not be staged, ignore
+      // Per-file fallback
+      for (const f of toUnstage) {
+        try {
+          execSync(`git reset HEAD -- ${JSON.stringify(f)}`, { cwd: dir, stdio: "ignore" });
+        } catch {
+          // File might not be staged, ignore
+        }
+      }
     }
   }
 

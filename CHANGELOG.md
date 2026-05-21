@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.6.0] — 2026-05-21
+
+### Added
+
+- **Benchmark suite:** 34 benchmark tests covering all major phases (diff, check-ignore, reset,
+  add, diff stat parsing, commit, full pipeline with `stagedCommits` on/off, subagent fallback,
+  group parsing) at 3 file sizes (5, 30, 100 files) with per-operation wall-clock timing and
+  TAP-formatted summary output. Baseline/optimized result files stored in-repo.
+- **Profiling instrumentation:** `_getLastSubagentCallMs()` and `_getLastGroupGenCallMs()` timing
+  hooks record real wall-clock duration of subagent message generation and group generation calls
+  during actual usage.
+
+### Changed
+
+- **`filterGitignoredFiles`** — batched `git check-ignore --stdin` using a single `execSync` call
+  with all paths piped via stdin, replacing `O(n)` per-file `git check-ignore -q` calls.
+  **Speedup: ~167×** (2505ms → 15ms for 100 files).
+- **`unstageExcludedFiles`** — single `git reset HEAD -- <file1> <file2> ...` call with all
+  excluded files, replacing `O(n)` per-file `git reset HEAD` calls, with per-file fallback
+  on failure. Applied to both `index.ts` and `async-commit-worker.ts`. **Speedup: ~5×**.
+- **`getDiffContent`** — fast path via `execSync` pipe with 10MB `maxBuffer`, replacing
+  temp-dir + `--output=<file>` I/O for the common case. Falls back to temp-dir only on
+  `ENOBUFS`. Applied to both `index.ts` and `async-commit-worker.ts`.
+- **`asyncThreshold` default lowered from 10 to 5** — benchmark-informed decision: at 5 files,
+  the optimized pipeline completes in ~90ms vs ~140ms baseline, making async subprocess overhead
+  worthwhile at this threshold.
+
 ## [0.5.0] — 2026-05-20
 
 ### Added
@@ -89,6 +116,7 @@
 - Config loading with directory-walking discovery.
 - Comprehensive unit and E2E test suite.
 
+[0.5.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.5.0
 [0.4.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.4.0
 [0.3.0]: https://github.com/tmonk/pi-committer/releases/tag/v0.3.0
 [0.2.1]: https://github.com/tmonk/pi-committer/releases/tag/v0.2.1

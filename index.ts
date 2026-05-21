@@ -59,6 +59,19 @@ const __workerPath = (() => {
 /** Reference to the forked child process for async commits. */
 let __asyncChildProcess: import("node:child_process").ChildProcess | null = null;
 
+// ---------------------------------------------------------------------------
+// Profiling instrumentation (used by benchmarks and runtime introspection)
+// ---------------------------------------------------------------------------
+
+/** Last subagent call duration in ms (timer started before session creation). */
+let __lastSubagentCallMs = 0;
+/** Export for benchmarks. */
+export function _getLastSubagentCallMs(): number { return __lastSubagentCallMs; }
+/** Last commit group generation duration in ms. */
+let __lastGroupGenCallMs = 0;
+/** Export for benchmarks. */
+export function _getLastGroupGenCallMs(): number { return __lastGroupGenCallMs; }
+
 /** Flag set when an async commit is launched, checked by the tool handler. */
 let __asyncCommitStarted = false;
 let __asyncCommitFileCount = 0;
@@ -304,14 +317,27 @@ export function getBranch(dir: string): string {
  * Get the full staged diff by writing to a temp file via --output, avoiding the
  * OS pipe buffer limit that causes ENOBUFS errors on macOS.
  */
-function getDiffContent(dir: string): string {
-  const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-committer-"));
-  const diffFile = path.join(tmpDir, "diff-cached.txt");
+/** @internal exported for benchmarking */
+export function getDiffContent(dir: string): string {
+  // Fast path: pipe the diff through execSync with a 10MB buffer.
   try {
-    execSync(`git diff --cached --output="${diffFile}"`, { cwd: dir, stdio: "ignore" });
-    return readFileSync(diffFile, "utf-8").trim();
-  } finally {
-    rmSync(tmpDir, { recursive: true, force: true });
+    return execSync("git diff --cached", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    // Fallback: if pipe buffer limits are hit (ENOBUFS on very large diffs),
+    // use the file-based approach that bypasses the pipe entirely.
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-committer-"));
+    const diffFile = path.join(tmpDir, "diff-cached.txt");
+    try {
+      execSync(`git diff --cached --output="${diffFile}"`, { cwd: dir, stdio: "ignore" });
+      return readFileSync(diffFile, "utf-8").trim();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -345,14 +371,20 @@ export function hasAnyChanges(dir: string): boolean {
  */
 export function filterGitignoredFiles(dir: string, files: string[]): string[] {
   if (files.length === 0) return [];
-  return files.filter((f) => {
-    try {
-      execSync(`git check-ignore -q -- "${f}"`, { cwd: dir, stdio: "pipe" });
-      return false; // exit 0 = ignored
-    } catch {
-      return true; // exit non-zero = not ignored
-    }
-  });
+  // Batched check: feed all paths via stdin so git only runs once.
+  try {
+    const result = execSync(`git check-ignore --stdin`, {
+      cwd: dir,
+      input: files.join("\n"),
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const ignored = new Set(result.trim().split("\n").filter(Boolean));
+    return files.filter((f) => !ignored.has(f));
+  } catch {
+    // git check-ignore exits with code 1 when nothing is ignored
+    return files;
+  }
 }
 
 /** Extract changed file list from diff stat. */
@@ -380,6 +412,8 @@ export function unstageExcludedFiles(
   if (excludePatterns.length === 0) return files;
 
   const kept: string[] = [];
+  const toUnstage: string[] = [];
+
   for (const file of files) {
     const shouldExclude = excludePatterns.some((pattern) => {
       if (pattern.startsWith("*.")) {
@@ -389,22 +423,41 @@ export function unstageExcludedFiles(
     });
 
     if (shouldExclude) {
-      try {
-        execSync(`git reset HEAD -- "${file}"`, { cwd: dir, stdio: "ignore" });
-      } catch {
-        try {
-          execSync(`git rm --cached -- "${file}"`, {
-            cwd: dir,
-            stdio: "ignore",
-          });
-        } catch {
-          // ignore
-        }
-      }
+      toUnstage.push(file);
     } else {
       kept.push(file);
     }
   }
+
+  // Batch-unstage all excluded files in one command
+  if (toUnstage.length > 0) {
+    const paths = toUnstage.map((f) => `${JSON.stringify(f)}`).join(" ");
+    try {
+      execSync(`git reset HEAD -- ${paths}`, { cwd: dir, stdio: "ignore" });
+    } catch {
+      // Fallback: some files might be new (never tracked), try git rm
+      try {
+        execSync(`git rm --cached -- ${paths}`, { cwd: dir, stdio: "ignore" });
+      } catch {
+        // Ultimate per-file fallback
+        for (const f of toUnstage) {
+          try {
+            execSync(`git reset HEAD -- ${JSON.stringify(f)}`, { cwd: dir, stdio: "ignore" });
+          } catch {
+            try {
+              execSync(`git rm --cached -- ${JSON.stringify(f)}`, {
+                cwd: dir,
+                stdio: "ignore",
+              });
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    }
+  }
+
   return kept;
 }
 
@@ -513,6 +566,7 @@ export async function generateStagedCommitGroups(
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
 ): Promise<CommitGroup[]> {
+  const _ts = performance.now();
   const truncatedDiff =
     diffContent.length > 12000
       ? diffContent.slice(0, 12000) + "\n... (truncated)"
@@ -641,6 +695,7 @@ export async function generateStagedCommitGroups(
 
     try {
       if (signal?.aborted) {
+        __lastGroupGenCallMs = performance.now() - _ts;
         return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
       }
       await session.prompt(prompt);
@@ -650,11 +705,13 @@ export async function generateStagedCommitGroups(
     }
 
     if (signal?.aborted) {
+      __lastGroupGenCallMs = performance.now() - _ts;
       return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
     }
 
     const output = outputParts.join("\n\n").trim();
     if (output.length < 20) {
+      __lastGroupGenCallMs = performance.now() - _ts;
       return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
     }
 
@@ -675,13 +732,16 @@ export async function generateStagedCommitGroups(
     }
 
     if (groups.length === 0) {
+      __lastGroupGenCallMs = performance.now() - _ts;
       return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
     }
 
+    __lastGroupGenCallMs = performance.now() - _ts;
     return groups;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[pi-committer] Staged commit grouping failed: ${msg}`);
+    __lastGroupGenCallMs = performance.now() - _ts;
     return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
   }
 }
@@ -897,6 +957,7 @@ export async function generateCommitMessageViaSubagent(
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
 ): Promise<string> {
+  const _ts = performance.now();
   const truncatedDiff =
     diffContent.length > 8000
       ? diffContent.slice(0, 8000) + "\n... (truncated)"
@@ -1010,7 +1071,10 @@ export async function generateCommitMessageViaSubagent(
     signal?.addEventListener("abort", abortSession, { once: true });
 
     try {
-      if (signal?.aborted) return deterministicCommitMessage(diffStat, diffContent);
+      if (signal?.aborted) {
+        __lastSubagentCallMs = performance.now() - _ts;
+        return deterministicCommitMessage(diffStat, diffContent);
+      }
       await session.prompt(prompt);
     } finally {
       signal?.removeEventListener("abort", abortSession);
@@ -1018,12 +1082,16 @@ export async function generateCommitMessageViaSubagent(
     }
 
     const generated = outputParts.join("\n\n").trim();
-    if (generated.length > 10) return generated;
+    if (generated.length > 10) {
+      __lastSubagentCallMs = performance.now() - _ts;
+      return generated;
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[pi-committer] Subagent message generation failed: ${msg}`);
   }
 
+  __lastSubagentCallMs = performance.now() - _ts;
   return deterministicCommitMessage(diffStat, diffContent);
 }
 

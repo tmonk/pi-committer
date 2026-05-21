@@ -54,7 +54,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   subagentModel: undefined,
   stagedCommits: true,
   deferToGoalAudit: false,
-  asyncThreshold: 10,
+  asyncThreshold: 5,
 };
 
 const CONVENTIONAL_TYPES = [

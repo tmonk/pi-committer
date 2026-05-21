@@ -1,0 +1,35 @@
+# Benchmark results — 2026-05-21T11:19:02.614Z
+# Git: git version 2.50.1 (Apple Git-155)
+# Run: 30 measurements
+
+Operation                                     Size     Avg (ms)   Min (ms)   Max (ms)   Runs
+getDiffContent                                small    16.91      16.86      16.96      3
+getDiffContent                                medium   20.53      19.53      21.07      3
+getDiffContent                                large    31.52      29.94      32.84      3
+filterGitignoredFiles                         small    14.93      14.21      16.05      3
+filterGitignoredFiles                         medium   14.23      14.05      14.38      3
+filterGitignoredFiles                         large    13.68      13.4       13.86      3
+unstageExcludedFiles                          small    15.38      15.02      16.1       3
+unstageExcludedFiles                          medium   15.61      15.15      16.05      3
+unstageExcludedFiles                          large    17.85      17.4       18.73      3
+stageAll                                      small    46.57      45.01      49.27      3
+stageAll                                      medium   60.82      54.9       72.22      3
+stageAll                                      large    93.65      73.07      128.89     3
+getChangedFiles (parse)                       small    0.01       0          0.01       3
+getChangedFiles (parse)                       medium   0.01       0.01       0.02       3
+getChangedFiles (parse)                       large    0.02       0.02       0.03       3
+git commit                                    small    24.93      23.56      26.6       3
+git commit                                    medium   26.01      24.47      28.37      3
+git commit                                    large    30.75      25.73      39.22      3
+full pipeline stagedCommits=on                small    93.12      91.48      94.48      3
+full pipeline stagedCommits=on                medium   114.82     113.25     116.87     3
+full pipeline stagedCommits=on                large    184.71     182.59     185.84     3
+full pipeline stagedCommits=off               small    89.64      86.68      91.85      3
+full pipeline stagedCommits=off               medium   114.76     112.9      118.06     3
+full pipeline stagedCommits=off               large    178.85     176.91     181.43     3
+deterministicCommitMessage                    small    0.1        0.01       0.28       3
+deterministicCommitMessage                    medium   0.06       0.05       0.08       3
+deterministicCommitMessage                    large    0.52       0.47       0.56       3
+parseCommitGroups                             small    0.09       0          0.22       3
+parseCommitGroups                             medium   0.02       0.01       0.03       3
+parseCommitGroups                             large    0.05       0.04       0.05       3

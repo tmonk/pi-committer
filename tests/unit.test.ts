@@ -10,7 +10,7 @@ import assert from "node:assert";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, chmodSync, mkdirSync } from "node:fs";
 
 import {
   renderCommitterWidgetLines,
@@ -178,9 +178,9 @@ enabled = true
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
 
-  it("defaults async_threshold to 10", () => {
+  it("defaults async_threshold to 5", () => {
     const cfg = loadConfig(dir);
-    assert.strictEqual(cfg.asyncThreshold, 10);
+    assert.strictEqual(cfg.asyncThreshold, 5);
   });
 
   it("parses async_threshold from .pi-committer.toml", () => {
@@ -2055,5 +2055,612 @@ describe("async commit widget rendering", () => {
 
     const lines = renderCommitterWidgetLines(progress, theme, 80);
     assert.ok(lines.some((l) => l.includes("12345") || l.includes("pid")), "should show subprocess PID");
+  });
+});
+
+// ===========================================================================
+// Commit error handling
+// ===========================================================================
+
+describe("commit error handling", () => {
+  let originalConfig: CommitterConfig;
+  let originalMock: ((opts: any) => any) | undefined;
+
+  before(() => {
+    // Initialize config from defaults (extension entry point doesn't run in tests)
+    setConfig(loadConfig(process.cwd()));
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  /** Create a repo WITH a pre-commit hook that always fails. */
+  function createRepoWithFailingHook(): string {
+    const dir = createTempRepo();
+    const hookDir = path.join(dir, ".git", "hooks");
+    if (!existsSync(hookDir)) {
+      fs.mkdirSync(hookDir, { recursive: true });
+    }
+    writeFileSync(path.join(hookDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
+    fs.chmodSync(path.join(hookDir, "pre-commit"), 0o755);
+    return dir;
+  }
+
+  /** Create a repo WITH a pre-commit hook that writes to stdout/stderr and fails. */
+  function createRepoWithNoisyFailingHook(): string {
+    const dir = createTempRepo();
+    const hookDir = path.join(dir, ".git", "hooks");
+    if (!existsSync(hookDir)) {
+      fs.mkdirSync(hookDir, { recursive: true });
+    }
+    writeFileSync(
+      path.join(hookDir, "pre-commit"),
+      "#!/bin/sh\necho \"Linting failed...\"\necho \"Error: trailing whitespace\" >&2\nexit 1\n",
+    );
+    fs.chmodSync(path.join(hookDir, "pre-commit"), 0o755);
+    return dir;
+  }
+
+  // -----------------------------------------------------------------------
+  // commitStaged (single commit, index.ts)
+  // -----------------------------------------------------------------------
+
+  it("commitStaged returns undefined on commit-msg hook failure", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Add a failing commit-msg hook (different hook than pre-commit)
+    const hookDir = path.join(repoDir, ".git", "hooks");
+    if (!existsSync(hookDir)) {
+      mkdirSync(hookDir, { recursive: true });
+    }
+    writeFileSync(path.join(hookDir, "commit-msg"), "#!/bin/sh\nexit 1\n");
+    chmodSync(path.join(hookDir, "commit-msg"), 0o755);
+
+    // Create and stage a file
+    writeFileSync(path.join(repoDir, "fix.ts"), "// fix");
+    execSync("git add fix.ts", { cwd: repoDir, stdio: "ignore" });
+
+    // Mock subagent to bypass real agent call
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await commitStaged(repoDir, mockCtx(), ["fix.ts"], undefined, undefined);
+
+      // commitStaged should return undefined since commit-msg hook failed
+      assert.strictEqual(result, undefined, "Expected undefined on commit-msg hook failure");
+
+      // Verify no commit was created
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      assert.strictEqual(count, 1, "Expected only the initial commit (hook rejected)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("commitStaged returns undefined on pre-commit hook failure", async () => {
+    const repoDir = createRepoWithFailingHook();
+    after(() => removeDir(repoDir));
+
+    // Create and stage a file
+    writeFileSync(path.join(repoDir, "bugfix.ts"), "// bugfix");
+    execSync("git add bugfix.ts", { cwd: repoDir, stdio: "ignore" });
+
+    // Mock subagent
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await commitStaged(repoDir, mockCtx(), ["bugfix.ts"], undefined, undefined);
+
+      // commitStaged should return undefined since the hook failed
+      assert.strictEqual(result, undefined, "Expected undefined on pre-commit hook failure");
+
+      // Verify no commit was created beyond the initial
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      assert.strictEqual(count, 1, "Expected only the initial commit (hook rejected)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("commitStaged returns undefined on noisy pre-commit hook failure (stderr output)", async () => {
+    const repoDir = createRepoWithNoisyFailingHook();
+    after(() => removeDir(repoDir));
+
+    writeFileSync(path.join(repoDir, "lint-fix.ts"), "// ok");
+    execSync("git add lint-fix.ts", { cwd: repoDir, stdio: "ignore" });
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await commitStaged(repoDir, mockCtx(), ["lint-fix.ts"], undefined, undefined);
+
+      // Must still gracefully handle hook failure even with stderr noise
+      assert.strictEqual(result, undefined, "Expected undefined on noisy pre-commit hook failure");
+
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "No commit should have been made");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // tryCommit grouped flow (index.ts) — error recovery
+  // -----------------------------------------------------------------------
+
+  it("tryCommit grouped flow handles commit-msg hook failure gracefully", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Add a failing commit-msg hook
+    const hookDir = path.join(repoDir, ".git", "hooks");
+    if (!existsSync(hookDir)) {
+      mkdirSync(hookDir, { recursive: true });
+    }
+    writeFileSync(path.join(hookDir, "commit-msg"), "#!/bin/sh\nexit 1\n");
+    chmodSync(path.join(hookDir, "commit-msg"), 0o755);
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(repoDir, "a.ts"), "// a\n");
+    writeFileSync(path.join(repoDir, "b.ts"), "// b\n");
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(repoDir, mockCtx(), true, undefined);
+
+      // tryCommit should return 0 since the hook rejects
+      assert.strictEqual(result, 0, "Expected 0 commits when commit-msg hook fails");
+
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "No commits should have been created");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("tryCommit grouped flow handles pre-commit hook failure gracefully and continues", async () => {
+    // Use a repo with a failing pre-commit hook
+    const repoDir = createRepoWithFailingHook();
+    after(() => removeDir(repoDir));
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    // Create several files so there are multiple groups
+    mkdirSync(path.join(repoDir, "src"), { recursive: true });
+    writeFileSync(path.join(repoDir, "src", "feature.ts"), "export const feat = () => 1;\n");
+    writeFileSync(path.join(repoDir, "src", "feature.test.ts"), "import { test } from 'node:test';\n");
+
+    // Mock subagent
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(repoDir, mockCtx(), true, undefined);
+
+      // tryCommit should return 0 since the hook rejects all commits
+      assert.strictEqual(result, 0, "Expected 0 commits when pre-commit hook always fails");
+
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "No commits should have been created");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("tryCommit grouped flow creates a single commit with mocked subagent (fallback to single group)", async () => {
+    // With a mocked subagent that returns empty output, generateStagedCommitGroups
+    // falls back to singleGroupFallback, producing one commit with all files.
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(repoDir, "feature.ts"), "export const feat = () => 2;\n");
+    writeFileSync(path.join(repoDir, "feature.test.ts"), "import { test } from 'node:test';\n");
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      // Force=false so async isn't triggered, goes through grouped sync path
+      const result = await tryCommit(repoDir, mockCtx(), false, undefined);
+
+      // Mock subagent fallback creates a single group → 1 commit
+      assert.strictEqual(result, 1, "Expected 1 commit in grouped flow with mocked subagent");
+
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      // Initial + 1 = 2
+      assert.strictEqual(log.split("\n").length, 2, "Expected 2 total commits (initial + 1 group)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Widget error rendering
+  // -----------------------------------------------------------------------
+
+  it("commit widget renders failed commits in the log", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const progress: CommitterProgress = {
+      phase: "done",
+      fileCount: 2,
+      statusMessage: "All commits created",
+      commitLog: [
+        { hash: "abc1234", message: "feat: add feature", success: true },
+        { hash: "", message: "fix: bugfix", success: false },
+      ],
+      startedAt: Date.now(),
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    const joined = lines.join("\n");
+
+    // Should mention the failed commit
+    assert.ok(joined.includes("fail") || joined.includes("✗"), "Widget should indicate failed commits");
+  });
+
+  // -----------------------------------------------------------------------
+  // Async worker single-commit fix regression
+  // -----------------------------------------------------------------------
+
+  it("async worker handles single commit failure gracefully (via fork mock)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `as-fail-${i}.ts`), `// test ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 12345;
+    mockChild.kill = () => {};
+    mockChild.send = () => true;
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1 when async started");
+
+      // The async flag should be set
+      assert.ok(_getAsyncCommitStarted(), "async commit flag should be set");
+
+      // Simulate worker sending a single-commit failure error result
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Worker single commit failed: Command failed: git commit -F -",
+      });
+
+      // Flag cleared after result
+      assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after error result");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("async worker handles group commit failure gracefully (via fork mock)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // We need enough files to trigger async (asyncThreshold >= file count)
+    setConfig({ ...originalConfig, asyncThreshold: 2, stagedCommits: true });
+
+    // Create multiple files to trigger async + grouped path
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `grp-${i}.ts`), `// grp ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 12346;
+    mockChild.kill = () => {};
+    mockChild.send = () => true;
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1 when async started");
+      assert.ok(_getAsyncCommitStarted(), "async flag set");
+
+      // Simulate worker sending a group commit error
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Worker group commit failed: Command failed: git commit -F -",
+      });
+
+      assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after group error");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Edge case: diff becomes empty between group generation and commit
+  // -----------------------------------------------------------------------
+
+  it("commitStaged returns undefined when no staged changes (empty diff)", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Stage nothing — diff will be empty
+    const result = await commitStaged(repoDir, mockCtx(), [], undefined, undefined);
+    assert.strictEqual(result, undefined, "Expected undefined for empty staged diff");
+  });
+
+  // -----------------------------------------------------------------------
+  // Author identity not configured
+  // -----------------------------------------------------------------------
+
+  it("commitStaged returns undefined on missing git author identity", async () => {
+    const repoDir = mkdtempSync(path.join(tmpDir(), "pi-committer-test-noauth-"));
+    after(() => removeDir(repoDir));
+
+    execSync("git init", { cwd: repoDir, stdio: "ignore" });
+    writeFileSync(path.join(repoDir, "README.md"), "# test\n");
+    // Set identity locally just for the initial commit
+    execSync("git config user.name Seed", { cwd: repoDir, stdio: "ignore" });
+    execSync("git config user.email seed@test.com", { cwd: repoDir, stdio: "ignore" });
+    execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+    execSync("git commit -m root", { cwd: repoDir, stdio: "ignore" });
+    // Unset local identity so the NEXT commit has no author info
+    execSync("git config --unset user.name", { cwd: repoDir, stdio: "ignore" });
+    execSync("git config --unset user.email", { cwd: repoDir, stdio: "ignore" });
+
+    writeFileSync(path.join(repoDir, "work.ts"), "// work\n");
+    execSync("git add work.ts", { cwd: repoDir, stdio: "ignore" });
+
+    const origGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const origGitAuthorName = process.env.GIT_AUTHOR_NAME;
+    const origGitAuthorEmail = process.env.GIT_AUTHOR_EMAIL;
+    const origGitCommiterName = process.env.GIT_COMMITTER_NAME;
+    const origGitCommiterEmail = process.env.GIT_COMMITTER_EMAIL;
+
+    // Prevent git from falling back to global config by pointing to /dev/null
+    // and set git identity env vars to empty so git fails with "empty ident name"
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    process.env.GIT_AUTHOR_NAME = "";
+    process.env.GIT_AUTHOR_EMAIL = "";
+    process.env.GIT_COMMITTER_NAME = "";
+    process.env.GIT_COMMITTER_EMAIL = "";
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await commitStaged(repoDir, mockCtx(), ["work.ts"], undefined, undefined);
+
+      // Should fail because git can't determine the author identity
+      assert.strictEqual(result, undefined, "Expected undefined when author identity is missing");
+
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "No commit should have been created");
+    } finally {
+      if (origGitConfigGlobal !== undefined) process.env.GIT_CONFIG_GLOBAL = origGitConfigGlobal;
+      else delete process.env.GIT_CONFIG_GLOBAL;
+      if (origGitAuthorName !== undefined) process.env.GIT_AUTHOR_NAME = origGitAuthorName;
+      else delete process.env.GIT_AUTHOR_NAME;
+      if (origGitAuthorEmail !== undefined) process.env.GIT_AUTHOR_EMAIL = origGitAuthorEmail;
+      else delete process.env.GIT_AUTHOR_EMAIL;
+      if (origGitCommiterName !== undefined) process.env.GIT_COMMITTER_NAME = origGitCommiterName;
+      else delete process.env.GIT_COMMITTER_NAME;
+      if (origGitCommiterEmail !== undefined) process.env.GIT_COMMITTER_EMAIL = origGitCommiterEmail;
+      else delete process.env.GIT_COMMITTER_EMAIL;
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Large commit message handling (ENOBUFS / pipe buffer edge case)
+  // -----------------------------------------------------------------------
+
+  it("handles very large commit messages gracefully", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    // Create a message larger than typical OS pipe buffer (64KB) to stress the
+    // stdin pipe of `git commit -F -`
+    const bigBody = "x".repeat(80 * 1000); // ~80KB
+    const hugeMessage = `feat(core): add massive change\n\n${bigBody}\n`;
+
+    writeFileSync(path.join(repoDir, "huge.ts"), "// huge\n");
+    execSync("git add huge.ts", { cwd: repoDir, stdio: "ignore" });
+
+    // Use execSync directly to call git commit with a huge message
+    // This should either succeed (if buffers are large enough) or fail gracefully
+    try {
+      execSync("git commit -F -", {
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        input: hugeMessage,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+
+      // Success case: commit was created
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 2, "Expected 2 commits (initial + huge message)");
+    } catch (err) {
+      // Failure case: execSync threw, but it should NOT be a crash
+      // Any execSync error is acceptable - the important thing is it doesn't
+      // crash the process
+      const msg = err instanceof Error ? err.message : String(err);
+      assert.ok(msg.length > 0, "Error message should be present");
+      // Verify no partial commit was created
+      const log = execSync("git log --oneline", {
+        cwd: repoDir, encoding: "utf-8",
+      }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "No commit should have been created on error");
+    }
+  });
+
+  it("commitStaged handles large commit messages from subagent gracefully", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    writeFileSync(path.join(repoDir, "big.ts"), "// big\n");
+    execSync("git add big.ts", { cwd: repoDir, stdio: "ignore" });
+
+    // Mock a subagent that returns a very large commit message
+    const bigBody = "y".repeat(80 * 1000); // ~80KB
+    const hugeMessage = `feat(core): massive update\n\n${bigBody}\n`;
+
+    let promptResolve: (() => void) | undefined;
+    __setCreateAgentSessionMock(async (_opts: any) => {
+      // We need the session.prompt to be called so it triggers message_end
+      // events. Use a deferred resolve to control timing.
+      return {
+        session: {
+          prompt: async () => {},
+          subscribe: (cb: any) => {
+            // Emit a message_end with the huge message
+            setImmediate(() => {
+              cb({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: hugeMessage }],
+                },
+              });
+            });
+            return () => {};
+          },
+          abort: () => {},
+        },
+      };
+    });
+
+    try {
+      const result = await commitStaged(repoDir, mockCtx(), ["big.ts"], undefined, undefined);
+
+      // Either the commit succeeds (hash returned) or fails gracefully (undefined)
+      // The important thing is no crash/unhandled error
+      if (result) {
+        assert.strictEqual(result.length, 40, "Expected 40-char SHA on success");
+      } else {
+        // Fail gracefully: no commit was created but no crash
+        const log = execSync("git log --oneline", {
+          cwd: repoDir, encoding: "utf-8",
+        }).trim();
+        assert.strictEqual(log.split("\n").length, 1, "No commit should have been created");
+      }
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
   });
 });

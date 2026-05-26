@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.10.0] — 2026-05-26
+
+### Fixed
+
+- **Async worker crash with no subagent model configured:** Fixed a parameter swap bug in
+  `async-commit-worker.ts` where `params.subagentThinkingLevel` (a string like `"off"`) was
+  passed in the `onProgress` callback position (position #6) in both `generateCommitGroups()`
+  and `generateCommitMessage()` call sites. When the SDK emitted a `message_update` or
+  `message_end` event, the callback tried to invoke a string as a function, throwing `TypeError`
+  and crashing the worker with "Subprocess exited with code 1". The callback and
+  `subagentThinkingLevel` are now in the correct order.
+
+### Added
+
+- **Defensive guards on `onProgress`:** Both `generateCommitMessage` and `generateCommitGroups`
+  now use `typeof onProgress === "function"` before calling the progress callback, preventing
+  any future type mismatch from crashing the worker.
+- **Model-availability shortcut:** Both functions check `!subagentModel` alongside the existing
+  `tryLoadSDK()` guard. When no subagent model is configured (common on new installs), the
+  worker skips SDK-dependent calls and falls through to deterministic commit messages
+  immediately, avoiding unnecessary timeouts.
+- **IPC integration tests:** 3 new tests that fork the real worker process and verify
+  successful commits with deterministic fallback when no model is configured (grouped mode,
+  single-commit mode, staged_commits=false mode).
+
 ## [0.9.0] — 2026-05-26
 
 ### Added

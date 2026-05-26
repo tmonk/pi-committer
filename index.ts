@@ -1685,7 +1685,7 @@ async function tryCommitAsync(
 
   // Return immediately — the subprocess runs in the background
   ctx.ui.notify(
-    `[pi-committer] Commit running in background for ${allFiles.length} file(s). The commit completes automatically — do not wait for it.`,
+    `[pi-committer] Commit running in background for ${allFiles.length} file(s).`,
     "info",
   );
   return -1;
@@ -2059,7 +2059,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Commit running in background for ${__asyncCommitFileCount} file(s). The commit completes automatically — do not check git status or git log. Continue with your task.`,
+              text: `Commit running in background for ${__asyncCommitFileCount} file(s).`,
             },
           ],
           details: { commitCount: 0, async: true },

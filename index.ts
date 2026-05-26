@@ -1625,7 +1625,7 @@ async function tryCommitAsync(
 
   // Return immediately — the subprocess runs in the background
   ctx.ui.notify(
-    `[pi-committer] Commit started in background for ${allFiles.length} file(s). Progress visible in widget.`,
+    `[pi-committer] Commit running in background for ${allFiles.length} file(s). The commit completes automatically — do not wait for it.`,
     "info",
   );
   return -1;
@@ -1961,6 +1961,7 @@ export default function (pi: ExtensionAPI) {
       "Use commit_changes when the user asks to commit, save progress, or checkpoint work.",
       "Call commit_changes when completing significant work or on user request.",
       "When pi-goal is active with trigger_mode=on_goal, do NOT call commit_changes before marking the goal complete — the automatic on_goal trigger will commit after the goal audit passes. Calling commit_changes preemptively bypasses the audit.",
+      "After calling commit_changes, do NOT run git commands (git status, git log, git diff) to check on the commit. Trust that it completes in the background.",
     ],
     parameters: commitChangesSchema,
     async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
@@ -1998,7 +1999,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Commit started in background for ${__asyncCommitFileCount} file(s). Progress visible in widget.`,
+              text: `Commit running in background for ${__asyncCommitFileCount} file(s). The commit completes automatically — do not check git status or git log. Continue with your task.`,
             },
           ],
           details: { commitCount: 0, async: true },

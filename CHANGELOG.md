@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.0] — 2026-05-26
+
+### Added
+
+- **Assertive async commit response:** When an async commit is launched, the tool now returns
+  "Commit running in background for N file(s). The commit completes automatically — do not
+  check git status or git log. Continue with your task." — telling the agent definitively
+  not to probe git.
+- **Prompt guideline against git probing:** Added guideline to `commit_changes` telling the
+  agent "do NOT run git commands (git status, git log, git diff) to check on the commit."
+
+### Changed
+
+- **Notification text aligned:** The session-level notification now reads "Commit running in
+  background" with "do not wait for it" guidance instead of "Progress visible in widget".
+
 ## [0.6.0] — 2026-05-21
 
 ### Added

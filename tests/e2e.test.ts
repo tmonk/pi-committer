@@ -249,7 +249,38 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
   });
 
   // -----------------------------------------------------------------------
-  it("Test 10: Nested .gitignore is respected", () => {
+  it("Test 11: Async commit with many files runs in background", async () => {
+    // Create 6 files to trigger async threshold (default is 5)
+    for (let i = 0; i < 6; i++) {
+      writeFileSync(path.join(testDir, `async-e2e-${i}.ts`), `// async e2e ${i}\n`);
+    }
+
+    // Run pi with commit_changes — this should trigger the async path
+    // because we have 6 files and the default asyncThreshold is 5.
+    const output = runPi(testDir, "Call commit_changes\n");
+
+    // The output should indicate the commit is running in background
+    // (or it may have completed synchronously if the async worker failed).
+    // Either way, there should be new commits in the repo.
+    const startCount = commitCount(testDir);
+
+    // Wait for up to 2 minutes for the async worker to complete
+    let currentCount = startCount;
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      currentCount = commitCount(testDir);
+      if (currentCount > startCount) break;
+    }
+
+    assert.ok(
+      currentCount > startCount,
+      `Expected new commits after async, got ${currentCount} (was ${startCount})`,
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  it("Test 12: Nested .gitignore is respected", () => {
     const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\n`;
     writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
 

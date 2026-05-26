@@ -2161,6 +2161,395 @@ describe("async commit threshold", () => {
       setConfig(originalConfig);
     }
   });
+
+  /**
+   * Verify that the committer widget is registered and visible when
+   * an async commit is triggered.
+   */
+  it("shows the committer widget when async commit starts", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `widget-vis-${i}.ts`), `// widget vis ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88870;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    let setWidgetCalled = false;
+    let setWidgetKey = "";
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: (key: string, _widget: any) => {
+          setWidgetCalled = true;
+          setWidgetKey = key;
+        },
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Widget should be registered via ctx.ui.setWidget
+      assert.ok(setWidgetCalled, "ctx.ui.setWidget should be called");
+      assert.strictEqual(setWidgetKey, "pi-committer", "should register with correct widget key");
+
+      // Internal progress state should reflect the preparing phase
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "preparing", "phase should be preparing");
+      assert.strictEqual(progress!.fileCount, 5, "file count should be set");
+      assert.strictEqual(progress!.subprocessPid, 88870, "subprocess PID should be set from mock child");
+      assert.ok(progress!.startedAt > 0, "startedAt should be set");
+      assert.strictEqual(progress!.commitLog.length, 0, "commit log should be empty initially");
+      assert.strictEqual(progress!.error, undefined, "error should be undefined initially");
+      assert.ok(progress!.statusMessage?.includes("5"), "status message should mention file count");
+
+      // State flags should be set
+      assert.strictEqual(_getAsyncCommitStarted(), true, "async started flag should be set");
+      assert.strictEqual(_getAsyncCommitFileCount(), 5, "async file count should be set");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the widget updates through the full IPC lifecycle:
+   * preparing → analyzing → committing (with commit entries) → result (done).
+   */
+  it("updates the committer widget through full IPC lifecycle (preparing → progress → result)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `lifecycle-${i}.ts`), `// lifecycle ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88869;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Phase 1: preparing (initial state set by showCommitterWidget)
+      let progress = _getCommitterProgress();
+      assert.strictEqual(progress!.phase, "preparing", "initial phase should be preparing");
+      assert.strictEqual(progress!.fileCount, 5);
+      assert.ok(progress!.statusMessage?.includes("5"), "status message should mention file count");
+
+      // Phase 2: IPC progress message → analyzing phase
+      mockChild.emit("message", {
+        type: "progress",
+        phase: "analyzing",
+        fileCount: 5,
+        statusMessage: "Analyzing 5 file(s) for logical commit grouping...",
+      });
+      progress = _getCommitterProgress();
+      assert.strictEqual(progress!.phase, "analyzing", "phase should update to analyzing");
+      assert.strictEqual(progress!.statusMessage, "Analyzing 5 file(s) for logical commit grouping...");
+
+      // Phase 3: IPC progress message → committing phase
+      mockChild.emit("message", {
+        type: "progress",
+        phase: "committing",
+        totalCommits: 2,
+        completedCommits: 0,
+        statusMessage: "Committing 1/2...",
+      });
+      progress = _getCommitterProgress();
+      assert.strictEqual(progress!.phase, "committing", "phase should update to committing");
+      assert.strictEqual(progress!.totalCommits, 2);
+      assert.strictEqual(progress!.completedCommits, 0);
+      assert.strictEqual(progress!.statusMessage, "Committing 1/2...");
+
+      // Phase 4: IPC commit entries arrive one at a time
+      mockChild.emit("message", {
+        type: "commit",
+        commit: { hash: "aaa1111", message: "feat: first commit", success: true },
+      });
+      progress = _getCommitterProgress();
+      assert.strictEqual(progress!.completedCommits, 1, "completed commits should increment after first commit");
+      assert.strictEqual(progress!.commitLog.length, 1, "commit log should have 1 entry");
+      assert.strictEqual(progress!.commitLog[0].hash, "aaa1111");
+      assert.strictEqual(progress!.commitLog[0].message, "feat: first commit");
+      assert.strictEqual(progress!.commitLog[0].success, true);
+
+      mockChild.emit("message", {
+        type: "commit",
+        commit: { hash: "bbb2222", message: "feat: second commit", success: true },
+      });
+      progress = _getCommitterProgress();
+      assert.strictEqual(progress!.completedCommits, 2, "completed commits should increment after second commit");
+      assert.strictEqual(progress!.commitLog.length, 2, "commit log should have 2 entries");
+
+      // Phase 5: IPC result message (success) — widget should show done
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 2,
+        commitLog: [
+          { hash: "aaa1111", message: "feat: first commit", success: true },
+          { hash: "bbb2222", message: "feat: second commit", success: true },
+        ],
+      });
+      progress = _getCommitterProgress();
+      assert.strictEqual(progress!.phase, "done", "phase should be done after result");
+      assert.strictEqual(progress!.error, undefined, "error should be undefined on success");
+      assert.strictEqual(progress!.totalCommits, 2);
+      assert.strictEqual(progress!.completedCommits, 2);
+      assert.strictEqual(progress!.commitLog.length, 2, "commit log should have 2 entries");
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared on result");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the widget shows the error message when the worker sends
+   * an error result via IPC.
+   */
+  it("shows error in widget from IPC error result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `err-widget-${i}.ts`), `// err widget ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88868;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Send an error result via IPC
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Something went wrong in the worker",
+      });
+
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done after error result");
+      assert.strictEqual(
+        progress!.error,
+        "Something went wrong in the worker",
+        "error should be set from result message",
+      );
+      assert.strictEqual(progress!.totalCommits, 0);
+      assert.strictEqual(progress!.completedCommits, 0);
+      assert.strictEqual(progress!.commitLog.length, 0);
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared on result");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the widget shows the error message when the worker emits
+   * an error event (process crash).
+   */
+  it("shows error in widget when worker crashes (error event)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `crash-widget-${i}.ts`), `// crash widget ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88867;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Simulate worker process crash via error event
+      mockChild.emit("error", new Error("Worker process crashed"));
+
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done after crash");
+      assert.ok(
+        progress!.error?.includes("Worker process crashed"),
+        "error should describe the crash, got: " + progress!.error,
+      );
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared after crash");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the widget shows a subprocess exit error when the worker
+   * exits with a non-zero code without sending any result IPC.
+   * The exit handler's fallback timer (500ms) should fire and display
+   * the error in the widget.
+   */
+  it("shows error in widget on unexpected worker exit without result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `exit-widget-${i}.ts`), `// exit widget ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88866;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Simulate worker exit with code 1 WITHOUT sending any result IPC
+      mockChild.emit("exit", 1);
+
+      // The exit handler clears async flags immediately
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag cleared on exit");
+
+      // Wait for the fallback timer (500ms) to fire
+      await new Promise((resolve) => setTimeout(resolve, 600));
+
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done after exit error");
+      assert.ok(
+        progress!.error?.includes("Subprocess exited with code"),
+        "error should mention subprocess exit, got: " + progress!.error,
+      );
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
 });
 
 // ===========================================================================
@@ -2208,6 +2597,119 @@ describe("async commit widget rendering", () => {
 
     const lines = renderCommitterWidgetLines(progress, theme, 80);
     assert.ok(lines.some((l) => l.includes("12345") || l.includes("pid")), "should show subprocess PID");
+  });
+
+  it("renders committing phase with progress", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "committing",
+      totalCommits: 3,
+      completedCommits: 1,
+      statusMessage: "Committing 2/3...",
+      commitLog: [
+        { hash: "aaa1111", message: "feat: first commit", success: true },
+      ],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines.length > 0, "should render at least one line");
+    assert.ok(lines[0].includes("committing"), "header should show committing");
+    assert.ok(lines[0].includes("1/3"), "header should show completed/total progress");
+    assert.ok(lines.some((l) => l.includes("aaa1111")), "should show commit hash");
+    assert.ok(lines.some((l) => l.includes("Esc")), "should show Esc hint during committing");
+  });
+
+  it("renders done phase with commit log", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 2,
+      completedCommits: 2,
+      commitLog: [
+        { hash: "aaa1111", message: "feat: first commit", success: true },
+        { hash: "bbb2222", message: "feat: second commit", success: true },
+      ],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines[0].includes("complete"), "header should show complete");
+    assert.ok(lines[0].includes("2"), "header should show commit count");
+    assert.ok(lines.some((l) => l.includes("aaa1111")), "should show first commit hash");
+    assert.ok(lines.some((l) => l.includes("bbb2222")), "should show second commit hash");
+    assert.ok(!lines.some((l) => l.includes("Esc")), "should NOT show Esc hint when done");
+  });
+
+  it("renders done phase with error", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 0,
+      completedCommits: 0,
+      commitLog: [],
+      error: "Something went wrong",
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines[0].includes("complete"), "header should show complete");
+    assert.ok(lines.some((l) => l.includes("Something went wrong")), "should show error message");
+    assert.ok(!lines.some((l) => l.includes("Esc")), "should NOT show Esc hint when done");
+  });
+
+  it("renders cancelled phase", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "cancelled",
+      commitLog: [],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines[0].includes("cancelled"), "header should show cancelled");
+    assert.ok(lines.some((l) => l.includes("Operation cancelled")), "should show cancellation message");
+  });
+
+  it("renders cancelled phase with partial commit log", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+    const elapsed = Date.now();
+
+    const progress: CommitterProgress = {
+      phase: "cancelled",
+      commitLog: [
+        { hash: "aaa1111", message: "feat: first commit", success: true },
+      ],
+      startedAt: elapsed,
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.ok(lines[0].includes("cancelled"), "header should show cancelled");
+    assert.ok(lines.some((l) => l.includes("aaa1111")), "should show partial commit log");
+    assert.ok(lines.some((l) => l.includes("Operation cancelled")), "should show cancellation message");
   });
 });
 

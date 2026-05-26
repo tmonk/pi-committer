@@ -413,7 +413,7 @@ async function generateCommitMessage(
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
 ): Promise<string> {
-  if (!(await tryLoadSDK())) {
+  if (!(await tryLoadSDK()) || !subagentModel) {
     return deterministicCommitMessage(diffStat, diffContent, files);
   }
 
@@ -487,13 +487,13 @@ async function generateCommitMessage(
             outputParts.push(part.text);
           }
         }
-        if (onProgress) {
+        if (typeof onProgress === "function") {
           const fullText = outputParts.join("\n\n");
           onProgress(fullText.split("\n").filter((l: string) => l.trim()).slice(-8));
         }
         return;
       }
-      if (event.type === "message_update" && onProgress) {
+      if (event.type === "message_update" && typeof onProgress === "function") {
         const message = event.message as any;
         if (message?.role === "assistant") {
           const recentLines: string[] = [];
@@ -538,8 +538,8 @@ async function generateCommitGroups(
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
 ): Promise<Array<{ message: string; files: string[] }>> {
-  // Fallback: single group
-  if (!(await tryLoadSDK())) {
+  // Fallback: single group (SDK not available or no model configured)
+  if (!(await tryLoadSDK()) || !subagentModel) {
     const message = deterministicCommitMessage(diffStat, diffContent, allFiles);
     return [{ message, files: [...allFiles] }];
   }
@@ -630,10 +630,12 @@ async function generateCommitGroups(
         }
         const fullText = outputParts.join("\n\n");
         const lines = fullText.split("\n").filter((l: string) => l.trim());
-        onProgress?.(lines.slice(-8));
+        if (typeof onProgress === "function") {
+          onProgress(lines.slice(-8));
+        }
         return;
       }
-      if (event.type === "message_update" && onProgress) {
+      if (event.type === "message_update" && typeof onProgress === "function") {
         const message = event.message as any;
         if (message?.role === "assistant") {
           const recentLines: string[] = [];
@@ -836,7 +838,6 @@ async function doGroupedCommits(
     allFiles,
     dir,
     params.subagentModel,
-    params.subagentThinkingLevel,
     (output) => {
       sendProgress({
         phase: "analyzing",
@@ -845,6 +846,7 @@ async function doGroupedCommits(
         subagent: { recentOutput: output },
       });
     },
+    params.subagentThinkingLevel,
   );
 
   if (aborted) {
@@ -903,7 +905,6 @@ async function doGroupedCommits(
         stagedFiles,
         dir,
         params.subagentModel,
-        params.subagentThinkingLevel,
         (output) => {
           sendProgress({
             phase: "committing",
@@ -913,6 +914,7 @@ async function doGroupedCommits(
             statusMessage: `Committing group ${commitCount + 1}/${groups.length}...`,
           });
         },
+        params.subagentThinkingLevel,
       );
 
       if (aborted) {

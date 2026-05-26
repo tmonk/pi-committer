@@ -7,10 +7,11 @@ import {
   mock,
 } from "node:test";
 import assert from "node:assert";
-import { execSync } from "node:child_process";
+import { execSync, fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdtempSync, writeFileSync, existsSync, chmodSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
 
 import {
   renderCommitterWidgetLines,
@@ -4064,5 +4065,241 @@ describe("widget rendering for small grouped commit (single-path fallback)", () 
       joined.includes("feat: add small commit"),
       "should show commit message in log",
     );
+  });
+});
+
+// ===========================================================================
+// Async worker IPC integration — fork the real worker, send params, verify result
+// ===========================================================================
+
+describe("async worker IPC integration", () => {
+  it("completes successfully with no subagentModel configured (deterministic fallback)", async () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-ipc-"));
+    after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    // Init git repo
+    execSync("git init", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.email test@test.com", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: dir, stdio: "ignore" });
+
+    // Create initial commit
+    writeFileSync(path.join(dir, "README.md"), "# test\n");
+    execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
+
+    // Create some changes
+    writeFileSync(path.join(dir, "file1.ts"), "// file1\n");
+    writeFileSync(path.join(dir, "file2.ts"), "// file2\n");
+    writeFileSync(path.join(dir, "file3.ts"), "// file3\n");
+
+    // Stage all
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+
+    // Get diff stat and content
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+
+    const allFiles = diffStat
+      .split("\n")
+      .filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+
+    // Fork the worker
+    const workerPath = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
+    const child = fork(workerPath, [], {
+      execArgv: ["--experimental-strip-types"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+
+    // Wait for result from worker
+    const result = await new Promise<{ commitCount: number; commitLog: any[]; error?: string }>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error("Worker timed out after 15 seconds"));
+      }, 15_000);
+
+      child.on("message", (msg: any) => {
+        if (msg?.type === "result") {
+          clearTimeout(timeout);
+          resolve(msg);
+        }
+      });
+
+      child.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      child.on("exit", (code) => {
+        clearTimeout(timeout);
+        reject(new Error(`Worker exited with code ${code} before sending result`));
+      });
+
+      // Send params to the worker
+      child.send({
+        type: "start",
+        params: {
+          dir,
+          diffStat,
+          diffContent,
+          allFiles,
+          stagedCommits: true,
+          excludePatterns: [],
+          minChanges: 1,
+          subagentModel: undefined,  // No model configured — tests deterministic fallback
+          subagentGroupingMinFiles: 4,
+          subagentThinkingLevel: "off",
+        },
+      });
+    });
+
+    // Verify the result
+    assert.strictEqual(result.error, undefined, `worker should not error: ${result.error}`);
+    assert.ok(result.commitCount > 0, "should have at least 1 commit");
+    assert.ok(result.commitLog.length > 0, "should have commit log entries");
+
+    // Verify the commits actually exist in the repo
+    const commitCount = execSync("git rev-list --count HEAD", {
+      cwd: dir,
+      encoding: "utf-8",
+    }).trim();
+    // Initial commit + new commits
+    assert.ok(Number(commitCount) >= result.commitCount + 1, "commits should be in git history");
+
+    // Verify deterministic message was used (no subagent) — contains "file" since no model
+    const lastMsg = execSync("git log -1 --format=%B", { cwd: dir, encoding: "utf-8" }).trim();
+    assert.ok(lastMsg.length > 0, "commit message should not be empty");
+  });
+
+  it("handles single commit mode (grouping disabled) with no model", async () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-ipc2-"));
+    after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    execSync("git init", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.email test@test.com", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, "README.md"), "# test\n");
+    execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
+
+    // Single change
+    writeFileSync(path.join(dir, "single.ts"), "// single\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = diffStat
+      .split("\n").filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+
+    const workerPath2 = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
+    const child = fork(workerPath2, [], {
+      execArgv: ["--experimental-strip-types"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+
+    const result = await new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => { child.kill(); reject(new Error("Timeout")); }, 15_000);
+      child.on("message", (msg: any) => {
+        if (msg?.type === "result") { clearTimeout(timeout); resolve(msg); }
+      });
+      child.on("error", (err) => { clearTimeout(timeout); reject(err); });
+      child.on("exit", (code) => { clearTimeout(timeout); reject(new Error(`exit ${code}`)); });
+
+      child.send({
+        type: "start",
+        params: {
+          dir,
+          diffStat,
+          diffContent,
+          allFiles,
+          stagedCommits: true,
+          excludePatterns: [],
+          minChanges: 1,
+          subagentModel: undefined,
+          subagentGroupingMinFiles: 4,
+          subagentThinkingLevel: "off",
+        },
+      });
+    });
+
+    assert.strictEqual(result.error, undefined, `no error expected: ${result.error}`);
+    assert.strictEqual(result.commitCount, 1, "single file should produce 1 commit");
+    assert.strictEqual(result.commitLog.length, 1, "should have 1 log entry");
+  });
+
+  it("falls through to deterministic when staged_commits is false", async () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-ipc3-"));
+    after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    execSync("git init", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.email test@test.com", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, "README.md"), "# test\n");
+    execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
+
+    writeFileSync(path.join(dir, "a.ts"), "// a\n");
+    writeFileSync(path.join(dir, "b.ts"), "// b\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = diffStat
+      .split("\n").filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+
+    const workerPath3 = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
+    const child = fork(workerPath3, [], {
+      execArgv: ["--experimental-strip-types"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+
+    const result = await new Promise<any>((resolve, reject) => {
+      const timeout = setTimeout(() => { child.kill(); reject(new Error("Timeout")); }, 15_000);
+      child.on("message", (msg: any) => {
+        if (msg?.type === "result") { clearTimeout(timeout); resolve(msg); }
+      });
+      child.on("error", (err) => { clearTimeout(timeout); reject(err); });
+      child.on("exit", (code) => { clearTimeout(timeout); reject(new Error(`exit ${code}`)); });
+
+      child.send({
+        type: "start",
+        params: {
+          dir,
+          diffStat,
+          diffContent,
+          allFiles,
+          stagedCommits: false,
+          excludePatterns: [],
+          minChanges: 1,
+          subagentModel: undefined,
+          subagentGroupingMinFiles: 4,
+          subagentThinkingLevel: "off",
+        },
+      });
+    });
+
+    assert.strictEqual(result.error, undefined, `no error expected: ${result.error}`);
+    assert.strictEqual(result.commitCount, 1, "single commit mode should produce 1 commit");
   });
 });

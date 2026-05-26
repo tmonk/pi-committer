@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.1] — 2026-05-26
+
+### Added
+
+- **Full test coverage for async widget visibility:** 12 new tests verifying the
+  committer widget is shown and updated during async commits:
+  - 5 widget rendering tests (committing phase, done phase with log, done phase
+    with error, cancelled phase, cancelled with partial log)
+  - 5 integration tests using fork mock (widget shown on start, full IPC lifecycle,
+    error from IPC, error from crash, error from unexpected exit)
+  - 1 e2e test (async commit with many files runs in background, verifies commits)
+
 ## [0.8.0] — 2026-05-26
 
 ### Fixed

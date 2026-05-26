@@ -115,16 +115,30 @@ function sendResult(result: {
 }
 
 /**
- * Exit the worker safely, allowing pending IPC messages to be delivered.
- * Replaces direct process.exit(N) after sendResult()/sendCommit() to prevent
- * the race condition where the process terminates before queued IPC messages
- * arrive at the parent.
+ * Send the result IPC message and exit the worker only after the message
+ * has been delivered to the parent. Uses process.send's callback to confirm
+ * delivery, eliminating the race where process.exit() fires before the
+ * queued IPC message reaches the parent.
  */
-function safeExit(exitCode: number): void {
+function sendResultAndExit(
+  result: {
+    commitCount: number;
+    commitLog: CommitLogEntry[];
+    error?: string;
+  },
+  exitCode: number,
+): void {
   clearWorkerTimeout();
-  process.exitCode = exitCode;
-  // Give the event loop a tick to deliver pending IPC messages before exiting
-  setTimeout(() => process.exit(), 100);
+  if (process.send) {
+    process.send({ type: "result", ...result }, () => {
+      process.exitCode = exitCode;
+      // Use setImmediate to let the callback stack unwind before exiting
+      setImmediate(() => process.exit());
+    });
+  } else {
+    process.exitCode = exitCode;
+    setImmediate(() => process.exit());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -694,7 +708,9 @@ function parseCommitGroups(
       fileList = filesMatch[1]
         .split(",")
         .map((f) => f.trim())
-        .filter(Boolean);
+        .filter(Boolean)
+        // Only keep files that are actually in the changed set
+        .filter((f) => allFiles.includes(f));
     }
 
     if (messagePart && fileList.length > 0) {
@@ -714,7 +730,9 @@ function parseCommitGroups(
         fileList = filesMatch[1]
           .split(",")
           .map((f) => f.trim())
-          .filter(Boolean);
+          .filter(Boolean)
+          // Only keep files that are actually in the changed set
+          .filter((f) => allFiles.includes(f));
       }
       // Extract message (all lines before "Files:")
       const msgLines: string[] = [];
@@ -841,9 +859,21 @@ async function doGroupedCommits(
     const groupFiles = filterGitignoredFiles(dir, group.files);
     if (groupFiles.length === 0) continue;
 
+    // Track which files were successfully staged; skip any that fail git add
+    const stagedFiles: string[] = [];
     for (const f of groupFiles) {
-      execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
+      try {
+        execSync(`git add -- "${f}"`, { cwd: dir, stdio: "pipe" });
+        stagedFiles.push(f);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendProgress({
+          phase: "committing",
+          statusMessage: `Skipping unstageable file: ${f} (${msg})`,
+        });
+      }
     }
+    if (stagedFiles.length === 0) continue;
 
     try {
       const diffStat = execSync("git diff --cached --stat", {
@@ -861,7 +891,7 @@ async function doGroupedCommits(
       const message = await generateCommitMessage(
         diffStat,
         diffContent,
-        groupFiles,
+        stagedFiles,
         dir,
         params.subagentModel,
         (output) => {
@@ -880,7 +910,7 @@ async function doGroupedCommits(
         return { commitCount, commitLog };
       }
 
-      const finalMessage = message.length > 10 ? message : `chore: update ${groupFiles.length} file(s)`;
+      const finalMessage = message.length > 10 ? message : `chore: update ${stagedFiles.length} file(s)`;
 
       execSync("git commit -F -", {
         cwd: dir,
@@ -896,8 +926,7 @@ async function doGroupedCommits(
       sendCommit(entry);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      sendResult({ commitCount, commitLog, error: `Commit failed: ${msg}` });
-      safeExit(0);
+      sendResultAndExit({ commitCount, commitLog, error: `Commit failed: ${msg}` }, 0);
       return { commitCount, commitLog };
     }
   }
@@ -919,8 +948,7 @@ process.on("message", async (msg: any) => {
     // Check for abort before starting
     if (aborted) {
       unstageAll(dir);
-      sendResult({ commitCount: 0, commitLog: [], error: "Cancelled." });
-      safeExit(0);
+      sendResultAndExit({ commitCount: 0, commitLog: [], error: "Cancelled." }, 0);
       return;
     }
 
@@ -930,16 +958,14 @@ process.on("message", async (msg: any) => {
 
     if (files.length === 0) {
       unstageAll(dir);
-      sendResult({ commitCount: 0, commitLog: [] });
-      safeExit(0);
+      sendResultAndExit({ commitCount: 0, commitLog: [] }, 0);
       return;
     }
 
     // Check min changes
     if (files.length < minChanges) {
       unstageAll(dir);
-      sendResult({ commitCount: 0, commitLog: [] });
-      safeExit(0);
+      sendResultAndExit({ commitCount: 0, commitLog: [] }, 0);
       return;
     }
 
@@ -952,8 +978,7 @@ process.on("message", async (msg: any) => {
 
     if (aborted) {
       unstageAll(dir);
-      sendResult({ commitCount: 0, commitLog: [], error: "Cancelled." });
-      safeExit(0);
+      sendResultAndExit({ commitCount: 0, commitLog: [], error: "Cancelled." }, 0);
       return;
     }
 
@@ -979,18 +1004,15 @@ process.on("message", async (msg: any) => {
 
     if (aborted) {
       unstageAll(dir);
-      sendResult({ commitCount, commitLog, error: "Cancelled." });
-      safeExit(0);
+      sendResultAndExit({ commitCount, commitLog, error: "Cancelled." }, 0);
       return;
     }
 
     // Success
-    sendResult({ commitCount, commitLog });
-    safeExit(0);
+    sendResultAndExit({ commitCount, commitLog }, 0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    sendResult({ commitCount: 0, commitLog: [], error: msg });
-    safeExit(1);
+    sendResultAndExit({ commitCount: 0, commitLog: [], error: msg }, 1);
   }
 });
 

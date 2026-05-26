@@ -1384,8 +1384,20 @@ export async function tryCommit(
           continue;
         }
 
+        // Track which files were successfully staged; skip any that fail git add
+        const stagedFiles: string[] = [];
         for (const f of groupFiles) {
-          execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
+          try {
+            execSync(`git add -- "${f}"`, { cwd: dir, stdio: "pipe" });
+            stagedFiles.push(f);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ctx.ui.notify(`[pi-committer] Skipping unstageable file: ${f} (${msg})`, "warning");
+          }
+        }
+        if (stagedFiles.length === 0) {
+          ctx.ui.notify("[pi-committer] Skipping group — all files failed to stage", "warning");
+          continue;
         }
 
         // Create commit with the group's message
@@ -1446,6 +1458,12 @@ export async function tryCommit(
 
       if (commitCount === 0) {
         ctx.ui.notify("[pi-committer] No commits created", "info");
+        // When all grouped commits failed, surface the error in the widget
+        if (__committerProgress && __committerProgress.commitLog.length > 0) {
+          const failedCount = __committerProgress.commitLog.filter((e) => !e.success).length;
+          const totalGroups = __committerProgress.commitLog.length;
+          __committerProgress.error = `All ${totalGroups} commit group(s) failed (${failedCount} with errors) — check git hooks or working tree`;
+        }
       } else if (commitCount > 1) {
         ctx.ui.notify(
           `[pi-committer] ${commitCount} commits created`,

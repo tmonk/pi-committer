@@ -3319,3 +3319,455 @@ describe("commit error handling", () => {
     }
   });
 });
+
+// ===========================================================================
+// Widget error rendering for sync commit failures
+// ===========================================================================
+
+describe("widget error rendering for sync commit failures", () => {
+  it("renders done phase with error when all grouped commits fail", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 0,
+      completedCommits: 0,
+      commitLog: [
+        { hash: "", message: "feat: first change", success: false },
+        { hash: "", message: "fix: second change", success: false },
+      ],
+      error: "All 2 commit group(s) failed (2 with errors) — check git hooks or working tree",
+      startedAt: Date.now(),
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    const joined = lines.join("\n");
+
+    assert.ok(lines[0].includes("complete"), "header should show complete");
+    assert.ok(lines[0].includes("0 commits"), "header should show 0 commits");
+    assert.ok(
+      joined.includes("All 2 commit group(s) failed"),
+      "should render the progress.error message: " + joined,
+    );
+    assert.ok(
+      joined.includes("✗"),
+      "should render error icon for failed commit log entries",
+    );
+  });
+
+  it("renders done phase without error when all grouped commits succeed", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 2,
+      completedCommits: 2,
+      commitLog: [
+        { hash: "aaa1111", message: "feat: first", success: true },
+        { hash: "bbb2222", message: "fix: second", success: true },
+      ],
+      error: undefined,
+      startedAt: Date.now(),
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    const joined = lines.join("\n");
+
+    assert.ok(lines[0].includes("complete"), "header should show complete");
+    assert.ok(lines[0].includes("2 commits"), "header should show 2 commits");
+    assert.ok(
+      !joined.includes("failed"),
+      "should NOT render 'failed' text when all commits succeed",
+    );
+    assert.ok(
+      !joined.includes("error"),
+      "should NOT render 'error' text when all commits succeed",
+    );
+  });
+
+  it("renders done phase with only heading when no error and no commit log", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+
+    // No error, no commit log — just heading
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 0,
+      completedCommits: 0,
+      commitLog: [],
+      error: undefined,
+      startedAt: Date.now(),
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    assert.strictEqual(lines.length, 1, "should only render the heading line");
+    // The heading includes "complete  0 commits" (double space between word and number)
+    assert.ok(lines[0].includes("complete"), "should show complete");
+    assert.ok(lines[0].includes("0"), "should show 0");
+  });
+});
+
+// ===========================================================================
+// Sync path: hallucinated subagent file names handling
+// ===========================================================================
+
+describe("sync path handles hallucinated subagent file names", () => {
+  let originalConfig: CommitterConfig;
+  let dir: string;
+
+  before(() => {
+    setConfig(loadConfig(process.cwd()));
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  it("tryCommit does not crash when subagent hallucinates a file in commit groups", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(dir, "module.ts"), "export const m = 1;\n");
+    writeFileSync(path.join(dir, "module.test.ts"), "import { test } from 'node:test';\n");
+
+    // Mock subagent that fires message_end synchronously during subscribe.
+    // The subscribe callback is invoked with the event immediately, so
+    // outputParts are populated before session.prompt resolves.
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: (cb: any) => {
+          // Fire synchronously so output is captured before prompt resolves
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: `--- COMMIT GROUP 1 ---
+feat(core): add module
+
+Module implementation.
+Files: module.ts
+
+--- COMMIT GROUP 2 ---
+test(core): add tests
+
+Test suite.
+Files: module.test.ts, nonexistent.ts`,
+                },
+              ],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      // This should not throw — the hallucinated file is filtered out by parseCommitGroups
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      // Should have created 2 commits (one for each valid group, nonexistent.ts filtered out)
+      assert.strictEqual(result, 2, "Expected 2 commits (both groups with valid files)");
+
+      const log = execSync("git log --oneline", {
+        cwd: dir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      // Initial + 2 = 3
+      assert.strictEqual(count, 3, "Expected 3 total commits (initial + 2 groups)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("tryCommit handles hallucinated file gracefully even with all files hallucinated", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(dir, "real.ts"), "// real\n");
+
+    // Mock subagent that fires message_end synchronously
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: (cb: any) => {
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: `--- COMMIT GROUP 1 ---
+chore: update
+
+Changes.
+Files: hallucinated.ts`,
+                },
+              ],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      // Should fall through to singleGroupFallback because all parsed groups have 0 valid files
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      // Fallback should produce 1 commit with the actual file
+      assert.strictEqual(result, 1, "Expected 1 commit via fallback when all hallucinated");
+
+      const log = execSync("git log --oneline", {
+        cwd: dir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      assert.strictEqual(count, 2, "Expected 2 total commits (initial + fallback)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+});
+
+// ===========================================================================
+// Async path: IPC error delivery (mock fork)
+// ===========================================================================
+
+describe("async path IPC error delivery (mock fork)", () => {
+  let originalConfig: CommitterConfig;
+
+  before(() => {
+    setConfig(loadConfig(process.cwd()));
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setForkMock(undefined);
+  });
+
+  it("widget shows the actual IPC error message when worker sends error result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `ipc-err-${i}.ts`), `// ipc error ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 77771;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1 for async commit");
+
+      // Worker sends an error result via IPC with a specific error message
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "fatal: pathspec 'nonexistent.ts' did not match any files",
+      });
+
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done after result");
+      assert.strictEqual(
+        progress!.error,
+        "fatal: pathspec 'nonexistent.ts' did not match any files",
+        "widget should show the actual error message, not generic 'Subprocess exited'",
+      );
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("widget shows error from IPC result even when exit happens first", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `ipc-exit-first-${i}.ts`), `// exit first ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 77772;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1 for async commit");
+
+      // IPC result arrives BEFORE exit event — this is the normal flow
+      // with the fixed sendResultAndExit (message callback fires before process.exit).
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "fatal: pathspec 'nonexistent.ts' did not match any files",
+      });
+      mockChild.emit("exit", 1);
+
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(
+        progress!.error,
+        "fatal: pathspec 'nonexistent.ts' did not match any files",
+        "widget should show the actual error, not generic 'Subprocess exited'",
+      );
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+});
+
+// ===========================================================================
+// Worker parseCommitGroups (integration via mock fork)
+// ===========================================================================
+
+describe("worker parseCommitGroups hallucinated file filtering (via fork mock)", () => {
+  let originalConfig: CommitterConfig;
+
+  before(() => {
+    setConfig(loadConfig(process.cwd()));
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setForkMock(undefined);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  it("parseCommitGroups filters hallucinated file names", () => {
+    const output = `--- COMMIT GROUP 1 ---
+feat(core): add module
+
+Module implementation.
+Files: module.ts
+
+--- COMMIT GROUP 2 ---
+test(core): add tests
+
+Test suite.
+Files: module.test.ts, nonexistent.ts`;
+
+    const allFiles = ["module.ts", "module.test.ts"];
+    const groups = parseCommitGroups(output, allFiles);
+
+    // Both groups have at least one valid file — both should be kept
+    assert.strictEqual(groups.length, 2, "both groups have valid files after filtering");
+    assert.deepStrictEqual(groups[0].files, ["module.ts"], "group 1: allFiles includes module.ts");
+    assert.deepStrictEqual(groups[1].files, ["module.test.ts"], "group 2: nonexistent.ts filtered out by allFiles filter");
+  });
+
+  it("parseCommitGroups filters hallucinated file names in fallback path", () => {
+    const output = `--- COMMIT GROUP 1 ---
+chore: update
+
+Changes.
+Files: hallucinated.ts`;
+
+    const allFiles = ["real.ts"];
+    const groups = parseCommitGroups(output, allFiles);
+
+    // The group has no valid files, so it should be skipped entirely
+    assert.strictEqual(groups.length, 0, "should skip groups with no valid files");
+  });
+
+  it("parseCommitGroups handles overlapping file names", () => {
+    // Subagent puts the same file in multiple groups
+    const output = `--- COMMIT GROUP 1 ---
+feat(core): add module
+
+Module.
+Files: module.ts
+
+--- COMMIT GROUP 2 ---
+test(core): test module
+
+Testing.
+Files: module.ts, module.test.ts`;
+
+    const allFiles = ["module.ts", "module.test.ts"];
+    const groups = parseCommitGroups(output, allFiles);
+
+    // Both groups have valid files, so both should be kept
+    assert.strictEqual(groups.length, 2, "both groups should be kept with valid files");
+    assert.strictEqual(groups[0].files.length, 1, "first group: module.ts");
+    assert.strictEqual(groups[1].files.length, 2, "second group: module.ts + module.test.ts");
+  });
+});

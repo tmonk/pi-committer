@@ -35,6 +35,10 @@ interface CommitWorkerParams {
   minChanges: number;
   /** Resolved model for the subagent (provider/id string, e.g. "openai/gpt-4o-mini") */
   subagentModel?: string;
+  /** Minimum changed files to use the subagent for grouping */
+  subagentGroupingMinFiles: number;
+  /** Thinking level for the subagent session (off, minimal, low, medium, high, xhigh) */
+  subagentThinkingLevel?: string;
 }
 
 interface CommitLogEntry {
@@ -407,6 +411,7 @@ async function generateCommitMessage(
   repoDir: string,
   subagentModel?: string,
   onProgress?: (output: string[]) => void,
+  subagentThinkingLevel?: string,
 ): Promise<string> {
   if (!(await tryLoadSDK())) {
     return deterministicCommitMessage(diffStat, diffContent, files);
@@ -455,6 +460,7 @@ async function generateCommitMessage(
     const result = await cas({
       cwd: repoDir,
       model,
+      thinkingLevel: subagentThinkingLevel as any,
       modelRegistry: {
         getAvailable: () => (model ? [model] : []),
         find: (p: string, i: string) => {
@@ -530,6 +536,7 @@ async function generateCommitGroups(
   repoDir: string,
   subagentModel?: string,
   onProgress?: (output: string[]) => void,
+  subagentThinkingLevel?: string,
 ): Promise<Array<{ message: string; files: string[] }>> {
   // Fallback: single group
   if (!(await tryLoadSDK())) {
@@ -594,6 +601,7 @@ async function generateCommitGroups(
     const result = await cas({
       cwd: repoDir,
       model,
+      thinkingLevel: subagentThinkingLevel as any,
       modelRegistry: {
         getAvailable: () => (model ? [model] : []),
         find: (p: string, i: string) => {
@@ -828,6 +836,7 @@ async function doGroupedCommits(
     allFiles,
     dir,
     params.subagentModel,
+    params.subagentThinkingLevel,
     (output) => {
       sendProgress({
         phase: "analyzing",
@@ -894,6 +903,7 @@ async function doGroupedCommits(
         stagedFiles,
         dir,
         params.subagentModel,
+        params.subagentThinkingLevel,
         (output) => {
           sendProgress({
             phase: "committing",
@@ -942,7 +952,7 @@ process.on("message", async (msg: any) => {
   if (!msg || msg.type !== "start") return;
 
   const params: CommitWorkerParams = msg.params;
-  const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges } = params;
+  const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentThinkingLevel } = params;
 
   try {
     // Check for abort before starting
@@ -987,7 +997,7 @@ process.on("message", async (msg: any) => {
     let commitCount = 0;
     let commitLog: CommitLogEntry[] = [];
 
-    if (stagedCommits && files.length > 1) {
+    if (stagedCommits && files.length > 1 && files.length >= params.subagentGroupingMinFiles) {
       // ---- Agent-decided staged commit mode ----
       const result = await doGroupedCommits(dir, ctx, files, params);
       commitCount = result.commitCount;

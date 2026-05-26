@@ -41,6 +41,25 @@ export interface CommitterConfig {
    * Default: 10
    */
   asyncThreshold: number;
+  /**
+   * Minimum number of changed files to use the subagent for commit group
+   * generation (logical splitting). When the changed file count is below this
+   * threshold, the grouped path falls through to a single-commit (which still
+   * uses the subagent for the commit message). This avoids the ~90s overhead
+   * of the subagent grouping call for small change sets where grouping is
+   * almost always unnecessary.
+   * Default: 4
+   */
+  subagentGroupingMinFiles: number;
+  /**
+   * Thinking level for the commit subagent session. Controls how much
+   * reasoning the model does before generating a commit message.
+   * Lower values = faster responses with fewer thinking tokens.
+   * Valid values: "off", "minimal", "low", "medium", "high", "xhigh".
+   * Default: "off" — commit messages are straightforward and don't
+   * need deep reasoning.
+   */
+  subagentThinkingLevel: string;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -55,6 +74,8 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   stagedCommits: true,
   deferToGoalAudit: false,
   asyncThreshold: 5,
+  subagentGroupingMinFiles: 4,
+  subagentThinkingLevel: "off",
 };
 
 const CONVENTIONAL_TYPES = [
@@ -198,6 +219,17 @@ function applyConfig(
 
   if (typeof raw.async_threshold === "number") {
     config.asyncThreshold = raw.async_threshold;
+  }
+
+  if (typeof raw.subagent_grouping_min_files === "number") {
+    config.subagentGroupingMinFiles = raw.subagent_grouping_min_files;
+  }
+
+  if (typeof raw.subagent_thinking_level === "string") {
+    const level = raw.subagent_thinking_level.trim();
+    if (["off", "minimal", "low", "medium", "high", "xhigh"].includes(level)) {
+      config.subagentThinkingLevel = level;
+    }
   }
 
   return config;

@@ -618,6 +618,7 @@ export async function generateStagedCommitGroups(
     const result = await cas({
       cwd: repoDir || ctx.cwd,
       model,
+      thinkingLevel: config.subagentThinkingLevel as any,
       modelRegistry: ctx.modelRegistry,
       resourceLoader: makeMessageResourceLoader(),
       sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -995,6 +996,7 @@ export async function generateCommitMessageViaSubagent(
     const result = await cas({
       cwd: repoDir || ctx.cwd,
       model,
+      thinkingLevel: config.subagentThinkingLevel as any,
       modelRegistry: ctx.modelRegistry,
       resourceLoader: makeMessageResourceLoader(),
       sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -1330,7 +1332,7 @@ export async function tryCommit(
   let commitCount = 0;
 
   try {
-    if (config.stagedCommits && allFiles.length > 1) {
+    if (config.stagedCommits && allFiles.length > 1 && allFiles.length >= config.subagentGroupingMinFiles) {
       // ---- Agent-decided staged commit mode ----
 
       // Combine runtime signal with widget Esc signal AFTER showCommitterWidget
@@ -1664,6 +1666,8 @@ async function tryCommitAsync(
         excludePatterns: config.excludePatterns,
         minChanges: config.minChanges,
         subagentModel: modelStr,
+        subagentGroupingMinFiles: config.subagentGroupingMinFiles,
+        subagentThinkingLevel: config.subagentThinkingLevel,
       },
     });
 

@@ -3437,7 +3437,7 @@ describe("sync path handles hallucinated subagent file names", () => {
     dir = createTempRepo();
     after(() => removeDir(dir));
 
-    setConfig({ ...originalConfig, stagedCommits: true });
+    setConfig({ ...originalConfig, stagedCommits: true, subagentGroupingMinFiles: 2 });
 
     writeFileSync(path.join(dir, "module.ts"), "export const m = 1;\n");
     writeFileSync(path.join(dir, "module.test.ts"), "import { test } from 'node:test';\n");
@@ -3769,5 +3769,300 @@ Files: module.ts, module.test.ts`;
     assert.strictEqual(groups.length, 2, "both groups should be kept with valid files");
     assert.strictEqual(groups[0].files.length, 1, "first group: module.ts");
     assert.strictEqual(groups[1].files.length, 2, "second group: module.ts + module.test.ts");
+  });
+});
+
+// ===========================================================================
+// subagentGroupingMinFiles config and behavior
+// ===========================================================================
+
+describe("subagentGroupingMinFiles config", () => {
+  it("default value is 4", () => {
+    const cfg = loadConfig("/tmp/nonexistent");
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 4);
+  });
+
+  it("parses subagent_grouping_min_files from TOML", () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-grouping-cfg-"));
+    after(() => removeDir(dir));
+
+    const toml = `[committer]
+subagent_grouping_min_files = 2
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 2);
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("parses subagent_grouping_min_files from JSON", () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-grouping-cfg2-"));
+    after(() => removeDir(dir));
+
+    const json = JSON.stringify({
+      committer: {
+        subagent_grouping_min_files: 3,
+      },
+    });
+    writeFileSync(path.join(dir, ".pi-committer.json"), json, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 3);
+    fs.rmSync(path.join(dir, ".pi-committer.json"));
+  });
+
+  it("ignores non-number value", () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-grouping-cfg3-"));
+    after(() => removeDir(dir));
+
+    const toml = `[committer]
+subagent_grouping_min_files = "not-a-number"
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 4, "should fall back to default");
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("subagentThinkingLevel defaults to off", () => {
+    const cfg = loadConfig("/tmp/nonexistent");
+    assert.strictEqual(cfg.subagentThinkingLevel, "off");
+  });
+
+  it("parses subagent_thinking_level from TOML", () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-thinking-cfg-"));
+    after(() => removeDir(dir));
+
+    const toml = `[committer]
+subagent_thinking_level = "low"
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.subagentThinkingLevel, "low");
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("ignores invalid subagent_thinking_level value", () => {
+    const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-thinking-cfg2-"));
+    after(() => removeDir(dir));
+
+    const toml = `[committer]
+subagent_thinking_level = "super-deep"
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.subagentThinkingLevel, "off", "should fall back to default");
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("accepts all valid thinking levels", () => {
+    for (const level of ["off", "minimal", "low", "medium", "high", "xhigh"]) {
+      const dir = mkdtempSync(path.join(tmpDir(), "pi-committer-thinking-cfg3-"));
+      after(() => removeDir(dir));
+
+      const toml = `[committer]
+subagent_thinking_level = "${level}"
+`;
+      writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+      const cfg = loadConfig(dir);
+      assert.strictEqual(cfg.subagentThinkingLevel, level, `level "${level}" should be accepted`);
+      fs.rmSync(path.join(dir, ".pi-committer.toml"));
+    }
+  });
+});
+
+describe("subagentGroupingMinFiles behaviour", () => {
+  let originalConfig: CommitterConfig;
+  let dir: string;
+
+  before(() => {
+    setConfig(loadConfig(process.cwd()));
+    originalConfig = getConfig();
+  });
+
+  after(() => {
+    setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
+  });
+
+  it("2 files with stagedCommits=true and default threshold uses single-commit path", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Default subagentGroupingMinFiles = 4, so 2 < 4 -> single-commit path
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(dir, "file-a.ts"), "// a\n");
+    writeFileSync(path.join(dir, "file-b.ts"), "// b\n");
+
+    // Mock subagent for commit message (single-commit path still uses subagent)
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: (cb: any) => {
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "feat: add module files" }],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      // Single-commit path produces 1 commit
+      assert.strictEqual(result, 1, "2 files with default threshold should produce 1 commit (single path)");
+
+      const log = execSync("git log --oneline", {
+        cwd: dir, encoding: "utf-8",
+      }).trim();
+      const count = log.split("\n").length;
+      // Initial + 1 = 2
+      assert.strictEqual(count, 2, "Expected 2 total commits (initial + 1 single commit)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("2 files with stagedCommits=true and threshold=2 uses grouped path", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    // Set threshold to 2 so 2 >= 2 triggers grouped path
+    setConfig({ ...originalConfig, stagedCommits: true, subagentGroupingMinFiles: 2 });
+
+    writeFileSync(path.join(dir, "file-x.ts"), "// x\n");
+    writeFileSync(path.join(dir, "file-y.ts"), "// y\n");
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {},
+        subscribe: (cb: any) => {
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: `--- COMMIT GROUP 1 ---
+feat: add x
+
+X.
+Files: file-x.ts
+
+--- COMMIT GROUP 2 ---
+feat: add y
+
+Y.
+Files: file-y.ts`,
+                },
+              ],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      // Grouped path produces 2 commits
+      assert.strictEqual(result, 2, "2 files with threshold=2 should produce 2 commits (grouped path)");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("single commit path still uses subagent for commit message", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, stagedCommits: true });
+
+    writeFileSync(path.join(dir, "only-one.ts"), "// only one\n");
+    writeFileSync(path.join(dir, "only-two.ts"), "// only two\n");
+
+    let subagentCalled = false;
+
+    // Mock subagent that tracks if it was called
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {
+          subagentCalled = true;
+        },
+        subscribe: (cb: any) => {
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "chore: update files" }],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      assert.strictEqual(result, 1, "should produce 1 commit");
+      assert.ok(subagentCalled, "subagent should still be called for commit message in single-commit path");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+});
+
+describe("widget rendering for small grouped commit (single-path fallback)", () => {
+  it("renders proper heading for 1-commit single path from small file set", () => {
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    } as any;
+
+    const progress: CommitterProgress = {
+      phase: "done",
+      totalCommits: 1,
+      completedCommits: 1,
+      commitLog: [
+        { hash: "aaa1111", message: "feat: add small commit", success: true },
+      ],
+      error: undefined,
+      startedAt: Date.now(),
+    };
+
+    const lines = renderCommitterWidgetLines(progress, theme, 80);
+    const joined = lines.join("\n");
+
+    assert.ok(lines[0].includes("complete"), "header should show complete");
+    assert.ok(lines[0].includes("1 commit"), "header should show 1 commit");
+    assert.ok(
+      !joined.includes("✗"),
+      "should not show error icon for successful commit",
+    );
+    assert.ok(
+      joined.includes("aaa1111"),
+      "should show commit hash",
+    );
+    assert.ok(
+      joined.includes("feat: add small commit"),
+      "should show commit message in log",
+    );
   });
 });

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.9.0] — 2026-05-26
+
+### Added
+
+- **`subagentGroupingMinFiles` config option (default 4):** When `stagedCommits=true` and the
+  number of changed files is below this threshold, the expensive subagent grouping step is
+  skipped entirely. The commit still uses the subagent for the commit message, but avoids
+  the ~90s grouping overhead for small change sets.
+- **`subagentThinkingLevel` config option (default `"off"`):** Sets the thinking level on all
+  commit subagent sessions to `"off"` by default (accepts: `off`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`). The pi SDK defaults to `"medium"` thinking, which generates unnecessary
+  reasoning tokens for trivial commit messages.
+
+### Fixed
+
+- **Widget error display for failed grouped commits:** When a grouped commit's `git add` step
+  failed (e.g., subagent hallucinated file names that don't exist), the worker no longer crashes
+  with "Subprocess exited with code 1". The `git add` loop is wrapped in try/catch, and worker
+  IPC uses a callback-based `sendResultAndExit` to avoid a race condition where `process.exit()`
+  fired before IPC messages were delivered. In the sync path, grouped commit failures now set
+  `progress.error` with a descriptive message instead of showing misleading "done 0 commits".
+
+### Changed
+
+- **Background commit notification simplified:** Removed agent-only instructions ("do not wait
+  for it", "do not check git status or git log. Continue with your task") from user-facing
+  notification text.
+
 ## [0.8.1] — 2026-05-26
 
 ### Added

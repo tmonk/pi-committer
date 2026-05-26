@@ -114,6 +114,19 @@ function sendResult(result: {
   send({ type: "result", ...result });
 }
 
+/**
+ * Exit the worker safely, allowing pending IPC messages to be delivered.
+ * Replaces direct process.exit(N) after sendResult()/sendCommit() to prevent
+ * the race condition where the process terminates before queued IPC messages
+ * arrive at the parent.
+ */
+function safeExit(exitCode: number): void {
+  clearWorkerTimeout();
+  process.exitCode = exitCode;
+  // Give the event loop a tick to deliver pending IPC messages before exiting
+  setTimeout(() => process.exit(), 100);
+}
+
 // ---------------------------------------------------------------------------
 // Pure git helpers (execSync-based, no SDK needed)
 // ---------------------------------------------------------------------------
@@ -884,8 +897,7 @@ async function doGroupedCommits(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       sendResult({ commitCount, commitLog, error: `Commit failed: ${msg}` });
-      clearWorkerTimeout();
-      process.exit(0);
+      safeExit(0);
       return { commitCount, commitLog };
     }
   }
@@ -908,7 +920,7 @@ process.on("message", async (msg: any) => {
     if (aborted) {
       unstageAll(dir);
       sendResult({ commitCount: 0, commitLog: [], error: "Cancelled." });
-      process.exit(0);
+      safeExit(0);
       return;
     }
 
@@ -919,7 +931,7 @@ process.on("message", async (msg: any) => {
     if (files.length === 0) {
       unstageAll(dir);
       sendResult({ commitCount: 0, commitLog: [] });
-      process.exit(0);
+      safeExit(0);
       return;
     }
 
@@ -927,7 +939,7 @@ process.on("message", async (msg: any) => {
     if (files.length < minChanges) {
       unstageAll(dir);
       sendResult({ commitCount: 0, commitLog: [] });
-      process.exit(0);
+      safeExit(0);
       return;
     }
 
@@ -941,8 +953,7 @@ process.on("message", async (msg: any) => {
     if (aborted) {
       unstageAll(dir);
       sendResult({ commitCount: 0, commitLog: [], error: "Cancelled." });
-      clearWorkerTimeout();
-      process.exit(0);
+      safeExit(0);
       return;
     }
 
@@ -969,18 +980,17 @@ process.on("message", async (msg: any) => {
     if (aborted) {
       unstageAll(dir);
       sendResult({ commitCount, commitLog, error: "Cancelled." });
-      process.exit(0);
+      safeExit(0);
       return;
     }
 
     // Success
     sendResult({ commitCount, commitLog });
-    process.exit(0);
+    safeExit(0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     sendResult({ commitCount: 0, commitLog: [], error: msg });
-    clearWorkerTimeout();
-    process.exit(1);
+    safeExit(1);
   }
 });
 

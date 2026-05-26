@@ -75,6 +75,10 @@ export function _getLastGroupGenCallMs(): number { return __lastGroupGenCallMs; 
 /** Flag set when an async commit is launched, checked by the tool handler. */
 let __asyncCommitStarted = false;
 let __asyncCommitFileCount = 0;
+/** Export for unit tests. */
+export function _getCommitterProgress(): CommitterProgress | null {
+  return __committerProgress;
+}
 
 // ---------------------------------------------------------------------------
 // Widget state
@@ -1583,15 +1587,49 @@ async function tryCommitAsync(
       __asyncCommitStarted = false;
       __asyncCommitFileCount = 0;
       if (__committerProgress && !resultReceived) {
-        __committerProgress.phase = "done";
-        __committerProgress.error = code === 0 ? undefined : `Subprocess exited with code ${code ?? "unknown"}`;
-        if (!__committerProgress.error) {
-          // Clean exit without result — likely no changes
+        if (code !== 0) {
+          // The worker exited with an error before sending a result IPC message.
+          // This is typically a race condition where the worker called
+          // process.exit(N) before its IPC queue was flushed. Wait briefly
+          // for a delayed result before showing the subprocess error.
+          const fallbackTimer = setTimeout(() => {
+            if (!resultReceived && __committerProgress) {
+              __committerProgress.phase = "done";
+              __committerProgress.error = `Subprocess exited with code ${code ?? "unknown"}`;
+              updateCommitterWidget();
+              setTimeout(() => hideCommitterWidget(ctx), 6000);
+            }
+          }, 500);
+
+          // Listen for a delayed result message arriving after the exit event
+          const onDelayedMsg = (msg: any) => {
+            if (msg && msg.type === "result") {
+              clearTimeout(fallbackTimer);
+              resultReceived = true;
+              if (msg.error) {
+                __committerProgress!.phase = "done";
+                __committerProgress!.error = msg.error;
+              } else {
+                __committerProgress!.phase = "done";
+                __committerProgress!.error = undefined;
+              }
+              __committerProgress!.totalCommits = msg.commitCount ?? 0;
+              __committerProgress!.completedCommits = msg.commitCount ?? 0;
+              __committerProgress!.commitLog = msg.commitLog || [];
+              updateCommitterWidget();
+              setTimeout(() => hideCommitterWidget(ctx), 6000);
+              child.removeListener("message", onDelayedMsg);
+            }
+          };
+          child.on("message", onDelayedMsg);
+        } else {
+          // Clean exit with code 0 without result — likely no changes
+          __committerProgress.phase = "done";
           __committerProgress.totalCommits = 0;
           __committerProgress.completedCommits = 0;
+          updateCommitterWidget();
+          setTimeout(() => hideCommitterWidget(ctx), 6000);
         }
-        updateCommitterWidget();
-        setTimeout(() => hideCommitterWidget(ctx), 6000);
       }
       __asyncChildProcess = null;
     });

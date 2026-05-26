@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.0] — 2026-05-26
+
+### Fixed
+
+- **IPC race condition in async commit worker:** Fixed a bug where `process.exit(N)` was called
+  before queued IPC messages (`sendResult`/`sendCommit`) could be delivered to the parent
+  process, causing the widget to show "✗ Subprocess exited with code 1" and "0 commits" even
+  when the commit had succeeded. The worker now uses a `safeExit()` function that gives the
+  event loop 100ms to flush pending IPC messages before terminating.
+- **Parent-side fallback:** When the async worker exits with a non-zero code before sending a
+  result IPC message, the parent now waits up to 500ms for a delayed result before showing the
+  subprocess error (defense-in-depth for the IPC race).
+
+### Added
+
+- **`safeExit()` helper** in `async-commit-worker.ts` — replaces direct `process.exit(N)` after
+  IPC sends with a pattern that yields the event loop before terminating.
+- **`_getCommitterProgress()` export** in `index.ts` — exposes widget progress state for test
+  assertions.
+- **2 new unit tests** (126 total): IPC race fix test verifies result-before-exit scenario;
+  parent fallback test verifies exit-before-result scenario.
+
 ## [0.7.0] — 2026-05-26
 
 ### Added

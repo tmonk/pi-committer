@@ -64,6 +64,7 @@ import {
   _restoreGoalScanCount,
   _getAsyncCommitStarted,
   _getAsyncCommitFileCount,
+  _getCommitterProgress,
 
   // State
   getSelectedSubagentModel,
@@ -2003,6 +2004,158 @@ describe("async commit threshold", () => {
 
       // The flag should be cleared after exit
       assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after exit");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the IPC race condition fix: when the worker sends a result message
+   * and THEN exits with code 1, the parent should process the result (not the
+   * exit error).
+   */
+  it("processes IPC result when result arrives before exit (IPC race fix)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `race-result-${i}.ts`), `// race ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88881;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Send result FIRST (simulating the worker's sendResult working correctly)
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 2,
+        commitLog: [
+          { hash: "abc1234", message: "feat: first commit", success: true },
+          { hash: "def5678", message: "fix: second commit", success: true },
+        ],
+      });
+
+      // THEN exit with code 1 (simulating the race where exit fires late)
+      mockChild.emit("exit", 1);
+
+      // The result should have been processed and the widget should show the
+      // result, not the "Subprocess exited with code 1" error.
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done");
+      assert.strictEqual(progress!.error, undefined, "error should be undefined (result succeeded, not exit)");
+      assert.strictEqual(progress!.totalCommits, 2, "should have the result's commit count");
+      assert.strictEqual(progress!.commitLog.length, 2, "should have the result's commit log");
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag cleared");
+    } finally {
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  /**
+   * Verify the parent-side fallback: when the worker exits with code 1 before
+   * sending a result IPC message, the parent should wait for a delayed result
+   * rather than immediately showing the subprocess exit error.
+   */
+  it("waits for delayed IPC result when exit arrives before result (parent fallback)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `delayed-${i}.ts`), `// delayed ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 88882;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithUI = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithUI, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      // Emit exit FIRST (before any result), simulating the race where
+      // process.exit(N) terminates before the IPC message is delivered.
+      mockChild.emit("exit", 1);
+
+      // The exit handler should have set up the fallback timer and the
+      // onDelayedMsg listener. Now send a result after a short delay.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 3,
+        commitLog: [
+          { hash: "aaa1111", message: "feat: commit 1", success: true },
+          { hash: "bbb2222", message: "feat: commit 2", success: true },
+          { hash: "ccc3333", message: "feat: commit 3", success: true },
+        ],
+      });
+
+      // Wait for the delayed result to be processed
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // The progress should now show the result, not the exit error
+      const progress = _getCommitterProgress();
+      assert.ok(progress, "committer progress should exist");
+      assert.strictEqual(progress!.phase, "done", "phase should be done");
+      assert.strictEqual(progress!.error, undefined, "error should be undefined (result arrived, not exit error)");
+      assert.strictEqual(progress!.totalCommits, 3, "commit count should come from the delayed result");
+      assert.strictEqual(progress!.commitLog.length, 3, "commit log should come from the delayed result");
+      assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared");
     } finally {
       __setForkMock(undefined);
       setConfig(originalConfig);

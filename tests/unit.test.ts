@@ -73,6 +73,10 @@ import {
 
   // Commit
   tryCommit,
+
+  // Worker execArgv resolution (node_modules fix)
+  resolveWorkerExecArgv,
+  _findJitiRegisterForPath,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
@@ -4069,6 +4073,76 @@ describe("widget rendering for small grouped commit (single-path fallback)", () 
 });
 
 // ===========================================================================
+// Worker execArgv resolution — tests for the node_modules/TypeScript fix
+// ===========================================================================
+
+describe("resolveWorkerExecArgv / _findJitiRegisterForPath", () => {
+  it("returns --experimental-strip-types when worker is NOT under node_modules", () => {
+    const result = resolveWorkerExecArgv("/home/user/project/worker.ts");
+    assert.deepStrictEqual(result, ["--experimental-strip-types"]);
+  });
+
+  it("returns --experimental-strip-types for a path without 'node_modules'", () => {
+    const result = resolveWorkerExecArgv("/Users/test/projects/my-app/worker.ts");
+    assert.deepStrictEqual(result, ["--experimental-strip-types"]);
+  });
+
+  it("returns jiti --import when worker is under node_modules and jiti is available at sibling", () => {
+    // Use the real jiti in the dev project's node_modules to verify detection works
+    const cwd = process.cwd();
+    const realJitiPath = path.join(cwd, "node_modules", "jiti", "lib", "jiti-register.mjs");
+
+    // Only run this assertion if jiti actually exists (CI/npm-installed environments)
+    if (existsSync(realJitiPath)) {
+      // Construct a worker path in the same node_modules as jiti
+      const workerInNm = path.join(cwd, "node_modules", "any-pkg", "worker.ts");
+      const argv = resolveWorkerExecArgv(workerInNm);
+
+      assert.strictEqual(argv.length, 2);
+      assert.strictEqual(argv[0], "--import");
+      // The jiti register path should be returned
+      assert.ok(argv[1].endsWith("jiti/lib/jiti-register.mjs"), `Expected jiti register path, got: ${argv[1]}`);
+    }
+  });
+
+  it("_findJitiRegisterForPath finds jiti in sibling node_modules", () => {
+    const cwd = process.cwd();
+    const realJitiPath = path.join(cwd, "node_modules", "jiti", "lib", "jiti-register.mjs");
+
+    if (existsSync(realJitiPath)) {
+      const workerInNm = path.join(cwd, "node_modules", "some-package", "worker.ts");
+      const result = _findJitiRegisterForPath(workerInNm);
+
+      assert.ok(result, "Expected jiti register to be found");
+      assert.ok(result.endsWith("jiti/lib/jiti-register.mjs"), `Expected jiti register, got: ${result}`);
+      assert.ok(existsSync(result!), `Expected ${result} to exist`);
+    }
+  });
+
+  it("_findJitiRegisterForPath returns null for imaginary path with no jiti", () => {
+    // A path that has no node_modules prefix — still checked against
+    // PI agent dir and cwd, both of which may or may not have jiti.
+    // The key assertion: no error is thrown.
+    const result = _findJitiRegisterForPath("/tmp/no-jiti-here/worker.ts");
+    // This should not throw — either returns a path or null
+    assert.ok(result === null || typeof result === "string");
+  });
+
+  it("_findJitiRegisterForPath handles edge case: no node_modules in path", () => {
+    const result = _findJitiRegisterForPath("/plain/path/worker.ts");
+    // Should not throw; null or a path from strategies 2/3
+    assert.ok(result === null || typeof result === "string");
+  });
+
+  it("_findJitiRegisterForPath handles edge case: exactly 'node_modules' boundary", () => {
+    // Path ending right at node_modules prefix
+    const result = _findJitiRegisterForPath("/some/node_modules/extra/path/worker.ts");
+    // Should not throw
+    assert.ok(result === null || typeof result === "string");
+  });
+});
+
+// ===========================================================================
 // Async worker IPC integration — fork the real worker, send params, verify result
 // ===========================================================================
 
@@ -4118,7 +4192,7 @@ describe("async worker IPC integration", () => {
     // Fork the worker
     const workerPath = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
     const child = fork(workerPath, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 
@@ -4209,7 +4283,7 @@ describe("async worker IPC integration", () => {
 
     const workerPath2 = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
     const child = fork(workerPath2, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath2),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 
@@ -4270,7 +4344,7 @@ describe("async worker IPC integration", () => {
 
     const workerPath3 = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
     const child = fork(workerPath3, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath3),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 

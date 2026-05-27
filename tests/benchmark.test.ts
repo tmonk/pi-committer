@@ -109,6 +109,8 @@ import {
   loadConfig,
   getConfig,
   type CommitterConfig,
+  resolveWorkerExecArgv,
+  _findJitiRegisterForPath,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
@@ -617,6 +619,69 @@ describe("benchmark", () => {
 
       assert.ok(msg.length > 0, "deterministic fallback should produce a message");
       assert.ok(elapsed < 500, `deterministic fallback should be fast (<500ms, got ${Math.round(elapsed)}ms)`);
+    });
+  });
+
+  // ===================================================================
+  // Worker execArgv resolution performance
+  // ===================================================================
+
+  describe("resolveWorkerExecArgv / _findJitiRegisterForPath", () => {
+    const RUNS = 100;
+
+    it("resolveWorkerExecArgv (non-node_modules path)", () => {
+      const timings: number[] = [];
+      for (let i = 0; i < RUNS; i++) {
+        const start = performance.now();
+        resolveWorkerExecArgv("/home/user/projects/app/worker.ts");
+        timings.push(performance.now() - start);
+      }
+      record("resolveWorkerExecArgv (non-nm)", String(RUNS), timings);
+      const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
+      // Should be well under 1ms (simple string check)
+      assert.ok(avg < 1, `resolveWorkerExecArgv should be fast (<1ms avg, got ${Math.round(avg * 1000)}µs)`);
+    });
+
+    it("_findJitiRegisterForPath (node_modules path)", () => {
+      const cwd = process.cwd();
+      const workerPath = path.join(cwd, "node_modules", "some-pkg", "worker.ts");
+      const timings: number[] = [];
+      for (let i = 0; i < RUNS; i++) {
+        const start = performance.now();
+        _findJitiRegisterForPath(workerPath);
+        timings.push(performance.now() - start);
+      }
+      record("_findJitiRegisterForPath (nm)", String(RUNS), timings);
+      const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
+      // May involve filesystem checks (~0.1-2ms)
+      assert.ok(avg < 5, `_findJitiRegisterForPath should be fast (<5ms avg, got ${Math.round(avg * 100) / 100}ms)`);
+    });
+
+    it("_findJitiRegisterForPath (no node_modules)", () => {
+      const timings: number[] = [];
+      for (let i = 0; i < RUNS; i++) {
+        const start = performance.now();
+        _findJitiRegisterForPath("/home/user/projects/app/worker.ts");
+        timings.push(performance.now() - start);
+      }
+      record("_findJitiRegisterForPath (no-nm)", String(RUNS), timings);
+      const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
+      // Only checks cwd and homedir (both may not match), so fast
+      assert.ok(avg < 5, `_findJitiRegisterForPath(no-nm) should be fast (<5ms avg, got ${Math.round(avg * 100) / 100}ms)`);
+    });
+
+    it("resolveWorkerExecArgv (node_modules path with real jiti)", () => {
+      const cwd = process.cwd();
+      const workerInNm = path.join(cwd, "node_modules", "any-pkg", "worker.ts");
+      const timings: number[] = [];
+      for (let i = 0; i < RUNS; i++) {
+        const start = performance.now();
+        const argv = resolveWorkerExecArgv(workerInNm);
+        timings.push(performance.now() - start);
+      }
+      record("resolveWorkerExecArgv (nm+jiti)", String(RUNS), timings);
+      const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
+      assert.ok(avg < 5, `resolveWorkerExecArgv(nm+jiti) should be fast (<5ms avg, got ${Math.round(avg * 100) / 100}ms)`);
     });
   });
 });

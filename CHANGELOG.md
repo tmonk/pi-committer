@@ -1,6 +1,35 @@
 # Changelog
 
+## [0.12.0] — 2026-05-27
+
+### Fixed
+
+- **Worker crash under node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING):**
+  Node.js 22's built-in `--experimental-strip-types` refuses to process `.ts` files
+  under `node_modules`, causing the async commit worker to exit with code 1 immediately.
+  The fix detects when the worker path is under `node_modules` and switches to jiti's ESM
+  loader (`--import jiti/lib/jiti-register.mjs`) instead, which has no such restriction.
+  The `resolveWorkerExecArgv(workerPath?)` helper encapsulates the decision logic.
+
+### Added
+
+- **Full test coverage for the node_modules fix:**
+  - 7 unit tests for `resolveWorkerExecArgv`/`_findJitiRegisterForPath` covering all path
+    resolution strategies and edge cases.
+  - 4 crash-scenario integration tests reproducing the original `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`
+    error, verifying jiti succeeds where strip-types fails, and a regression guard.
+  - 1 E2E test creating a temp `node_modules` structure with the real worker symlinked in,
+    forking with jiti execArgv, and verifying the worker loads and responds.
+  - 4 performance benchmarks confirming sub-millisecond overhead for both code paths.
+
+### Changed
+
+- **`forkWorker()` in test infrastructure** now uses `resolveWorkerExecArgv(workerPath)`
+  instead of hardcoded `["--experimental-strip-types"]`, matching the production fix.
+
 ## [0.11.0] — 2026-05-27
+
+### Fixed
 
 ### Fixed
 

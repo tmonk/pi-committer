@@ -8,7 +8,7 @@ import assert from "node:assert";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -305,5 +305,53 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
       encoding: "utf-8",
     }).trim();
     assert.ok(status.includes("results.json"), "Expected results.json to remain untracked in nested gitignore");
+  });
+
+  // -----------------------------------------------------------------------
+  it("Test 13: Async commit worker loads successfully under node_modules (jiti execArgv path)", async () => {
+    // This test verifies that the async worker can be forked from a path
+    // under node_modules using the jiti loader, which is the exact scenario
+    // that was crashing (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING).
+
+    // Create a temp node_modules structure
+    const nmDir = mkdtempSync(path.join(tmpDir(), "pi-e2e-nm-"));
+    after(() => { try { fs.rmSync(nmDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    const pkgDir = path.join(nmDir, "node_modules", "pi-committer-e2e");
+    fs.mkdirSync(pkgDir, { recursive: true });
+
+    // Symlink the real worker into the node_modules location
+    const realWorker = path.resolve(__dirname, "..", "async-commit-worker.ts");
+    fs.symlinkSync(realWorker, path.join(pkgDir, "async-commit-worker.ts"));
+
+    const jitiReg = path.join(process.cwd(), "node_modules", "jiti", "lib", "jiti-register.mjs");
+
+    // Build a runner script byte-by-byte to avoid template/String escaping
+    const runnerLines: string[] = [];
+    runnerLines.push("import { fork } from 'node:child_process';");
+    runnerLines.push("import { writeFileSync } from 'node:fs';");
+    runnerLines.push("const worker = " + JSON.stringify(path.join(pkgDir, "async-commit-worker.ts")) + ";");
+    runnerLines.push("const jiti = " + JSON.stringify(jitiReg) + ";");
+    runnerLines.push("const child = fork(worker, [], { execArgv: ['--import', jiti], stdio: ['ignore','ignore','ignore','ipc'] });");
+    runnerLines.push("const donePath = " + JSON.stringify(path.join(nmDir, "done.flag")) + ";");
+    runnerLines.push("child.on('message', (msg) => { if (msg && msg.type === 'result') { writeFileSync(donePath, 'done'); process.exit(0); } });");
+    runnerLines.push("child.on('exit', (code) => { if (code !== 0) process.exit(code); });");
+    runnerLines.push("setTimeout(() => process.exit(2), 10000);");
+    runnerLines.push("child.send({ type: 'start', params: { dir: " + JSON.stringify(testDir) + ", diffStat: '', diffContent: '', allFiles: [], stagedCommits: false, excludePatterns: [], minChanges: 1, subagentModel: undefined, subagentGroupingMinFiles: 4, subagentThinkingLevel: 'off' } });");
+
+    const runnerScript = path.join(nmDir, "runner.mjs");
+    writeFileSync(runnerScript, runnerLines.join("\n"));
+
+    // Run the runner and check for done flag
+    try {
+      execSync(`node "${runnerScript}"`, { timeout: 15_000, encoding: "utf-8", maxBuffer: 1024 });
+    } catch (e: any) {
+      assert.fail(`Runner failed: ${e.message}`);
+    }
+
+    // Verify the done.flag was created (worker sent result message)
+    const doneFlag = path.join(nmDir, "done.flag");
+    assert.ok(existsSync(doneFlag),
+      "Worker should have created done.flag, indicating result message was received");
   });
 });

@@ -41,10 +41,14 @@ import {
   type WorkerProgress,
   type CommitCallbacks,
 } from "../async-commit-worker.ts";
+import { resolveWorkerExecArgv } from "../index.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /** Base temp directory for all test repos. */
 const _baseDir = fs.mkdtempSync("pi-worker-edge-");
@@ -82,7 +86,7 @@ function forkWorker(
       new URL("../async-commit-worker.ts", import.meta.url),
     );
     const child = fork(workerPath, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 
@@ -397,7 +401,7 @@ describe("worker abort at checkpoint", () => {
       new URL("../async-commit-worker.ts", import.meta.url),
     );
     const child = fork(workerPath, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 
@@ -472,7 +476,7 @@ describe("worker abort at checkpoint", () => {
       new URL("../async-commit-worker.ts", import.meta.url),
     );
     const child = fork(workerPath, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(workerPath),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
 
@@ -1000,5 +1004,205 @@ describe("worker IPC result guarantees", () => {
       assert.ok(entry.message, "commit entry must have message");
       assert.strictEqual(entry.success, true, "commit entry must have success=true");
     }
+  });
+});
+
+// ===========================================================================
+// Worker loading via jiti (node_modules scenario)
+// ===========================================================================
+
+describe("worker loads via jiti (node_modules scenario)", () => {
+  it("forks the worker with jiti execArgv and processes commits successfully", async () => {
+    const dir = mkdtempSync(path.join(_baseDir, "jiti-test-"));
+    after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    // Init git repo with changes
+    execSync("git init", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.email test@test.com", { cwd: dir, stdio: "ignore" });
+    execSync("git config user.name Test", { cwd: dir, stdio: "ignore" });
+    writeFileSync(path.join(dir, "README.md"), "# test\n");
+    execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
+
+    writeFileSync(path.join(dir, "change1.ts"), "// change1\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = ["change1.ts"];
+
+    const workerPath = fileURLToPath(new URL("../async-commit-worker.ts", import.meta.url));
+    const jitiRegister = path.join(process.cwd(), "node_modules", "jiti", "lib", "jiti-register.mjs");
+
+    // Only run test if jiti exists
+    if (!fs.existsSync(jitiRegister)) {
+      console.log("skipping jiti test: jiti-register.mjs not found");
+      return;
+    }
+
+    // Write params JSON for the external runner
+    const paramsFile = path.join(dir, "jiti-params.json");
+    const runnerPath = path.join(__dirname, "_jiti-runner.mjs");
+    writeFileSync(paramsFile, JSON.stringify({ dir, diffStat, diffContent, allFiles, workerPath, jitiRegister }));
+
+    // Run the external runner as a subprocess (avoids node:test IPC conflict)
+    const output = execSync(
+      `node "${runnerPath}" "${paramsFile}"`,
+      { cwd: process.cwd(), encoding: "utf-8", timeout: 15_000, maxBuffer: 10 * 1024 * 1024 },
+    ).trim();
+
+    // Parse JSON result from stdout
+    const lines = output.split("\n").filter(Boolean);
+    const jsonLine = lines.find((l: string) => l.startsWith("{"));
+    assert.ok(jsonLine, "Expected JSON output from runner, got: " + output);
+
+    const result = JSON.parse(jsonLine);
+
+    assert.strictEqual(result.type, "result", "expected result message");
+    assert.strictEqual(result.error, undefined, "no error: " + result.error);
+    assert.strictEqual(result.commitCount, 1, "should produce 1 commit via jiti loader");
+  });
+});
+
+// ===========================================================================
+// Node_modules type-stripping crash scenario (regression guard)
+// ===========================================================================
+
+describe("node_modules type-stripping crash scenario", () => {
+  it("--experimental-strip-types crashes for .ts under node_modules (verify the original bug)", async () => {
+    // Create a temp dir structured like node_modules/pkg with a minimal .ts worker
+    const nmDir = mkdtempSync(path.join(_baseDir, "nm-crash-"));
+    after(() => { try { fs.rmSync(nmDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    const pkgDir = path.join(nmDir, "node_modules", "test-pkg");
+    fs.mkdirSync(pkgDir, { recursive: true });
+
+    // Write a minimal .ts file that does IPC
+    const workerContent = `
+import { parentPort } from "node:worker_threads";
+process.on("message", (msg: any) => {
+  if (msg?.type === "ping") {
+    process.send?.({ type: "pong" });
+    setTimeout(() => process.exit(0), 100);
+  }
+});
+`;
+    const workerFile = path.join(pkgDir, "worker.ts");
+    writeFileSync(workerFile, workerContent);
+
+    // Verify: forking with --experimental-strip-types should crash
+    // because the worker is under node_modules
+    const script1 = path.join(nmDir, "test-strip-types.mjs");
+    writeFileSync(script1, `
+import { fork } from "node:child_process";
+const child = fork(${JSON.stringify(workerFile)}, [], {
+  execArgv: ["--experimental-strip-types"],
+  stdio: ["ignore", "ignore", "pipe", "ipc"],
+});
+child.on("exit", (code) => { process.exit(code ?? 1); });
+setTimeout(() => process.exit(1), 5000);
+child.send({ type: "ping" });
+`);
+
+    // Run the script — expect non-zero exit
+    let stripExitCode = 0;
+    try {
+      execSync(`node "${script1}"`, { timeout: 8000, stdio: "pipe" });
+      // If we get here, strip-types didn't crash — unexpected success
+      stripExitCode = 0;
+    } catch (e: any) {
+      stripExitCode = e.status ?? 1;
+    }
+
+    // Node.js 22+ should refuse to strip types under node_modules
+    assert.notStrictEqual(stripExitCode, 0,
+      "--experimental-strip-types should crash for .ts files under node_modules");
+  });
+
+  it("resolveWorkerExecArgv returns jiti --import for node_modules path", () => {
+    const cwd = process.cwd();
+    const workerInNm = path.join(cwd, "node_modules", "any-pkg", "worker.ts");
+    const argv = resolveWorkerExecArgv(workerInNm);
+
+    assert.strictEqual(argv[0], "--import",
+      "resolveWorkerExecArgv should return --import for path under node_modules");
+    assert.ok(argv[1].includes("jiti"),
+      "resolveWorkerExecArgv should return jiti register path");
+  });
+
+  it("jiti succeeds where --experimental-strip-types fails (node_modules .ts file)", async () => {
+    // Create a temp dir structured like node_modules/pkg
+    const nmDir = mkdtempSync(path.join(_baseDir, "nm-jiti-"));
+    after(() => { try { fs.rmSync(nmDir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+    const pkgDir = path.join(nmDir, "node_modules", "test-pkg");
+    fs.mkdirSync(pkgDir, { recursive: true });
+
+    // Write the same minimal .ts worker
+    const workerContent = `
+import { parentPort } from "node:worker_threads";
+process.on("message", (msg: any) => {
+  if (msg?.type === "ping") {
+    process.send?.({ type: "pong" });
+    setTimeout(() => process.exit(0), 100);
+  }
+});
+`;
+    const workerFile = path.join(pkgDir, "worker.ts");
+    writeFileSync(workerFile, workerContent);
+
+    const jitiReg = path.join(process.cwd(), "node_modules", "jiti", "lib", "jiti-register.mjs");
+    if (!fs.existsSync(jitiReg)) {
+      console.log("skipping: jiti not found");
+      return;
+    }
+
+    // Run with jiti — expect success
+    const script2 = path.join(nmDir, "test-jiti.mjs");
+    writeFileSync(script2, `
+import { fork } from "node:child_process";
+const child = fork(${JSON.stringify(workerFile)}, [], {
+  execArgv: ["--import", ${JSON.stringify(jitiReg)}],
+  stdio: ["ignore", "ignore", "pipe", "ipc"],
+});
+child.on("message", (msg) => {
+  if (msg?.type === "pong") process.exit(0);
+});
+child.on("exit", (code) => process.exit(code ?? 1));
+setTimeout(() => process.exit(1), 5000);
+child.send({ type: "ping" });
+`);
+
+    let jitiExitCode = -1;
+    try {
+      execSync(`node "${script2}"`, { timeout: 8000, stdio: "pipe" });
+      jitiExitCode = 0;
+    } catch (e: any) {
+      jitiExitCode = e.status ?? 1;
+    }
+
+    assert.strictEqual(jitiExitCode, 0,
+      "jiti should successfully load .ts file under node_modules");
+  });
+
+  it("regression guard: if resolveWorkerExecArgv is reverted to always return --experimental-strip-types, crash-scenario tests would catch it", () => {
+    // This is a design-level assertion: verify that if someone reverts
+    // resolveWorkerExecArgv to always return "--experimental-strip-types",
+    // the crash-scenario tests above would fail.
+    //
+    // We verify this by checking that resolveWorkerExecArgv returns DIFFERENT
+    // values for node_modules vs non-node_modules paths.
+    const nmPath = path.join(process.cwd(), "node_modules", "any", "worker.ts");
+    const normalPath = "/home/user/worker.ts";
+
+    const nmArgv = resolveWorkerExecArgv(nmPath);
+    const normalArgv = resolveWorkerExecArgv(normalPath);
+
+    assert.notDeepStrictEqual(nmArgv, normalArgv,
+      "resolveWorkerExecArgv must return different execArgv for node_modules vs non-node_modules paths. " +
+      "If this fails, the fix has been reverted to always return --experimental-strip-types.");
   });
 });

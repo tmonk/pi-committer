@@ -9,8 +9,8 @@ import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { execSync, fork } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type CommitterConfig } from "./config.ts";
@@ -58,6 +58,74 @@ const __workerPath = (() => {
 
 /** Reference to the forked child process for async commits. */
 let __asyncChildProcess: import("node:child_process").ChildProcess | null = null;
+
+// ---------------------------------------------------------------------------
+// Worker subprocess execArgv resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the path to jiti's ESM loader register module.
+ *
+ * Jiti is used by the PI runtime to load TypeScript extensions. It can
+ * handle .ts files under node_modules, which Node.js 22's built-in
+ * --experimental-strip-types refuses to do.
+ *
+ * We search for jiti in these locations (in order):
+ * 1. Sibling to the worker package: <worker_node_modules>/jiti/lib/jiti-register.mjs
+ * 2. The PI agent's npm directory: ~/.pi/agent/npm/node_modules/jiti/lib/jiti-register.mjs
+ */
+function findJitiRegister(): string | null {
+  // Strategy 1: sibling in the same node_modules as the worker
+  if (__workerPath.includes("node_modules")) {
+    const nmIndex = __workerPath.lastIndexOf("node_modules");
+    if (nmIndex >= 0) {
+      const nmDir = __workerPath.slice(0, nmIndex + "node_modules".length);
+      const candidate = path.join(nmDir, "jiti", "lib", "jiti-register.mjs");
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  // Strategy 2: PI agent npm directory
+  const homeNpmJiti = path.join(
+    homedir(),
+    ".pi",
+    "agent",
+    "npm",
+    "node_modules",
+    "jiti",
+    "lib",
+    "jiti-register.mjs",
+  );
+  if (existsSync(homeNpmJiti)) return homeNpmJiti;
+
+  // Strategy 3: relative to process.cwd() node_modules (for development)
+  const cwdJiti = path.join(process.cwd(), "node_modules", "jiti", "lib", "jiti-register.mjs");
+  if (existsSync(cwdJiti)) return cwdJiti;
+
+  return null;
+}
+
+/**
+ * Determine the appropriate Node.js execArgv for forking the async commit worker.
+ *
+ * Node.js 22's --experimental-strip-types does NOT support .ts files under
+ * node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING). Since pi-committer
+ * is typically installed as a package under node_modules, we use jiti's ESM
+ * loader hooks instead when the worker is under node_modules.
+ */
+export function resolveWorkerExecArgv(): string[] {
+  if (__workerPath.includes("node_modules")) {
+    const jitiRegister = findJitiRegister();
+    if (jitiRegister) {
+      return ["--import", jitiRegister];
+    }
+    console.warn(
+      "[pi-committer] Worker is under node_modules but jiti not found. " +
+      "Falling back to --experimental-strip-types (may fail).",
+    );
+  }
+  return ["--experimental-strip-types"];
+}
 
 // ---------------------------------------------------------------------------
 // Profiling instrumentation (used by benchmarks and runtime introspection)
@@ -1538,7 +1606,7 @@ async function tryCommitAsync(
 
   try {
     const child = resolveFork()(__workerPath, [], {
-      execArgv: ["--experimental-strip-types"],
+      execArgv: resolveWorkerExecArgv(),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
       detached: true,
     });

@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.11.0] — 2026-05-27
+
+### Fixed
+
+- **Worker always exits with code 0:** Removed the last two `exit code 1` paths in
+  `async-commit-worker.ts`. The worker timeout (5-minute watchdog) now calls
+  `sendResultAndExit(..., 0)` instead of bare `process.exit(1)`, and the main handler's
+  catch block uses exit code 0. All errors (timeout, commit failure, cancellation, worker crash)
+  are communicated exclusively through the IPC result message's `error` field, never via the
+  process exit code. This eliminates the IPC race where the parent could see
+  "Subprocess exited with code 1" before the IPC result message arrived.
+
+### Added
+
+- **Exported worker functions for direct unit testing:** All pure git helpers (`git`, `gitCwd`,
+  `getHeadHash`, `unstageAll`, `getDiffContent`, `getChangedFiles`, `isGitignored`,
+  `filterGitignoredFiles`, `unstageExcludedFiles`), commit message generators
+  (`deterministicCommitMessage`, `parseCommitGroups`), IPC helpers (`sendResultAndExit`), and
+  the main commit pipeline functions (`doSingleCommit`, `doGroupedCommits`) are now exported
+  from `async-commit-worker.ts`. The pipeline functions accept an optional `ipc` parameter with
+  `onProgress` and `onCommit` callbacks, making them testable without a forked IPC environment.
+- **40 new comprehensive edge-case tests** in `tests/worker-edge.test.ts` covering:
+  - Worker exported git helper functions
+  - Deterministic commit message generation
+  - Parse commit groups (including hallucinated file filtering)
+  - `sendResultAndExit` IPC message delivery
+  - Abort/cancel at multiple checkpoints (SIGTERM timing races)
+  - Git failure modes (pre-commit hook rejection, empty diffs, missing files, minChanges filter)
+  - IPC result guarantees (always exit 0, result message structure, commit log field validation)
+  - Large diff handling (getDiffContent with file fallback)
+  - Binary file pattern handling (filterGitignoredFiles, unstageExcludedFiles)
+  - Widget phase transitions (analyzing, done with error, idle as empty)
+  - Exclude pattern glob matching (prefix, suffix, wildcard)
+
+### Changed
+
+- `npm test` now runs both `tests/unit.test.ts` and `tests/worker-edge.test.ts`.
+
 ## [0.10.0] — 2026-05-26
 
 ### Fixed

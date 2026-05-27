@@ -81,10 +81,7 @@ process.on("SIGHUP", () => {
 
 const WORKER_TIMEOUT_MS = 5 * 60 * 1000;
 const __workerTimeout = setTimeout(() => {
-  if (process.send) {
-    process.send({ type: "result", commitCount: 0, commitLog: [], error: "Worker timed out after 5 minutes." });
-  }
-  process.exit(1);
+  sendResultAndExit({ commitCount: 0, commitLog: [], error: "Worker timed out after 5 minutes." }, 0);
 }, WORKER_TIMEOUT_MS);
 
 // Clear the timeout when we get a result (handled in process.on('message') handler)
@@ -124,7 +121,7 @@ function sendResult(result: {
  * delivery, eliminating the race where process.exit() fires before the
  * queued IPC message reaches the parent.
  */
-function sendResultAndExit(
+export function sendResultAndExit(
   result: {
     commitCount: number;
     commitLog: CommitLogEntry[];
@@ -149,14 +146,14 @@ function sendResultAndExit(
 // Pure git helpers (execSync-based, no SDK needed)
 // ---------------------------------------------------------------------------
 
-function git(...args: string[]): string {
+export function git(...args: string[]): string {
   return execSync(`git ${args.join(" ")}`, {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
 }
 
-function gitCwd(dir: string, ...args: string[]): string {
+export function gitCwd(dir: string, ...args: string[]): string {
   return execSync(`git ${args.join(" ")}`, {
     cwd: dir,
     encoding: "utf-8",
@@ -164,11 +161,11 @@ function gitCwd(dir: string, ...args: string[]): string {
   }).trim();
 }
 
-function getHeadHash(dir: string): string {
+export function getHeadHash(dir: string): string {
   return gitCwd(dir, "rev-parse", "HEAD");
 }
 
-function unstageAll(dir: string): void {
+export function unstageAll(dir: string): void {
   try {
     gitCwd(dir, "reset", "HEAD", "--", ".");
   } catch {
@@ -176,7 +173,7 @@ function unstageAll(dir: string): void {
   }
 }
 
-function getDiffContent(dir: string): string {
+export function getDiffContent(dir: string): string {
   // Fast path: pipe the diff through execSync with a 10MB buffer.
   try {
     return execSync("git diff --cached", {
@@ -201,7 +198,7 @@ function getDiffContent(dir: string): string {
   }
 }
 
-function getChangedFiles(diffStat: string): string[] {
+export function getChangedFiles(diffStat: string): string[] {
   return diffStat
     .split("\n")
     .filter((l) => l.trim())
@@ -213,7 +210,7 @@ function getChangedFiles(diffStat: string): string[] {
     .filter(Boolean);
 }
 
-function isGitignored(dir: string, file: string): boolean {
+export function isGitignored(dir: string, file: string): boolean {
   try {
     execSync(`git check-ignore -- "${file}"`, {
       cwd: dir,
@@ -226,7 +223,7 @@ function isGitignored(dir: string, file: string): boolean {
   }
 }
 
-function filterGitignoredFiles(dir: string, files: string[]): string[] {
+export function filterGitignoredFiles(dir: string, files: string[]): string[] {
   if (files.length === 0) return [];
   try {
     const result = execSync(`git check-ignore --stdin`, {
@@ -245,7 +242,7 @@ function filterGitignoredFiles(dir: string, files: string[]): string[] {
   }
 }
 
-function unstageExcludedFiles(
+export function unstageExcludedFiles(
   dir: string,
   files: string[],
   excludePatterns: string[],
@@ -303,7 +300,7 @@ function unstageExcludedFiles(
 // Deterministic commit message (fallback when no SDK)
 // ---------------------------------------------------------------------------
 
-function deterministicCommitMessage(
+export function deterministicCommitMessage(
   diffStat: string,
   diffContent: string,
   files: string[],
@@ -404,7 +401,7 @@ function makeResourceLoader() {
  * Generate a commit message using a subagent (if SDK available).
  * Falls back to deterministic message on any failure.
  */
-async function generateCommitMessage(
+export async function generateCommitMessage(
   diffStat: string,
   diffContent: string,
   files: string[],
@@ -529,7 +526,7 @@ async function generateCommitMessage(
 /**
  * Generate commit groups using a subagent (if SDK available).
  */
-async function generateCommitGroups(
+export async function generateCommitGroups(
   diffStat: string,
   diffContent: string,
   allFiles: string[],
@@ -693,7 +690,7 @@ async function generateCommitGroups(
 /**
  * Parse commit groups from subagent output.
  */
-function parseCommitGroups(
+export function parseCommitGroups(
   output: string,
   allFiles: string[],
 ): Array<{ message: string; files: string[] }> {
@@ -764,11 +761,17 @@ function parseCommitGroups(
 // Single commit
 // ---------------------------------------------------------------------------
 
-async function doSingleCommit(
+export interface CommitCallbacks {
+  onProgress?: (p: WorkerProgress) => void;
+  onCommit?: (entry: CommitLogEntry) => void;
+}
+
+export async function doSingleCommit(
   dir: string,
   ctx: any,
   files: string[],
   params: CommitWorkerParams,
+  ipc?: CommitCallbacks,
 ): Promise<CommitLogEntry | undefined> {
   // Stage all files
   for (const f of files) {
@@ -794,7 +797,8 @@ async function doSingleCommit(
     dir,
     params.subagentModel,
     (output) => {
-      sendProgress({
+      const onProg = ipc?.onProgress ?? sendProgress;
+      onProg({
         phase: "committing",
         statusMessage: `Generating commit message for ${files.length} file(s)...`,
         subagent: { recentOutput: output },
@@ -826,11 +830,12 @@ async function doSingleCommit(
 // Grouped commits
 // ---------------------------------------------------------------------------
 
-async function doGroupedCommits(
+export async function doGroupedCommits(
   dir: string,
   ctx: any,
   allFiles: string[],
   params: CommitWorkerParams,
+  ipc?: CommitCallbacks,
 ): Promise<{ commitCount: number; commitLog: CommitLogEntry[] }> {
   const groups = await generateCommitGroups(
     params.diffStat,
@@ -839,7 +844,8 @@ async function doGroupedCommits(
     dir,
     params.subagentModel,
     (output) => {
-      sendProgress({
+      const onProgAnalyze = ipc?.onProgress ?? sendProgress;
+      onProgAnalyze({
         phase: "analyzing",
         fileCount: allFiles.length,
         statusMessage: `Analyzing ${allFiles.length} file(s) for logical commit grouping...`,
@@ -878,7 +884,8 @@ async function doGroupedCommits(
         stagedFiles.push(f);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        sendProgress({
+        const onProgErr = ipc?.onProgress ?? sendProgress;
+        onProgErr({
           phase: "committing",
           statusMessage: `Skipping unstageable file: ${f} (${msg})`,
         });
@@ -906,7 +913,8 @@ async function doGroupedCommits(
         dir,
         params.subagentModel,
         (output) => {
-          sendProgress({
+          const onProgGroup = ipc?.onProgress ?? sendProgress;
+          onProgGroup({
             phase: "committing",
             subagent: { recentOutput: output },
             totalCommits: groups.length,
@@ -935,7 +943,8 @@ async function doGroupedCommits(
       const entry: CommitLogEntry = { hash, message: finalMessage, success: true };
       commitLog.push(entry);
       commitCount++;
-      sendCommit(entry);
+      const onCommitEntry = ipc?.onCommit ?? sendCommit;
+      onCommitEntry(entry);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       sendResultAndExit({ commitCount, commitLog, error: `Commit failed: ${msg}` }, 0);
@@ -1001,12 +1010,12 @@ process.on("message", async (msg: any) => {
 
     if (stagedCommits && files.length > 1 && files.length >= params.subagentGroupingMinFiles) {
       // ---- Agent-decided staged commit mode ----
-      const result = await doGroupedCommits(dir, ctx, files, params);
+      const result = await doGroupedCommits(dir, ctx, files, params, { onProgress: sendProgress, onCommit: sendCommit });
       commitCount = result.commitCount;
       commitLog = result.commitLog;
     } else {
       // ---- Single commit mode ----
-      const entry = await doSingleCommit(dir, ctx, files, params);
+      const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress });
       if (entry) {
         commitCount = 1;
         commitLog = [entry];
@@ -1024,7 +1033,7 @@ process.on("message", async (msg: any) => {
     sendResultAndExit({ commitCount, commitLog }, 0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    sendResultAndExit({ commitCount: 0, commitLog: [], error: msg }, 1);
+    sendResultAndExit({ commitCount: 0, commitLog: [], error: msg }, 0);
   }
 });
 

@@ -111,6 +111,7 @@ function sendResult(result: {
   commitCount: number;
   commitLog: CommitLogEntry[];
   error?: string;
+  warnings?: string[];
 }): void {
   send({ type: "result", ...result });
 }
@@ -126,6 +127,7 @@ export function sendResultAndExit(
     commitCount: number;
     commitLog: CommitLogEntry[];
     error?: string;
+    warnings?: string[];
   },
   exitCode: number,
 ): void {
@@ -836,7 +838,7 @@ export async function doGroupedCommits(
   allFiles: string[],
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
-): Promise<{ commitCount: number; commitLog: CommitLogEntry[] }> {
+): Promise<{ commitCount: number; commitLog: CommitLogEntry[]; warnings: string[] }> {
   const groups = await generateCommitGroups(
     params.diffStat,
     params.diffContent,
@@ -857,16 +859,18 @@ export async function doGroupedCommits(
 
   if (aborted) {
     unstageAll(dir);
-    return { commitCount: 0, commitLog: [] };
+    return { commitCount: 0, commitLog: [], warnings: [] };
   }
 
   let commitCount = 0;
   const commitLog: CommitLogEntry[] = [];
+  const warnings: string[] = [];
+  const warnedFiles = new Set<string>();
 
   for (let i = 0; i < groups.length; i++) {
     if (aborted) {
       unstageAll(dir);
-      return { commitCount, commitLog };
+      return { commitCount, commitLog, warnings };
     }
 
     const group = groups[i];
@@ -889,9 +893,17 @@ export async function doGroupedCommits(
           phase: "committing",
           statusMessage: `Skipping unstageable file: ${f} (${msg})`,
         });
+        // Collect warning (deduplicated by file path)
+        if (!warnedFiles.has(f)) {
+          warnedFiles.add(f);
+          warnings.push(`Skipping unstageable file: ${f} (${msg})`);
+        }
       }
     }
-    if (stagedFiles.length === 0) continue;
+    if (stagedFiles.length === 0) {
+      warnings.push("Skipping group \u2014 all files failed to stage");
+      continue;
+    }
 
     try {
       const diffStat = execSync("git diff --cached --stat", {
@@ -927,7 +939,7 @@ export async function doGroupedCommits(
 
       if (aborted) {
         unstageAll(dir);
-        return { commitCount, commitLog };
+        return { commitCount, commitLog, warnings };
       }
 
       const finalMessage = message.length > 10 ? message : `chore: update ${stagedFiles.length} file(s)`;
@@ -947,12 +959,12 @@ export async function doGroupedCommits(
       onCommitEntry(entry);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      sendResultAndExit({ commitCount, commitLog, error: `Commit failed: ${msg}` }, 0);
-      return { commitCount, commitLog };
+      sendResultAndExit({ commitCount, commitLog, error: `Commit failed: ${msg}`, warnings }, 0);
+      return { commitCount, commitLog, warnings };
     }
   }
 
-  return { commitCount, commitLog };
+  return { commitCount, commitLog, warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +976,8 @@ process.on("message", async (msg: any) => {
 
   const params: CommitWorkerParams = msg.params;
   const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentThinkingLevel } = params;
+
+  let _warnings: string[] = [];
 
   try {
     // Check for abort before starting
@@ -1008,11 +1022,14 @@ process.on("message", async (msg: any) => {
     let commitCount = 0;
     let commitLog: CommitLogEntry[] = [];
 
+    _warnings = [];
+
     if (stagedCommits && files.length > 1 && files.length >= params.subagentGroupingMinFiles) {
       // ---- Agent-decided staged commit mode ----
       const result = await doGroupedCommits(dir, ctx, files, params, { onProgress: sendProgress, onCommit: sendCommit });
       commitCount = result.commitCount;
       commitLog = result.commitLog;
+      _warnings = result.warnings;
     } else {
       // ---- Single commit mode ----
       const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress });
@@ -1030,10 +1047,10 @@ process.on("message", async (msg: any) => {
     }
 
     // Success
-    sendResultAndExit({ commitCount, commitLog }, 0);
+    sendResultAndExit({ commitCount, commitLog, warnings: _warnings }, 0);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    sendResultAndExit({ commitCount: 0, commitLog: [], error: msg }, 0);
+    sendResultAndExit({ commitCount: 0, commitLog: [], error: msg, warnings: _warnings }, 0);
   }
 });
 

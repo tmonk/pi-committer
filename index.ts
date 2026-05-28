@@ -60,6 +60,74 @@ const __workerPath = (() => {
 let __asyncChildProcess: import("node:child_process").ChildProcess | null = null;
 
 // ---------------------------------------------------------------------------
+// Warnings accumulator
+// ---------------------------------------------------------------------------
+
+/**
+ * Collected warnings about skipped/unstageable files during the current commit operation.
+ * Each entry is a warning message string.
+ */
+let __commitWarnings: string[] = [];
+
+/** File paths already reported in __commitWarnings (for dedup). */
+const __commitWarningFiles = new Set<string>();
+
+/** Reset the commit warnings accumulator. */
+export function resetCommitWarnings(): void {
+  __commitWarnings = [];
+  __commitWarningFiles.clear();
+}
+
+/**
+ * Add a warning about an unstageable file. Deduplicates by file path.
+ */
+function addUnstageableFileWarning(filePath: string, msg: string): void {
+  if (!__commitWarningFiles.has(filePath)) {
+    __commitWarningFiles.add(filePath);
+    __commitWarnings.push(`Skipping unstageable file: ${filePath} (${msg})`);
+  }
+}
+
+/**
+ * Add a warning about a skipped group.
+ */
+function addSkippedGroupWarning(): void {
+  __commitWarnings.push("Skipping group \u2014 all files failed to stage");
+}
+
+/**
+ * Format a concise warning summary from collected warnings.
+ * Returns empty string if no warnings.
+ * Used by the commit_changes tool handler to include warnings in IPC response text.
+ */
+export function formatWarningSummary(warnings: string[]): string {
+  if (warnings.length === 0) return "";
+
+  const skippedFiles = new Set<string>();
+  let skippedGroupCount = 0;
+
+  for (const w of warnings) {
+    const fileMatch = w.match(/^Skipping unstageable file: (.+?) \(/);
+    if (fileMatch) skippedFiles.add(fileMatch[1]);
+    if (w.includes("group \u2014 all files failed to stage")) skippedGroupCount++;
+  }
+
+  const parts: string[] = [];
+  if (skippedFiles.size > 0) {
+    const fileNames = [...skippedFiles].slice(0, 3).map((f) => path.basename(f));
+    const suffix = skippedFiles.size > 3 ? ` (+${skippedFiles.size - 3} more)` : "";
+    parts.push(
+      `Skipped ${skippedFiles.size} unstageable file(s) (${fileNames.join(", ")}${suffix})`,
+    );
+  }
+  if (skippedGroupCount > 0) {
+    parts.push(`${skippedGroupCount} group(s) entirely skipped`);
+  }
+
+  return parts.join("; ");
+}
+
+// ---------------------------------------------------------------------------
 // Worker subprocess execArgv resolution
 // ---------------------------------------------------------------------------
 
@@ -496,10 +564,11 @@ export function getChangedFiles(diffStat: string): string[] {
  */
 export function unstageExcludedFiles(
   dir: string,
-  files: string[],
-  excludePatterns: string[],
+  files: string[] | undefined,
+  excludePatterns: string[] | undefined,
 ): string[] {
-  if (excludePatterns.length === 0) return files;
+  if (!files || files.length === 0) return [];
+  if (!excludePatterns || excludePatterns.length === 0) return files;
 
   const kept: string[] = [];
   const toUnstage: string[] = [];
@@ -1481,10 +1550,12 @@ export async function tryCommit(
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             ctx.ui.notify(`[pi-committer] Skipping unstageable file: ${f} (${msg})`, "warning");
+            addUnstageableFileWarning(f, msg);
           }
         }
         if (stagedFiles.length === 0) {
           ctx.ui.notify("[pi-committer] Skipping group — all files failed to stage", "warning");
+          addSkippedGroupWarning();
           continue;
         }
 
@@ -1659,6 +1730,21 @@ async function tryCommitAsync(
         resultReceived = true;
         __asyncCommitStarted = false;
         __asyncCommitFileCount = 0;
+
+        // Propagate warnings from the async worker into the module-level accumulator
+        if (msg.warnings && Array.isArray(msg.warnings)) {
+          for (const w of msg.warnings) {
+            const fileMatch = w.match(/^Skipping unstageable file: (.+?) \(/);
+            if (fileMatch) {
+              // Extract just the inner error message from the full warning string
+              const innerMsg = w.slice(fileMatch[0].length, -1);
+              addUnstageableFileWarning(fileMatch[1], innerMsg || "unknown error");
+            } else if (typeof w === "string") {
+              __commitWarnings.push(w);
+            }
+          }
+        }
+
         if (msg.error) {
           __committerProgress.phase = "done";
           __committerProgress.error = msg.error;
@@ -1712,6 +1798,21 @@ async function tryCommitAsync(
             if (msg && msg.type === "result") {
               clearTimeout(fallbackTimer);
               resultReceived = true;
+
+              // Propagate warnings from async worker
+              if (msg.warnings && Array.isArray(msg.warnings)) {
+                for (const w of msg.warnings) {
+                  const fileMatch = w.match(/^Skipping unstageable file: (.+?) \(/);
+                  if (fileMatch) {
+                    // Extract just the inner error message from the full warning string
+                    const innerMsg = w.slice(fileMatch[0].length, -1);
+                    addUnstageableFileWarning(fileMatch[1], innerMsg || "unknown error");
+                  } else if (typeof w === "string") {
+                    __commitWarnings.push(w);
+                  }
+                }
+              }
+
               if (msg.error) {
                 __committerProgress!.phase = "done";
                 __committerProgress!.error = msg.error;
@@ -2137,7 +2238,12 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Reset warnings from any previous commit operation
+      resetCommitWarnings();
       const count = await commitAllRepos(ctx.cwd, ctx, true, signal);
+
+      // Build warning summary if any warnings were collected
+      const warningText = formatWarningSummary(__commitWarnings);
 
       // Async commit started in background
       if (count === -1) {
@@ -2148,7 +2254,7 @@ export default function (pi: ExtensionAPI) {
               text: `Commit running in background for ${__asyncCommitFileCount} file(s).`,
             },
           ],
-          details: { commitCount: 0, async: true },
+          details: { commitCount: 0, async: true, warnings: __commitWarnings },
         };
       }
 
@@ -2156,28 +2262,34 @@ export default function (pi: ExtensionAPI) {
       if (signal?.aborted || isAborted()) {
         return {
           content: [{ type: "text" as const, text: "Commit cancelled." }],
-          details: { commitCount: 0, cancelled: true },
+          details: { commitCount: 0, cancelled: true, warnings: __commitWarnings },
         };
       }
       if (count > 0) {
+        const responseText = warningText
+          ? `${count} commit(s) created successfully.\n${warningText}`
+          : `${count} commit(s) created successfully.`;
         return {
           content: [
             {
               type: "text" as const,
-              text: `${count} commit(s) created successfully.`,
+              text: responseText,
             },
           ],
-          details: { commitCount: count },
+          details: { commitCount: count, warnings: __commitWarnings },
         };
       }
+      const nothingText = warningText
+        ? `Nothing to commit — no changes detected or all changes were excluded.\n${warningText}`
+        : "Nothing to commit — no changes detected or all changes were excluded.";
       return {
         content: [
           {
             type: "text" as const,
-            text: "Nothing to commit — no changes detected or all changes were excluded.",
+            text: nothingText,
           },
         ],
-        details: {},
+        details: { warnings: __commitWarnings },
       };
     },
   });

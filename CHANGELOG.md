@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.12.1] — 2026-05-28
+
+### Added
+
+- **Warning summary for unstageable files in `commit_changes` tool response:**
+  When files fail to stage during a commit (e.g. matching `.gitignore`, permission errors,
+  or subagent-hallucinated paths), warnings are now collected and surfaced in the IPC
+  response text the agent sees after the tool runs — not just in the ephemeral widget.
+  The format is: `Skipped N unstageable file(s) (file1, file2, ...)` with optional
+  `; N group(s) entirely skipped`. Works in both sync and async commit paths.
+  (dedicated by file path).
+
+### Fixed
+
+- **Async worker crash on error paths:** A `let` variable declared inside a `try` block
+  was inaccessible in the corresponding `catch` block due to block scoping, causing a
+  `ReferenceError` that silently killed the worker process without sending an IPC result
+  message. Moved the warnings variable outside the `try` block.
+- **`unstageExcludedFiles` defensive guards:** Handles `undefined` `files` and
+  `excludePatterns` parameters without crashing.
+
 ## [0.12.0] — 2026-05-27
 
 ### Fixed

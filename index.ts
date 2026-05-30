@@ -626,6 +626,122 @@ export function unstageAll(dir: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Batch staging helper — replaces per-file `git add` with batched
+// `git add -A --ignore-errors` to avoid O(N) subprocess overhead
+// when many files are unstageable (deleted, special files, etc.).
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage files for a commit group using `git add -A --ignore-errors` (which handles
+ * deletions correctly and skips genuinely problematic files), then restrict to only
+ * the specified group files by unstaging everything else.
+ *
+ * This avoids the O(N) per-file `git add -- "${f}"` subprocess overhead that causes
+ * severe lag when thousands of files are unstageable.
+ *
+ * @param dir - Git repo directory
+ * @param groupFiles - Files in the current commit group (already filtered for gitignore)
+ * @param onWarning - Callback for each unstageable file (filePath, message)
+ * @param onGroupSkipped - Callback when the entire group is skipped
+ * @returns {staged, allFailed}
+ */
+export function batchStageFilesForGroup(
+  dir: string,
+  groupFiles: string[],
+  onWarning: (filePath: string, msg: string) => void,
+  onGroupSkipped: () => void,
+): { staged: string[]; allFailed: boolean } {
+  if (groupFiles.length === 0) {
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  // git add -A stages all working-tree changes, including deletions of tracked
+  // files (which per-file git add fails on). --ignore-errors skips genuinely
+  // problematic files (permission issues, special file types) without aborting.
+  try {
+    execSync("git add -A --ignore-errors", {
+      cwd: dir,
+      stdio: ["ignore", "ignore", "pipe"],
+      encoding: "utf-8",
+    });
+  } catch {
+    // --ignore-errors can still exit non-zero if some files failed; that's fine.
+  }
+
+  // Get all currently staged files
+  let currentlyStaged: string[] = [];
+  try {
+    const output = execSync("git diff --cached --name-only", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    currentlyStaged = output ? output.split("\n") : [];
+  } catch {
+    // Nothing staged — all files are unstageable
+    for (const f of groupFiles) {
+      onWarning(f, "file could not be staged by git add -A");
+    }
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  const groupSet = new Set(groupFiles);
+
+  // Files in the group that were successfully staged
+  const stagedFiles = currentlyStaged.filter((f) => groupSet.has(f));
+
+  // Files in the group that are NOT staged — report warnings
+  for (const f of groupFiles) {
+    if (!stagedFiles.includes(f)) {
+      onWarning(f, "file could not be staged by git add -A");
+    }
+  }
+
+  // Files staged but NOT in this group — unstage them in batch
+  const toUnstage = currentlyStaged.filter((f) => !groupSet.has(f));
+  if (toUnstage.length > 0) {
+    // Use --pathspec-from-file=- to avoid shell argument length limits
+    try {
+      execSync("git restore --staged --pathspec-from-file=- --", {
+        cwd: dir,
+        input: toUnstage.join("\n"),
+        stdio: ["pipe", "ignore", "pipe"],
+        encoding: "utf-8",
+      });
+    } catch {
+      // Per-file fallback if batch restore fails
+      for (const f of toUnstage) {
+        try {
+          execSync(`git reset HEAD -- ${JSON.stringify(f)}`, {
+            cwd: dir,
+            stdio: "pipe",
+          });
+        } catch {
+          try {
+            execSync(`git rm --cached -- ${JSON.stringify(f)}`, {
+              cwd: dir,
+              stdio: "pipe",
+            });
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  }
+
+  if (stagedFiles.length === 0) {
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  return { staged: stagedFiles, allFailed: false };
+}
+
+// ---------------------------------------------------------------------------
 // Agent-decided staged commits
 // ---------------------------------------------------------------------------
 
@@ -1531,9 +1647,6 @@ export async function tryCommit(
           return commitCount;
         }
 
-        // Only stage this group's files
-        unstageAll(dir);
-
         // Filter out any gitignored files from this group
         const groupFiles = filterGitignoredFiles(dir, group.files);
         if (groupFiles.length === 0) {
@@ -1541,23 +1654,21 @@ export async function tryCommit(
           continue;
         }
 
-        // Track which files were successfully staged; skip any that fail git add
-        const stagedFiles: string[] = [];
-        for (const f of groupFiles) {
-          try {
-            execSync(`git add -- "${f}"`, { cwd: dir, stdio: "pipe" });
-            stagedFiles.push(f);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.ui.notify(`[pi-committer] Skipping unstageable file: ${f} (${msg})`, "warning");
-            addUnstageableFileWarning(f, msg);
-          }
-        }
-        if (stagedFiles.length === 0) {
-          ctx.ui.notify("[pi-committer] Skipping group — all files failed to stage", "warning");
-          addSkippedGroupWarning();
-          continue;
-        }
+        // Batch-stage all changes via git add -A (handles deletions correctly) then
+        // restrict to only this group's files — avoids O(N) per-file git-add overhead.
+        const { staged: stagedFiles, allFailed } = batchStageFilesForGroup(
+          dir,
+          groupFiles,
+          (filePath, msg) => {
+            ctx.ui.notify(`[pi-committer] Skipping unstageable file: ${filePath} (${msg})`, "warning");
+            addUnstageableFileWarning(filePath, msg);
+          },
+          () => {
+            ctx.ui.notify("[pi-committer] Skipping group — all files failed to stage", "warning");
+            addSkippedGroupWarning();
+          },
+        );
+        if (allFailed) continue;
 
         // Create commit with the group's message
         try {

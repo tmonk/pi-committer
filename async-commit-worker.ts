@@ -299,6 +299,107 @@ export function unstageExcludedFiles(
 }
 
 // ---------------------------------------------------------------------------
+// Batch staging helper (mirrors the same function in index.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage files for a commit group using `git add -A --ignore-errors` (handles
+ * deletions correctly), then restrict to only the specified group files.
+ * Avoids O(N) per-file `git add` subprocess overhead when many files are
+ * unstageable.
+ *
+ * @returns {staged, allFailed}
+ */
+export function batchStageFilesForGroup(
+  dir: string,
+  groupFiles: string[],
+  onWarning: (filePath: string, msg: string) => void,
+  onGroupSkipped: () => void,
+): { staged: string[]; allFailed: boolean } {
+  if (groupFiles.length === 0) {
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  // git add -A stages all working-tree changes including deletions.
+  // --ignore-errors skips genuinely problematic files without aborting.
+  try {
+    execSync("git add -A --ignore-errors", {
+      cwd: dir,
+      stdio: ["ignore", "ignore", "pipe"],
+      encoding: "utf-8",
+    });
+  } catch {
+    // --ignore-errors can still exit non-zero; that's fine.
+  }
+
+  // Get all currently staged files
+  let currentlyStaged: string[] = [];
+  try {
+    const output = execSync("git diff --cached --name-only", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    currentlyStaged = output ? output.split("\n") : [];
+  } catch {
+    for (const f of groupFiles) {
+      onWarning(f, "file could not be staged by git add -A");
+    }
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  const groupSet = new Set(groupFiles);
+
+  const stagedFiles = currentlyStaged.filter((f) => groupSet.has(f));
+
+  for (const f of groupFiles) {
+    if (!stagedFiles.includes(f)) {
+      onWarning(f, "file could not be staged by git add -A");
+    }
+  }
+
+  const toUnstage = currentlyStaged.filter((f) => !groupSet.has(f));
+  if (toUnstage.length > 0) {
+    try {
+      execSync("git restore --staged --pathspec-from-file=- --", {
+        cwd: dir,
+        input: toUnstage.join("\n"),
+        stdio: ["pipe", "ignore", "pipe"],
+        encoding: "utf-8",
+      });
+    } catch {
+      for (const f of toUnstage) {
+        try {
+          execSync(`git reset HEAD -- ${JSON.stringify(f)}`, {
+            cwd: dir,
+            stdio: "pipe",
+          });
+        } catch {
+          try {
+            execSync(`git rm --cached -- ${JSON.stringify(f)}`, {
+              cwd: dir,
+              stdio: "pipe",
+            });
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  }
+
+  if (stagedFiles.length === 0) {
+    onGroupSkipped();
+    return { staged: [], allFailed: true };
+  }
+
+  return { staged: stagedFiles, allFailed: false };
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic commit message (fallback when no SDK)
 // ---------------------------------------------------------------------------
 
@@ -775,9 +876,11 @@ export async function doSingleCommit(
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
 ): Promise<CommitLogEntry | undefined> {
-  // Stage all files
-  for (const f of files) {
-    execSync(`git add -- "${f}"`, { cwd: dir, stdio: "ignore" });
+  // Stage all files in a single batch (handles deletions correctly via git add -A)
+  try {
+    execSync("git add -A --ignore-errors", { cwd: dir, stdio: "pipe" });
+  } catch {
+    // --ignore-errors can exit non-zero; that's fine.
   }
 
   const diffStat = execSync("git diff --cached --stat", {
@@ -875,35 +978,30 @@ export async function doGroupedCommits(
 
     const group = groups[i];
 
-    // Only stage this group's files
-    unstageAll(dir);
     const groupFiles = filterGitignoredFiles(dir, group.files);
     if (groupFiles.length === 0) continue;
 
-    // Track which files were successfully staged; skip any that fail git add
-    const stagedFiles: string[] = [];
-    for (const f of groupFiles) {
-      try {
-        execSync(`git add -- "${f}"`, { cwd: dir, stdio: "pipe" });
-        stagedFiles.push(f);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+    // Batch-stage all changes via git add -A (handles deletions correctly),
+    // then restrict to only this group's files.
+    const { staged: stagedFiles, allFailed } = batchStageFilesForGroup(
+      dir,
+      groupFiles,
+      (filePath, msg) => {
         const onProgErr = ipc?.onProgress ?? sendProgress;
         onProgErr({
           phase: "committing",
-          statusMessage: `Skipping unstageable file: ${f} (${msg})`,
+          statusMessage: `Skipping unstageable file: ${filePath} (${msg})`,
         });
-        // Collect warning (deduplicated by file path)
-        if (!warnedFiles.has(f)) {
-          warnedFiles.add(f);
-          warnings.push(`Skipping unstageable file: ${f} (${msg})`);
+        if (!warnedFiles.has(filePath)) {
+          warnedFiles.add(filePath);
+          warnings.push(`Skipping unstageable file: ${filePath} (${msg})`);
         }
-      }
-    }
-    if (stagedFiles.length === 0) {
-      warnings.push("Skipping group \u2014 all files failed to stage");
-      continue;
-    }
+      },
+      () => {
+        warnings.push("Skipping group \u2014 all files failed to stage");
+      },
+    );
+    if (allFailed) continue;
 
     try {
       const diffStat = execSync("git diff --cached --stat", {

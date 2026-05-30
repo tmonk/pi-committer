@@ -626,18 +626,43 @@ export function unstageAll(dir: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Batch staging helper — replaces per-file `git add` with batched
-// `git add -A --ignore-errors` to avoid O(N) subprocess overhead
-// when many files are unstageable (deleted, special files, etc.).
+// Batch staging helper — replaces per-file `git add` with a
+// single-call `git add --ignore-errors -- files...` per batch.
+//
+// Git's --ignore-errors natively handles all tracked file states:
+// modified files, deleted tracked files (stages the deletion), and
+// new files. Batch size is 5000 (10× the previous 500), reducing
+// the ~10k-file use case from 20 git calls down to 2-3 calls.
+//
+// This eliminates both the O(N) per-file subprocess loop and the
+// need for a per-file `git rm --cached` fallback.
 // ---------------------------------------------------------------------------
 
 /**
- * Stage files for a commit group using `git add -A --ignore-errors` (which handles
- * deletions correctly and skips genuinely problematic files), then restrict to only
- * the specified group files by unstaging everything else.
+ * Parse git stderr lines to find file paths that failed.
+ */
+function parseFailedPaths(stderr: string): Set<string> {
+  const failed = new Set<string>();
+  for (const line of stderr.split("\n")) {
+    const m = line.match(/pathspec '(.+?)' did not match/);
+    if (m) { failed.add(m[1]); continue; }
+    const m2 = line.match(/Unable to process path '(.+?)'/);
+    if (m2) { failed.add(m2[1]); }
+  }
+  return failed;
+}
+
+/**
+ * Batch-stage a list of files using `git add --ignore-errors` calls
+ * with batch size 5000 to minimize subprocess overhead.
  *
- * This avoids the O(N) per-file `git add -- "${f}"` subprocess overhead that causes
- * severe lag when thousands of files are unstageable.
+ * `git add --ignore-errors` handles all tracked file states natively:
+ * - Modified files on disk → stages the change
+ * - Deleted tracked files → stages the deletion
+ * - New files on disk → stages the new file
+ *
+ * For genuinely unstageable files (e.g. path not in index/working tree),
+ * git reports them on stderr and we parse & report via onWarning.
  *
  * @param dir - Git repo directory
  * @param groupFiles - Files in the current commit group (already filtered for gitignore)
@@ -656,78 +681,34 @@ export function batchStageFilesForGroup(
     return { staged: [], allFailed: true };
   }
 
-  // git add -A stages all working-tree changes, including deletions of tracked
-  // files (which per-file git add fails on). --ignore-errors skips genuinely
-  // problematic files (permission issues, special file types) without aborting.
-  try {
-    execSync("git add -A --ignore-errors", {
-      cwd: dir,
-      stdio: ["ignore", "ignore", "pipe"],
-      encoding: "utf-8",
-    });
-  } catch {
-    // --ignore-errors can still exit non-zero if some files failed; that's fine.
-  }
+  const stagedFiles: string[] = [];
+  const warnedFiles = new Set<string>();
+  const maxBatchSize = 5000;
 
-  // Get all currently staged files
-  let currentlyStaged: string[] = [];
-  try {
-    const output = execSync("git diff --cached --name-only", {
-      cwd: dir,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    currentlyStaged = output ? output.split("\n") : [];
-  } catch {
-    // Nothing staged — all files are unstageable
-    for (const f of groupFiles) {
-      onWarning(f, "file could not be staged by git add -A");
-    }
-    onGroupSkipped();
-    return { staged: [], allFailed: true };
-  }
+  for (let i = 0; i < groupFiles.length; i += maxBatchSize) {
+    const batch = groupFiles.slice(i, i + maxBatchSize);
+    const quoted = batch.map((f) => JSON.stringify(f)).join(" ");
 
-  const groupSet = new Set(groupFiles);
-
-  // Files in the group that were successfully staged
-  const stagedFiles = currentlyStaged.filter((f) => groupSet.has(f));
-
-  // Files in the group that are NOT staged — report warnings
-  for (const f of groupFiles) {
-    if (!stagedFiles.includes(f)) {
-      onWarning(f, "file could not be staged by git add -A");
-    }
-  }
-
-  // Files staged but NOT in this group — unstage them in batch
-  const toUnstage = currentlyStaged.filter((f) => !groupSet.has(f));
-  if (toUnstage.length > 0) {
-    // Use --pathspec-from-file=- to avoid shell argument length limits
     try {
-      execSync("git restore --staged --pathspec-from-file=- --", {
+      execSync(`git add --ignore-errors -- ${quoted}`, {
         cwd: dir,
-        input: toUnstage.join("\n"),
-        stdio: ["pipe", "ignore", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
       });
-    } catch {
-      // Per-file fallback if batch restore fails
-      for (const f of toUnstage) {
-        try {
-          execSync(`git reset HEAD -- ${JSON.stringify(f)}`, {
-            cwd: dir,
-            stdio: "pipe",
-          });
-        } catch {
-          try {
-            execSync(`git rm --cached -- ${JSON.stringify(f)}`, {
-              cwd: dir,
-              stdio: "pipe",
-            });
-          } catch {
-            // ignore
+      stagedFiles.push(...batch);
+    } catch (err) {
+      // --ignore-errors may exit non-zero when some files are genuinely
+      // unstageable (e.g. path not in working tree or index).
+      const stderr = ((err as any)?.stderr ?? "") as string;
+      const failedPaths = parseFailedPaths(stderr);
+      for (const f of batch) {
+        if (failedPaths.has(f)) {
+          if (!warnedFiles.has(f)) {
+            warnedFiles.add(f);
+            onWarning(f, "could not be staged");
           }
+        } else {
+          stagedFiles.push(f);
         }
       }
     }
@@ -1654,8 +1635,9 @@ export async function tryCommit(
           continue;
         }
 
-        // Batch-stage all changes via git add -A (handles deletions correctly) then
-        // restrict to only this group's files — avoids O(N) per-file git-add overhead.
+        // Unstage all files, then batch-stage only this group's files — avoids O(N)
+        // per-file git-add overhead while keeping each group's commit isolated.
+        unstageAll(dir);
         const { staged: stagedFiles, allFailed } = batchStageFilesForGroup(
           dir,
           groupFiles,

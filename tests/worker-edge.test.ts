@@ -730,8 +730,6 @@ describe("worker IPC edge cases", () => {
     });
 
     // The worker should not crash — should return error via IPC
-    console.error('DEBUG msg:', JSON.stringify(msg));
-    console.error('DEBUG msg.error:', msg?.error);
     assert.ok(msg, "should send IPC result");
     assert.strictEqual(msg.type, "result");
     assert.ok(msg.error, "should report an error for invalid repo");

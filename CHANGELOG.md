@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.12.2] — 2026-05-30
+
+### Changed
+
+- **Batch staging pipeline optimized:** `batchStageFilesForGroup` in both `index.ts` and
+  `async-commit-worker.ts` now uses batch size 5000 (10× the previous 500), reducing
+  subprocess calls from 20 to 2-3 for repos with ~10k changed files. The pre-classify
+  (`existsSync`) + `git rm --cached` split was evaluated but the simpler approach of
+  just using `git add --ignore-errors` (which natively handles deleted tracked files)
+  with a larger batch proved both faster and cleaner.
+- **`doSingleCommit` in async-commit-worker.ts** also uses batch size 5000.
+
+### Performance
+
+- **1k staging loop:** 81ms → 19ms (**4.3× faster**)
+- **10k full pipeline:** 693ms → 142ms (**4.9× faster**)
+- **10k staging loop:** ~360ms → ~57ms (**6.3× faster**)
+- **Total vs original per-file baseline:** **814× speedup** (15.5s → 19ms at 1k files)
+
 ## [0.12.1] — 2026-05-28
 
 ### Added

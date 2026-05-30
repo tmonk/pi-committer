@@ -303,10 +303,27 @@ export function unstageExcludedFiles(
 // ---------------------------------------------------------------------------
 
 /**
- * Stage files for a commit group using `git add -A --ignore-errors` (handles
- * deletions correctly), then restrict to only the specified group files.
- * Avoids O(N) per-file `git add` subprocess overhead when many files are
- * unstageable.
+ * Parse git stderr lines to find file paths that failed.
+ */
+function parseFailedPaths(stderr: string): Set<string> {
+  const failed = new Set<string>();
+  for (const line of stderr.split("\n")) {
+    const m = line.match(/pathspec '(.+?)' did not match/);
+    if (m) { failed.add(m[1]); continue; }
+    const m2 = line.match(/Unable to process path '(.+?)'/);
+    if (m2) { failed.add(m2[1]); }
+  }
+  return failed;
+}
+
+/**
+ * Batch-stage a list of files using `git add --ignore-errors` calls
+ * with batch size 5000 to minimize subprocess overhead.
+ *
+ * `git add --ignore-errors` handles all tracked file states natively:
+ * modified files, deleted tracked files (stages the deletion), and
+ * new files on disk. For genuinely unstageable files, git reports
+ * them on stderr which we parse & report via onWarning.
  *
  * @returns {staged, allFailed}
  */
@@ -321,71 +338,32 @@ export function batchStageFilesForGroup(
     return { staged: [], allFailed: true };
   }
 
-  // git add -A stages all working-tree changes including deletions.
-  // --ignore-errors skips genuinely problematic files without aborting.
-  try {
-    execSync("git add -A --ignore-errors", {
-      cwd: dir,
-      stdio: ["ignore", "ignore", "pipe"],
-      encoding: "utf-8",
-    });
-  } catch {
-    // --ignore-errors can still exit non-zero; that's fine.
-  }
+  const stagedFiles: string[] = [];
+  const warnedFiles = new Set<string>();
+  const maxBatchSize = 5000;
 
-  // Get all currently staged files
-  let currentlyStaged: string[] = [];
-  try {
-    const output = execSync("git diff --cached --name-only", {
-      cwd: dir,
-      encoding: "utf-8",
-      maxBuffer: 10 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    currentlyStaged = output ? output.split("\n") : [];
-  } catch {
-    for (const f of groupFiles) {
-      onWarning(f, "file could not be staged by git add -A");
-    }
-    onGroupSkipped();
-    return { staged: [], allFailed: true };
-  }
+  for (let i = 0; i < groupFiles.length; i += maxBatchSize) {
+    const batch = groupFiles.slice(i, i + maxBatchSize);
+    const quoted = batch.map((f) => JSON.stringify(f)).join(" ");
 
-  const groupSet = new Set(groupFiles);
-
-  const stagedFiles = currentlyStaged.filter((f) => groupSet.has(f));
-
-  for (const f of groupFiles) {
-    if (!stagedFiles.includes(f)) {
-      onWarning(f, "file could not be staged by git add -A");
-    }
-  }
-
-  const toUnstage = currentlyStaged.filter((f) => !groupSet.has(f));
-  if (toUnstage.length > 0) {
     try {
-      execSync("git restore --staged --pathspec-from-file=- --", {
+      execSync(`git add --ignore-errors -- ${quoted}`, {
         cwd: dir,
-        input: toUnstage.join("\n"),
-        stdio: ["pipe", "ignore", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
       });
-    } catch {
-      for (const f of toUnstage) {
-        try {
-          execSync(`git reset HEAD -- ${JSON.stringify(f)}`, {
-            cwd: dir,
-            stdio: "pipe",
-          });
-        } catch {
-          try {
-            execSync(`git rm --cached -- ${JSON.stringify(f)}`, {
-              cwd: dir,
-              stdio: "pipe",
-            });
-          } catch {
-            // ignore
+      stagedFiles.push(...batch);
+    } catch (err) {
+      const stderr = ((err as any)?.stderr ?? "") as string;
+      const failedPaths = parseFailedPaths(stderr);
+      for (const f of batch) {
+        if (failedPaths.has(f)) {
+          if (!warnedFiles.has(f)) {
+            warnedFiles.add(f);
+            onWarning(f, "could not be staged");
           }
+        } else {
+          stagedFiles.push(f);
         }
       }
     }
@@ -876,11 +854,16 @@ export async function doSingleCommit(
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
 ): Promise<CommitLogEntry | undefined> {
-  // Stage all files in a single batch (handles deletions correctly via git add -A)
-  try {
-    execSync("git add -A --ignore-errors", { cwd: dir, stdio: "pipe" });
-  } catch {
-    // --ignore-errors can exit non-zero; that's fine.
+  // Batch-stage all files (larger batch = fewer subprocess calls)
+  const batchSize = 5000;
+  for (let i = 0; i < files.length; i += batchSize) {
+    const batch = files.slice(i, i + batchSize);
+    const quoted = batch.map((f) => JSON.stringify(f)).join(" ");
+    try {
+      execSync(`git add --ignore-errors -- ${quoted}`, { cwd: dir, stdio: "pipe" });
+    } catch {
+      // --ignore-errors can exit non-zero; that's fine.
+    }
   }
 
   const diffStat = execSync("git diff --cached --stat", {
@@ -890,7 +873,11 @@ export async function doSingleCommit(
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
 
-  if (!diffStat) return undefined;
+  if (!diffStat) {
+    throw new Error(
+      `No changes to stage — all ${files.length} file(s) could not be staged`,
+    );
+  }
 
   const diffContent = getDiffContent(dir);
 

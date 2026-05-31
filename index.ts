@@ -1693,6 +1693,14 @@ export async function tryCommit(
         }
       }
 
+      // Single summary notification for unstageable files (not per-file popup)
+      if (__commitWarningFiles.size > 0) {
+        ctx.ui.notify(`[pi-committer] ${__commitWarningFiles.size} file(s) could not be staged`, "warning");
+      } else if (__commitWarnings.some((w) => w.includes("all files failed"))) {
+        const groupCount = __commitWarnings.filter((w) => w.includes("all files failed")).length;
+        ctx.ui.notify(`[pi-committer] ${groupCount} group(s) skipped (all files unstageable)`, "warning");
+      }
+
       // Re-stage remaining changes, then re-apply exclusion patterns to prevent
       // previously excluded files from being re-added
       execSync("git add -A", { cwd: dir, stdio: "ignore" });

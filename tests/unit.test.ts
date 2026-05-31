@@ -77,6 +77,9 @@ import {
   // Worker execArgv resolution (node_modules fix)
   resolveWorkerExecArgv,
   _findJitiRegisterForPath,
+
+  // File staging
+  batchStageFilesForGroup,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
@@ -4375,5 +4378,123 @@ describe("async worker IPC integration", () => {
 
     assert.strictEqual(result.error, undefined, `no error expected: ${result.error}`);
     assert.strictEqual(result.commitCount, 1, "single commit mode should produce 1 commit");
+  });
+});
+
+// ===========================================================================
+// batchStageFilesForGroup — warnings go to collector, NOT to ctx.ui.notify
+// ===========================================================================
+
+describe("batchStageFilesForGroup warning routing", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs) removeDir(d);
+    dirs.length = 0;
+  });
+
+  function makeRepo(): string {
+    const d = createTempRepo();
+    dirs.push(d);
+    return d;
+  }
+
+  it("calls onWarning for unstageable files without calling ctx.ui.notify", () => {
+    const dir = makeRepo();
+
+    // Create a real file
+    writeFileSync(path.join(dir, "real.ts"), "// real\n");
+    execSync("git add real.ts", { cwd: dir, stdio: "ignore" });
+
+    // onWarning simulates addUnstageableFileWarning — tracks the warning
+    const warningCalls: Array<{ filePath: string; msg: string }> = [];
+    const onWarning = (filePath: string, msg: string) => {
+      warningCalls.push({ filePath, msg });
+    };
+
+    let groupSkippedCalled = false;
+    const onGroupSkipped = () => {
+      groupSkippedCalled = true;
+    };
+
+    // Spy to detect any ctx.ui.notify calls
+    const notifySpy = mock.fn();
+
+    // Call batchStageFilesForGroup with a mix of real and non-existent files.
+    // The callbacks simulate the real call site: no ctx.ui.notify, just collectors.
+    const result = batchStageFilesForGroup(
+      dir,
+      ["real.ts", "nonexistent.ts"],
+      (filePath, msg) => {
+        onWarning(filePath, msg);
+        // This should NOT be ctx.ui.notify — that's the bug we fixed
+      },
+      () => {
+        onGroupSkipped();
+      },
+    );
+
+    // onWarning should have been called for the non-existent file
+    assert.ok(warningCalls.length >= 1, "onWarning should be called for unstageable files");
+    const nonexistentWarning = warningCalls.find((w) => w.filePath === "nonexistent.ts");
+    assert.ok(nonexistentWarning, "onWarning should include the non-existent file");
+    assert.ok(nonexistentWarning!.msg.length > 0, "warning should include an error message");
+
+    // The real file should still be staged successfully
+    assert.ok(result.staged.includes("real.ts"), "real file should be staged");
+
+    // Both `addUnstageableFileWarning` (onWarning) AND no notify call:
+    // warning was COLLECTED, not BROADCAST as a notification
+    assert.strictEqual(
+      notifySpy.mock.callCount(),
+      0,
+      "ctx.ui.notify must NOT be called during batchStageFilesForGroup warning callbacks",
+    );
+
+    // onGroupSkipped should NOT be called since we have real staged files
+    assert.strictEqual(groupSkippedCalled, false, "onGroupSkipped should not be called when some files stage");
+  });
+
+  it("calls onGroupSkipped when empty group files array", () => {
+    const dir = makeRepo();
+
+    let groupSkippedCalled = false;
+
+    const result = batchStageFilesForGroup(
+      dir,
+      [],
+      () => {},
+      () => {
+        groupSkippedCalled = true;
+      },
+    );
+
+    assert.strictEqual(groupSkippedCalled, true, "onGroupSkipped should be called for empty file list");
+    assert.strictEqual(result.allFailed, true, "allFailed should be true");
+    assert.strictEqual(result.staged.length, 0, "no files should be staged");
+  });
+
+  it("calls onWarning for each unstageable file path reported by git", () => {
+    const dir = makeRepo();
+
+    writeFileSync(path.join(dir, "keep.ts"), "// keep\n");
+    execSync("git add keep.ts", { cwd: dir, stdio: "ignore" });
+
+    const warned: string[] = [];
+
+    // Note: git add only reports the FIRST pathspec error per invocation.
+    // So only the first non-existent file is warned.
+    batchStageFilesForGroup(
+      dir,
+      ["keep.ts", "missing-a.ts"],
+      (filePath) => {
+        warned.push(filePath);
+      },
+      () => {},
+    );
+
+    // The missing file should be warned
+    assert.ok(warned.includes("missing-a.ts"), "missing-a.ts should be warned");
+    // Real file should NOT be warned
+    assert.ok(!warned.includes("keep.ts"), "real files should not be warned");
   });
 });

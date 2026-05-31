@@ -1642,11 +1642,9 @@ export async function tryCommit(
           dir,
           groupFiles,
           (filePath, msg) => {
-            ctx.ui.notify(`[pi-committer] Skipping unstageable file: ${filePath} (${msg})`, "warning");
             addUnstageableFileWarning(filePath, msg);
           },
           () => {
-            ctx.ui.notify("[pi-committer] Skipping group — all files failed to stage", "warning");
             addSkippedGroupWarning();
           },
         );

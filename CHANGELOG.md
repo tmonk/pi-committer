@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.12.3] — 2026-05-31
+
+### Changed
+
+- **Unstageable file warnings routed to tool result instead of notification popups:**
+  Per-file `ctx.ui.notify()` calls in `batchStageFilesForGroup` callbacks are replaced with
+  a single concise summary notification after all groups are processed
+  (e.g. "3 file(s) could not be staged"). The individual warnings still
+  flow into `details.warnings` for the agent to see in the tool result — the fix removes
+  only the visually disruptive per-file floating popups.
+
+### Added
+
+- **Summary notification for unstageable files:** One `ctx.ui.notify()` fires at the end of
+  group processing if any files were unstageable ("X file(s) could not be staged") or if
+  entire groups were skipped ("Y group(s) skipped (all files unstageable)").
+- **Integration tests for warning routing:** 3 tests verify `batchStageFilesForGroup` collects
+  warnings via callbacks without calling `ctx.ui.notify()`.
+
 ## [0.12.2] — 2026-05-30
 
 ### Changed

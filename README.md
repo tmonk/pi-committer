@@ -143,6 +143,16 @@ The subagent decides the grouping from the diff content, not from file extension
 
 If the agent edits files in multiple git repositories during a session, `commit_changes` finds and commits in all of them. Detection works via session tool-call history — repos where the agent created or modified files using `write` or `edit` tools are detected and added on top of the primary working directory.
 
+## Deterministic commit message fallback
+
+When the subagent is unavailable (e.g., SDK load failure) or returns no result, pi-committer generates a deterministic commit message using string analysis — no LLM calls needed:
+
+- **Smart scope**: Uses the longest common ancestor directory across all changed files. If files span unrelated directories, scope is omitted entirely.
+- **Specific description**: Extracts meaningful keywords from file names (strips extensions, skips boilerplate like `__init__` and `conftest`, converts `snake_case` to readable words). Never says "update N modules".
+- **Structured body**: Includes the description summary line followed by a file list with change stats.
+
+Every subagent fallback decision point logs a `DIAG:` diagnostic message to help identify root causes.
+
 ## Architecture
 
 ```

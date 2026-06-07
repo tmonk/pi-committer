@@ -378,6 +378,96 @@ export function batchStageFilesForGroup(
 }
 
 // ---------------------------------------------------------------------------
+// Smart scope & description helpers (mirrors index.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the longest common ancestor directory from a list of directory paths.
+ * Returns undefined when files are in unrelated directory trees.
+ */
+export function findCommonAncestor(dirs: string[]): string | undefined {
+  if (dirs.length === 0) return undefined;
+
+  const segments = dirs.map((d) => d.split("/"));
+  const common = segments[0].slice();
+
+  for (let i = 1; i < segments.length; i++) {
+    const other = segments[i];
+    let j = 0;
+    while (
+      j < common.length &&
+      j < other.length &&
+      common[j] === other[j]
+    ) {
+      j++;
+    }
+    common.length = j;
+    if (common.length === 0) return undefined;
+  }
+
+  return common.join("/");
+}
+
+/**
+ * Generate a concise description of changes by extracting meaningful
+ * keywords from file names. Avoids generic "update N modules".
+ */
+export function summarizeChanges(
+  files: string[],
+  _diffContent: string,
+  scope?: string,
+): string {
+  if (files.length === 0) return "update";
+  if (files.length === 1) {
+    return `update ${path.basename(files[0])}`;
+  }
+
+  // Collect meaningful terms from file stems
+  const terms: string[] = [];
+  const seen = new Set<string>();
+
+  for (const f of files) {
+    const stem = path.basename(f).replace(/\.[^.]+$/, "");
+    // Skip boilerplate files
+    if (
+      stem === "__init__" ||
+      stem === "conftest" ||
+      stem === "index"
+    )
+      continue;
+    // Remove test_/e2e_ prefix, convert separators to spaces
+    const cleaned = stem
+      .replace(/^test[-_]/, "")
+      .replace(/^e2e[-_]/, "")
+      .replace(/[-_]/g, " ")
+      .trim();
+    if (cleaned.length < 2) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    terms.push(cleaned);
+  }
+
+  const maxTerms = 6;
+  let desc = terms.slice(0, maxTerms).join(", ");
+
+  // Append "and tests" if test files present but not captured in terms
+  const hasTests = files.some(
+    (f) => /\.(test|spec|e2e)\./.test(f) || /\/test_/.test(f),
+  );
+  if (hasTests && !desc.toLowerCase().includes("test")) {
+    desc += ", and tests";
+  }
+
+  if (scope) {
+    const moduleName = scope.split("/").pop() || scope;
+    return `update ${moduleName}: ${desc}`;
+  }
+
+  return `update ${desc}`;
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic commit message (fallback when no SDK)
 // ---------------------------------------------------------------------------
 
@@ -406,32 +496,28 @@ export function deterministicCommitMessage(
   )
     type = "feat";
 
-  const dirs = [
-    ...new Set(files.map((f) => path.dirname(f)).filter((d) => d !== ".")),
-  ];
-  const scope = dirs.length > 0 ? dirs.join(",") : undefined;
+  // Compute smart scope: longest common ancestor directory, or omit
+  const dirs = files.map((f) => path.dirname(f)).filter((d) => d !== ".");
+  const scope = findCommonAncestor(dirs);
 
-  const desc =
-    files.length === 1
-      ? `update ${files[0]}`
-      : `update ${files.length} modules`;
+  // Generate a descriptive summary from file names
+  const desc = summarizeChanges(files, diffContent, scope);
 
   const scopePart = scope ? `(${scope})` : "";
   const header = `${type}${scopePart}: ${desc}`;
 
   if (!diffStat.trim()) return header;
 
-  const body = ["Changes:"]
-    .concat(
-      files.map((f) => {
-        const statLine = diffStat
-          .split("\n")
-          .find((l) => l.trim().startsWith(f));
-        const changes = statLine?.match(/(\d+) insertions?|\d+ deletions?/g);
-        return `- ${f}${changes ? ` (${changes.join(", ")})` : ""}`;
-      }),
-    )
-    .join("\n");
+  // Body: description line + file list
+  const bodyLines: string[] = [desc, ""];
+  for (const f of files) {
+    const statLine = diffStat
+      .split("\n")
+      .find((l) => l.trim().startsWith(f));
+    const changes = statLine?.match(/(\d+) insertions?|\d+ deletions?/g);
+    bodyLines.push(`- ${f}${changes ? ` (${changes.join(", ")})` : ""}`);
+  }
+  const body = bodyLines.join("\n");
 
   return `${header}\n\n${body}`;
 }
@@ -447,6 +533,7 @@ let SettingsManagerCls: any = null;
 
 async function tryLoadSDK(): Promise<boolean> {
   if (sdkAvailable) return true;
+  // Attempt 1: ESM dynamic import (works in native ESM contexts)
   try {
     const sdk = await import("@earendil-works/pi-coding-agent");
     createAgentSessionFn = sdk.createAgentSession;
@@ -455,7 +542,20 @@ async function tryLoadSDK(): Promise<boolean> {
     sdkAvailable = true;
     return true;
   } catch {
-    return false;
+    // ESM import failed — attempt CJS require() as fallback.
+    // The SDK package exports only ESM, but in jiti/fork contexts
+    // CJS require() may resolve where ESM dynamic import does not.
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const sdk = require("@earendil-works/pi-coding-agent");
+      createAgentSessionFn = sdk.createAgentSession;
+      SessionManagerCls = sdk.SessionManager;
+      SettingsManagerCls = sdk.SettingsManager;
+      sdkAvailable = true;
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -491,7 +591,13 @@ export async function generateCommitMessage(
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
 ): Promise<string> {
-  if (!(await tryLoadSDK()) || !subagentModel) {
+  const _sdkOk = await tryLoadSDK();
+  if (!_sdkOk || !subagentModel) {
+    console.error(
+      `[pi-committer] DIAG: subagent message generation skipped — ${
+        !_sdkOk ? "SDK unavailable" : "no model configured"
+      } — falling back to deterministic`,
+    );
     return deterministicCommitMessage(diffStat, diffContent, files);
   }
 
@@ -504,16 +610,17 @@ export async function generateCommitMessage(
     "Generate a conventional commit message from this git diff.",
     "",
     "Format:",
-    "<type>(<optional-scope>): <short description>",
+    "<type>(<scope>): <short description>",
     "",
     "<detailed body explaining what changed and why>",
     "",
     "Rules:",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
-    "- Scope is optional, derived from the module/directory changed",
-    "- Description is a short imperative sentence (max 72 chars)",
-    "- Body explains what and why, not how",
-    "- Output ONLY the commit message, nothing else",
+    "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
+    "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
+    "- Max 72 chars for the header line (type + scope + description combined).",
+    "- Body: a brief paragraph explaining what changed and why, then a blank line, then a bullet list of the changed files.",
+    "- Output ONLY the commit message, nothing else.",
     "",
     "Diff stat:",
     diffStat,
@@ -596,9 +703,14 @@ export async function generateCommitMessage(
 
     const generated = outputParts.join("\n\n").trim();
     if (generated.length > 10) return generated;
+    console.error(
+      `[pi-committer] DIAG: worker subagent returned empty/short output (${generated.length} chars) — falling back to deterministic`,
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Fall through to deterministic
+    console.error(
+      `[pi-committer] DIAG: worker subagent message generation threw — falling back to deterministic (${msg})`,
+    );
   }
 
   return deterministicCommitMessage(diffStat, diffContent, files);
@@ -617,7 +729,13 @@ export async function generateCommitGroups(
   subagentThinkingLevel?: string,
 ): Promise<Array<{ message: string; files: string[] }>> {
   // Fallback: single group (SDK not available or no model configured)
-  if (!(await tryLoadSDK()) || !subagentModel) {
+  const _sdkOk = await tryLoadSDK();
+  if (!_sdkOk || !subagentModel) {
+    console.error(
+      `[pi-committer] DIAG: worker subagent grouping skipped — ${
+        !_sdkOk ? "SDK unavailable" : "no model configured"
+      } — falling back to single commit`,
+    );
     const message = deterministicCommitMessage(diffStat, diffContent, allFiles);
     return [{ message, files: [...allFiles] }];
   }
@@ -637,7 +755,9 @@ export async function generateCommitGroups(
     "- Split unrelated changes into separate commits",
     "- Each commit must use conventional commit format: <type>(<scope>): <description>",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
-    "- Write a short imperative description (max 72 chars) and a body explaining what and why",
+    "- Scope: use the single most-specific directory for each group (e.g. 'api', 'exposure', 'config'). NEVER comma-join multiple scopes. If files in a group span unrelated directories, OMIT scope.",
+    "- Description: a SHORT imperative phrase summarizing what each group does. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
+    "- Max 72 chars per header line (type + scope + description combined).",
     "- Assign each file to EXACTLY ONE group",
     "- Cover ALL files listed below in your groups",
     "",
@@ -740,6 +860,9 @@ export async function generateCommitGroups(
 
     const output = outputParts.join("\n\n").trim();
     if (output.length < 20) {
+      console.error(
+        `[pi-committer] DIAG: worker subagent grouping returned empty/short output (${output.length} chars) — falling back to single commit`,
+      );
       return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles), files: [...allFiles] }];
     }
 
@@ -759,11 +882,18 @@ export async function generateCommitGroups(
     }
 
     if (groups.length === 0) {
+      console.error(
+        `[pi-committer] DIAG: worker subagent grouping produced 0 parseable groups — falling back to single commit`,
+      );
       return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles), files: [...allFiles] }];
     }
 
     return groups;
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[pi-committer] DIAG: worker subagent grouping threw — falling back to single commit (${msg})`,
+    );
     return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles), files: [...allFiles] }];
   }
 }

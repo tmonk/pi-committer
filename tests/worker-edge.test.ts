@@ -35,6 +35,7 @@ import {
   filterGitignoredFiles,
   unstageExcludedFiles,
   deterministicCommitMessage,
+  findCommonAncestor,
   parseCommitGroups,
   sendResultAndExit,
   type CommitLogEntry,
@@ -268,8 +269,58 @@ describe("worker exported deterministicCommitMessage", () => {
   it("includes body with file list when diff stat is provided", () => {
     const diffStat = `src/main.ts | 5 +++++\n`;
     const msg = deterministicCommitMessage(diffStat, "changes", ["src/main.ts"]);
-    assert.ok(msg.includes("Changes:"), "should have body");
+    assert.ok(msg.includes("update main.ts"), "should have body summary");
     assert.ok(msg.includes("src/main.ts"));
+  });
+
+  it("uses smart scope (longest common ancestor)", () => {
+    const diffStat = [
+      "experiments/exposure/config.yaml | 5 +++++",
+      "experiments/exposure/src/adaptation_panel.py | 12 ++++++++++-",
+      "experiments/exposure/tests/test_adaptation_panel.py | 20 ++++++++++++++++++++",
+      " 27 files changed, 300 insertions(+), 10 deletions(-)",
+    ].join("\n");
+    const files = [
+      "experiments/exposure/config.yaml",
+      "experiments/exposure/src/adaptation_panel.py",
+      "experiments/exposure/tests/test_adaptation_panel.py",
+    ];
+    const msg = deterministicCommitMessage(diffStat, "changes", files);
+    assert.ok(
+      msg.includes("(experiments/exposure)"),
+      `scope should be common ancestor, got: ${msg.split("\n")[0]}`,
+    );
+  });
+
+  it("omits scope when files have no common ancestor", () => {
+    const diffStat = [
+      "src/main.ts | 5 +++++",
+      "docs/guide.md | 2 ++",
+      " 2 files changed, 7 insertions(+)",
+    ].join("\n");
+    const files = ["src/main.ts", "docs/guide.md"];
+    const msg = deterministicCommitMessage(diffStat, "changes", files);
+    assert.ok(
+      !msg.includes("("),
+      `should not have scope when no common ancestor, got: ${msg.split("\n")[0]}`,
+    );
+  });
+});
+
+describe("worker exported findCommonAncestor", () => {
+  it("finds common ancestor for sibling directories", () => {
+    assert.strictEqual(
+      findCommonAncestor(["experiments/exposure/src", "experiments/exposure/tests"]),
+      "experiments/exposure",
+    );
+  });
+
+  it("returns undefined when no common ancestor", () => {
+    assert.strictEqual(findCommonAncestor(["experiments/exposure", "docs/guide"]), undefined);
+  });
+
+  it("returns undefined for empty input", () => {
+    assert.strictEqual(findCommonAncestor([]), undefined);
   });
 });
 

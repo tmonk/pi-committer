@@ -39,6 +39,8 @@ import {
   // Commit logic
   parseCommitGroups,
   deterministicCommitMessage,
+  findCommonAncestor,
+  summarizeChanges,
   shouldCommitOnTrigger,
   commitStaged,
   singleGroupFallback,
@@ -624,17 +626,153 @@ Files: src/secret.ts`;
 describe("deterministicCommitMessage", () => {
   it("generates a message for a single file", () => {
     const msg = deterministicCommitMessage("src/main.ts | 1 +", "some diff content");
-    assert.ok(msg.includes("update src/main.ts"));
+    assert.ok(msg.includes("update main.ts"));
   });
 
   it("detects test files", () => {
     const msg = deterministicCommitMessage("tests/main.test.ts | 1 +", "");
-    assert.ok(msg.includes("test"));
+    assert.ok(msg.startsWith("test"));
   });
 
   it("detects docs files", () => {
     const msg = deterministicCommitMessage("README.md | 1 +", "");
-    assert.ok(msg.includes("docs"));
+    assert.ok(msg.startsWith("docs"));
+  });
+
+  it("uses smart scope (longest common ancestor)", () => {
+    const diffStat = [
+      "experiments/exposure/config.yaml | 5 +++++",
+      "experiments/exposure/src/adaptation_panel.py | 12 ++++++++++-",
+      "experiments/exposure/tests/test_adaptation_panel.py | 20 ++++++++++++++++++++",
+      " 27 files changed, 300 insertions(+), 10 deletions(-)",
+    ].join("\n");
+    const msg = deterministicCommitMessage(diffStat, "changes");
+    // Should use 'experiments/exposure' as scope
+    assert.ok(msg.includes("(experiments/exposure)"), `scope should be common ancestor, got: ${msg}`);
+  });
+
+  it("omits scope when files have no common ancestor", () => {
+    const diffStat = [
+      "src/main.ts | 5 +++++",
+      "docs/guide.md | 2 ++",
+      " 2 files changed, 7 insertions(+)",
+    ].join("\n");
+    const msg = deterministicCommitMessage(diffStat, "changes");
+    // Should NOT have a scope (no common ancestor)
+    assert.ok(!msg.includes("("), `should not have scope when no common ancestor, got: ${msg}`);
+  });
+
+  it("produces a description from file names instead of 'update N modules'", () => {
+    const diffStat = [
+      "src/adaptation_panel.py | 5 +++++",
+      "src/embedding_pipeline.py | 10 ++++++++--",
+      " 2 files changed, 15 insertions(+), 2 deletions(-)",
+    ].join("\n");
+    const msg = deterministicCommitMessage(diffStat, "changes");
+    // Should reference the actual module and keywords from file names
+    assert.ok(msg.includes("adaptation") || msg.includes("embedding"),
+      `description should reference file names, got: ${msg}`);
+    // Should NOT say "update 2 modules"
+    assert.ok(!msg.includes("2 modules"), `should not say 'update 2 modules', got: ${msg}`);
+  });
+
+  it("body includes description summary line + file list", () => {
+    const diffStat = [
+      "src/main.ts | 5 +++++",
+      " 1 file changed, 5 insertions(+)",
+    ].join("\n");
+    const msg = deterministicCommitMessage(diffStat, "changes");
+    const lines = msg.split("\n");
+    // Body should have: header, blank, summary line, blank, file list
+    const blankCount = lines.filter((l) => l === "").length;
+    assert.ok(blankCount >= 1, `body should have blank line separator, got lines: ${JSON.stringify(lines)}`);
+    // Should contain file reference
+    assert.ok(lines.some((l) => l.includes("src/main.ts")), "body should list changed files");
+  });
+});
+
+// ===========================================================================
+// findCommonAncestor
+// ===========================================================================
+
+describe("findCommonAncestor", () => {
+  it("finds common ancestor for files in same directory", () => {
+    assert.strictEqual(findCommonAncestor(["src", "src"]), "src");
+  });
+
+  it("finds common ancestor for sibling directories", () => {
+    assert.strictEqual(
+      findCommonAncestor(["experiments/exposure/src", "experiments/exposure/tests"]),
+      "experiments/exposure",
+    );
+  });
+
+  it("finds common ancestor for nested directories", () => {
+    assert.strictEqual(
+      findCommonAncestor(["experiments/exposure/src", "experiments/exposure/src/adaptation"]),
+      "experiments/exposure/src",
+    );
+  });
+
+  it("returns undefined when no common ancestor exists", () => {
+    assert.strictEqual(
+      findCommonAncestor(["experiments/exposure", "docs/guide"]),
+      undefined,
+    );
+  });
+
+  it("returns undefined for empty input", () => {
+    assert.strictEqual(findCommonAncestor([]), undefined);
+  });
+
+  it("returns the directory for single input", () => {
+    assert.strictEqual(findCommonAncestor(["experiments/exposure"]), "experiments/exposure");
+  });
+});
+
+// ===========================================================================
+// summarizeChanges
+// ===========================================================================
+
+describe("summarizeChanges", () => {
+  it("produces module-scoped description with keywords", () => {
+    const files = [
+      "experiments/exposure/config.yaml",
+      "experiments/exposure/src/adaptation_panel.py",
+      "experiments/exposure/src/embedding_pipeline.py",
+      "experiments/exposure/tests/test_adaptation_panel.py",
+      "experiments/exposure/tests/test_embedding_pipeline.py",
+    ];
+    const desc = summarizeChanges(files, "", "experiments/exposure");
+    assert.ok(desc.startsWith("update exposure:"), `should start with module name, got: ${desc}`);
+    assert.ok(desc.includes("config"), `should include config keyword, got: ${desc}`);
+    assert.ok(desc.includes("adaptation"), `should include adaptation keyword, got: ${desc}`);
+    assert.ok(desc.includes("embedding"), `should include embedding keyword, got: ${desc}`);
+  });
+
+  it("appends 'and tests' when test files are present", () => {
+    const files = [
+      "src/main.ts",
+      "tests/test_main.ts",
+    ];
+    const desc = summarizeChanges(files, "");
+    assert.ok(desc.includes("and tests"), `should mention tests when present, got: ${desc}`);
+  });
+
+  it("handles single file", () => {
+    assert.strictEqual(summarizeChanges(["src/main.ts"], ""), "update main.ts");
+  });
+
+  it("skips boilerplate files", () => {
+    const files = [
+      "src/__init__.py",
+      "src/conftest.py",
+      "src/main.ts",
+    ];
+    const desc = summarizeChanges(files, "");
+    // Should not mention __init__ or conftest
+    assert.ok(!desc.includes("__init__"), `should not mention __init__, got: ${desc}`);
+    assert.ok(!desc.includes("conftest"), `should not mention conftest, got: ${desc}`);
   });
 });
 

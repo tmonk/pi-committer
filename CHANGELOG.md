@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.7] — 2026-06-07
+
+### Changed
+
+- **Changelog completed for v0.12.4, v0.12.5, and v0.12.6:** Full changelog entries
+  documenting all changes from the 0.12.3→0.12.6 releases are now included.
+
 ## [0.12.6] — 2026-06-07
 
 ### Added

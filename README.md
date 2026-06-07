@@ -60,6 +60,11 @@ exclude_patterns  = ["*.log", "node_modules/"]
 # you explicitly opt in to deferral.
 # defer_to_goal_audit = false
 
+# Minimum number of changed files before the subagent is called for grouping.
+# Small change sets below this threshold use the deterministic fallback
+# directly (faster, no LLM call). Default: 4.
+# subagent_grouping_min_files = 4
+
 # Optional: override the model used by the commit-message subagent
 # subagent_model = "openai/gpt-4o-mini"
 

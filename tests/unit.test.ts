@@ -4133,7 +4133,7 @@ Files: file-y.ts`,
     }
   });
 
-  it("single commit path still uses subagent for commit message", async () => {
+  it("single commit path skips subagent for small change sets below threshold", async () => {
     dir = createTempRepo();
     after(() => removeDir(dir));
 
@@ -4167,8 +4167,50 @@ Files: file-y.ts`,
     try {
       const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
 
+      // With default subagentGroupingMinFiles=4, 2 files are below the threshold,
+      // so the subagent should be skipped and deterministic path used.
       assert.strictEqual(result, 1, "should produce 1 commit");
-      assert.ok(subagentCalled, "subagent should still be called for commit message in single-commit path");
+      assert.ok(!subagentCalled, "subagent should be skipped for small change sets below threshold");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("single commit path calls subagent when files above threshold", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, stagedCommits: true, subagentGroupingMinFiles: 1 });
+
+    writeFileSync(path.join(dir, "only-one.ts"), "// only one\n");
+    writeFileSync(path.join(dir, "only-two.ts"), "// only two\n");
+
+    let subagentCalled = false;
+
+    __setCreateAgentSessionMock(async (_opts: any) => ({
+      session: {
+        prompt: async () => {
+          subagentCalled = true;
+        },
+        subscribe: (cb: any) => {
+          cb({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "chore: update files" }],
+            },
+          });
+          return () => {};
+        },
+        abort: () => {},
+      },
+    }));
+
+    try {
+      const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
+
+      assert.strictEqual(result, 1, "should produce 1 commit");
+      assert.ok(subagentCalled, "subagent should be called when files are above threshold");
     } finally {
       __setCreateAgentSessionMock(undefined);
     }

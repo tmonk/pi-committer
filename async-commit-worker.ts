@@ -983,6 +983,7 @@ export async function doSingleCommit(
   files: string[],
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
+  skipSubagent = false,
 ): Promise<CommitLogEntry | undefined> {
   // Batch-stage all files (larger batch = fewer subprocess calls)
   const batchSize = 5000;
@@ -1011,13 +1012,13 @@ export async function doSingleCommit(
 
   const diffContent = getDiffContent(dir);
 
-  // Generate commit message
+  // Generate commit message — skip subagent for small change sets
   const message = await generateCommitMessage(
     diffStat,
     diffContent,
     files,
     dir,
-    params.subagentModel,
+    skipSubagent ? undefined : params.subagentModel,
     (output) => {
       const onProg = ipc?.onProgress ?? sendProgress;
       onProg({
@@ -1219,11 +1220,15 @@ process.on("message", async (msg: any) => {
       return;
     }
 
-    // Show analyzing progress immediately (mimics sync path's initial widget state)
+    // Show progress immediately (mimics sync path's initial widget state).
+    // Only show 'analyzing' phase when the subagent will actually be called.
+    const useSubagent = stagedCommits && files.length > 1 && files.length >= subagentGroupingMinFiles;
     sendProgress({
-      phase: "analyzing",
+      phase: useSubagent ? "analyzing" : "committing",
       fileCount: files.length,
-      statusMessage: `Analyzing ${files.length} file(s) for logical commit grouping...`,
+      statusMessage: useSubagent
+        ? `Analyzing ${files.length} file(s) for logical commit grouping...`
+        : `Generating commit message for ${files.length} file(s)...`,
     });
 
     if (aborted) {
@@ -1247,7 +1252,9 @@ process.on("message", async (msg: any) => {
       _warnings = result.warnings;
     } else {
       // ---- Single commit mode ----
-      const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress });
+      // Small change sets below the grouping threshold skip the subagent entirely.
+      const skipSubagent = files.length < params.subagentGroupingMinFiles;
+      const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress }, skipSubagent);
       if (entry) {
         commitCount = 1;
         commitLog = [entry];

@@ -1553,6 +1553,7 @@ export async function commitStaged(
   files: string[],
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
+  skipSubagent = false,
 ): Promise<string | undefined> {
   const diffStat = execSync("git diff --cached --stat", {
     cwd: dir,
@@ -1566,14 +1567,16 @@ export async function commitStaged(
   const diffContent = getDiffContent(dir);
 
   try {
-    const message = await generateCommitMessageViaSubagent(
-      ctx,
-      diffStat,
-      diffContent,
-      dir,
-      onProgress,
-      signal,
-    );
+    const message = skipSubagent
+      ? deterministicCommitMessage(diffStat, diffContent)
+      : await generateCommitMessageViaSubagent(
+          ctx,
+          diffStat,
+          diffContent,
+          dir,
+          onProgress,
+          signal,
+        );
 
     // Check for abort before actually committing — the subagent may have been
     // aborted mid-flight and returned a fallback message. We must not commit.
@@ -1672,7 +1675,7 @@ export async function tryCommit(
   }
 
   // Show the committer widget
-  const initialPhase = config.stagedCommits && allFiles.length > 1 ? "analyzing" : "committing";
+  const initialPhase = config.stagedCommits && allFiles.length > 1 && allFiles.length >= config.subagentGroupingMinFiles ? "analyzing" : "committing";
   showCommitterWidget(ctx, {
     phase: initialPhase,
     fileCount: allFiles.length,
@@ -1844,10 +1847,11 @@ export async function tryCommit(
         ctx.ui.notify("[pi-committer] Commit cancelled.", "info");
         return 0;
       }
-      // Combine signals for single-commit path too, so Esc (via __committerAbortController)
-      // and the runtime signal both flow through to abort the subagent and prevent the commit.
       const opSignal = combineAbortSignals(runtimeSignal, getAbortSignal());
-      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal);
+      // Small change sets below the grouping threshold skip the subagent entirely
+      // and use the deterministic fallback directly (faster, no LLM call needed).
+      const skipSubagent = allFiles.length < config.subagentGroupingMinFiles;
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent);
     }
   } finally {
     // Mark as done or cancelled and schedule cleanup
@@ -2095,6 +2099,7 @@ async function doSingleCommit(
   allFiles: string[],
   progress: CommitterProgress | null,
   signal?: AbortSignal,
+  skipSubagent = false,
 ): Promise<number> {
   if (progress) {
     progress.phase = "committing";
@@ -2115,6 +2120,7 @@ async function doSingleCommit(
       }
     },
     signal,
+    skipSubagent,
   );
 
   if (hash && progress) {

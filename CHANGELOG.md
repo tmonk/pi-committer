@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.12.6] — 2026-06-07
+
+### Added
+
+- **`subagentMessageMinFiles` config option (default 3):** Decouples the commit-message
+  subagent call from the grouping subagent call. When the number of changed files is
+  below this threshold (1-2 files), the subagent is skipped entirely and the fully
+  deterministic fallback is used — no LLM call at all. For 3-14 files, a single commit
+  is made with a subagent-generated message but without grouping. At 15+ files, both
+  grouping and message subagent are used. Configurable via TOML key
+  `subagent_message_min_files`.
+- **SDK extension runtime caching:** `createExtensionRuntime()` is now called once and
+  cached across all subagent sessions (`getCachedRuntime()`), avoiding redundant
+  runtime creation on every subagent call.
+
+### Changed
+
+- **`subagentGroupingMinFiles` default raised from 4 to 15:** Empirically determined
+  via the expanded benchmark suite. Benchmark data shows non-subagent overhead is
+  ~100-200ms regardless of file count, while a grouping subagent call costs ~35s.
+  Most routine commits (< 15 files) now skip the grouping subagent entirely.
+- **`commitStaged` and `doSingleCommit` accept pre-computed diff stat/content:**
+  Pre-computed `git diff --cached --stat` and `diffContent` are passed from the
+  caller (`tryCommit`), avoiding redundant `execSync` calls.
+- **Async commit worker mirrored:** Both `subagentGroupingMinFiles` and
+  `subagentMessageMinFiles` are passed through `CommitWorkerParams`. The worker's
+  widget phase, skipSubagent logic, and progress tracking all match the sync path.
+
+### Performance
+
+- **1-2 files: ~269× faster** (~35s subagent → ~130ms deterministic).
+- **3-14 files: ~2× faster** (subagent called once instead of twice).
+- **Full pipeline at scale: ~8.5× faster** from batch git operations.
+
+## [0.12.5] — 2026-06-06
+
+### Changed
+
+- **`skipSubagent` logic now gates on file count:** The commit-message subagent is
+  skipped entirely when the file count is below `subagentMessageMinFiles` (default 3).
+  For 1-2 file changes, the fully deterministic fallback is used — no model call.
+- **Widget phase string corrected:** The widget now displays "committing" instead of
+  "analyzing" when the subagent message phase is active but grouping is skipped.
+- **README updated:** Documented `subagent_message_min_files` and updated default
+  of `subagent_grouping_min_files` from 4 to 15.
+
+## [0.12.4] — 2026-06-05
+
+### Added
+
+- **Diagnostics at every subagent fallback decision point:** 12 DIAG points across
+  both `index.ts` (5 points) and `async-commit-worker.ts` (7 points) log the exact
+  reason when the subagent is skipped or falls through — SDK load failure, empty
+  SDK result, model unavailable, threshold gate, or grouping produces no groups.
+  Diagnostics use `ctx.ui.notify` (sync path) or `console.error` with IPC progress
+  (async worker) and never crash.
+- **Smart deterministic scope via `findCommonAncestor()`:** When all changed files
+  share a common directory ancestor, the commit scope is set to that ancestor.
+  When files span unrelated directory trees, no scope is emitted at all.
+- **Smart deterministic description via `summarizeChanges()`:** Extracts meaningful
+  keywords from file names (strips extensions, skips boilerplate like `__init__`,
+  `conftest`), converts snake_case to readable words, caps at 6 terms, and appends
+  "and tests" when test files are present. No token-expensive diff analysis.
+- **Commit body format:** Description summary line followed by a blank line, then
+  a full file list with change stats — replaces the old `"Changes:"`-only body.
+
+### Changed
+
+- **Subagent prompts tightened** in all 4 locations (sync single-commit + grouping,
+  async single-commit + grouping):
+  - "NEVER comma-join multiple scopes" — stops the subagent from producing
+    `chore(experiments/exposure,experiments/exposure/src,...)`.
+  - "be specific: 'add regression pipeline and tests', not 'update 27 modules'".
+  - "max 72 chars" enforced in prompt.
+  - Body format rules: "First line is the description. Then a blank line. Then the
+    full file list (one per line)."
+- **SDK loading hardened in async worker:** `tryLoadSDK()` now attempts ESM dynamic
+  `import()` first, then CJS `require()` as fallback — addresses the case where
+  dynamic import fails in forked/jiti child processes.
+- **Smart scope replaces comma-joined directories:** The old behavior concatenated
+  all changed directories with commas; now `findCommonAncestor()` produces clean
+  scopes like `experiments/exposure` instead of
+  `experiments/exposure,experiments/exposure/src,.../exposure/tests`.
+- **Smart description replaces "update N modules":** The old fallback always said
+  "update N modules"; now `summarizeChanges()` produces descriptions like
+  "add regression pipeline and tests" from file-name keywords.
+
+### Performance
+
+- Deterministic fallback is still O(1) — no LLM calls, just string analysis.
+  `findCommonAncestor()` and `summarizeChanges()` operate in a single pass over
+  the file list with negligible overhead.
+
 ## [0.12.3] — 2026-05-31
 
 ### Changed

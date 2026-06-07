@@ -5,7 +5,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { ResourceLoader } from "@earendil-works/pi-coding-agent";
+import type { ExtensionRuntime, ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { execSync, fork } from "node:child_process";
@@ -1166,12 +1166,19 @@ export function shouldDeferToGoalAudit(
 // Commit message generation via subagent
 // ---------------------------------------------------------------------------
 
+// Cache the extension runtime across subagent calls (stateless, always identical)
+let _cachedRuntime: ExtensionRuntime | undefined;
+function getCachedRuntime(): ExtensionRuntime {
+  if (!_cachedRuntime) _cachedRuntime = createExtensionRuntime();
+  return _cachedRuntime;
+}
+
 function makeMessageResourceLoader(): ResourceLoader {
   return {
     getExtensions: () => ({
       extensions: [],
       errors: [],
-      runtime: createExtensionRuntime(),
+      runtime: getCachedRuntime(),
     }),
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
@@ -1554,8 +1561,10 @@ export async function commitStaged(
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
   skipSubagent = false,
+  precomputedDiffStat?: string,
+  precomputedDiffContent?: string,
 ): Promise<string | undefined> {
-  const diffStat = execSync("git diff --cached --stat", {
+  const diffStat = precomputedDiffStat ?? execSync("git diff --cached --stat", {
     cwd: dir,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
@@ -1564,7 +1573,7 @@ export async function commitStaged(
 
   if (!diffStat) return undefined;
 
-  const diffContent = getDiffContent(dir);
+  const diffContent = precomputedDiffContent ?? getDiffContent(dir);
 
   try {
     const message = skipSubagent
@@ -1848,10 +1857,12 @@ export async function tryCommit(
         return 0;
       }
       const opSignal = combineAbortSignals(runtimeSignal, getAbortSignal());
-      // Small change sets below the grouping threshold skip the subagent entirely
+      // Small change sets below the message threshold skip the subagent entirely
       // and use the deterministic fallback directly (faster, no LLM call needed).
-      const skipSubagent = allFiles.length < config.subagentGroupingMinFiles;
-      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent);
+      // Above the message threshold but below the grouping threshold, the subagent
+      // generates a single commit message (good descriptions, no grouping).
+      const skipSubagent = allFiles.length < config.subagentMessageMinFiles;
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent, diffStat, diffContent);
     }
   } finally {
     // Mark as done or cancelled and schedule cleanup
@@ -2066,6 +2077,7 @@ async function tryCommitAsync(
         minChanges: config.minChanges,
         subagentModel: modelStr,
         subagentGroupingMinFiles: config.subagentGroupingMinFiles,
+        subagentMessageMinFiles: config.subagentMessageMinFiles,
         subagentThinkingLevel: config.subagentThinkingLevel,
       },
     });
@@ -2100,6 +2112,8 @@ async function doSingleCommit(
   progress: CommitterProgress | null,
   signal?: AbortSignal,
   skipSubagent = false,
+  precomputedDiffStat?: string,
+  precomputedDiffContent?: string,
 ): Promise<number> {
   if (progress) {
     progress.phase = "committing";
@@ -2121,6 +2135,8 @@ async function doSingleCommit(
     },
     signal,
     skipSubagent,
+    precomputedDiffStat,
+    precomputedDiffContent,
   );
 
   if (hash && progress) {

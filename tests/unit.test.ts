@@ -3923,9 +3923,9 @@ Files: module.ts, module.test.ts`;
 // ===========================================================================
 
 describe("subagentGroupingMinFiles config", () => {
-  it("default value is 4", () => {
+  it("default value is 15", () => {
     const cfg = loadConfig("/tmp/nonexistent");
-    assert.strictEqual(cfg.subagentGroupingMinFiles, 4);
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 15);
   });
 
   it("parses subagent_grouping_min_files from TOML", () => {
@@ -3968,7 +3968,7 @@ subagent_grouping_min_files = "not-a-number"
     writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
 
     const cfg = loadConfig(dir);
-    assert.strictEqual(cfg.subagentGroupingMinFiles, 4, "should fall back to default");
+    assert.strictEqual(cfg.subagentGroupingMinFiles, 15, "should fall back to default");
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
 
@@ -4040,7 +4040,7 @@ describe("subagentGroupingMinFiles behaviour", () => {
     dir = createTempRepo();
     after(() => removeDir(dir));
 
-    // Default subagentGroupingMinFiles = 4, so 2 < 4 -> single-commit path
+    // Default subagentGroupingMinFiles = 15, so 2 < 15 -> single-commit path
     setConfig({ ...originalConfig, stagedCommits: true });
 
     writeFileSync(path.join(dir, "file-a.ts"), "// a\n");
@@ -4167,7 +4167,7 @@ Files: file-y.ts`,
     try {
       const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
 
-      // With default subagentGroupingMinFiles=4, 2 files are below the threshold,
+      // With default subagentGroupingMinFiles=15, 2 files are below the threshold,
       // so the subagent should be skipped and deterministic path used.
       assert.strictEqual(result, 1, "should produce 1 commit");
       assert.ok(!subagentCalled, "subagent should be skipped for small change sets below threshold");
@@ -4416,6 +4416,7 @@ describe("async worker IPC integration", () => {
           minChanges: 1,
           subagentModel: undefined,  // No model configured — tests deterministic fallback
           subagentGroupingMinFiles: 4,
+          subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
         },
       });
@@ -4490,6 +4491,7 @@ describe("async worker IPC integration", () => {
           minChanges: 1,
           subagentModel: undefined,
           subagentGroupingMinFiles: 4,
+          subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
         },
       });
@@ -4551,6 +4553,7 @@ describe("async worker IPC integration", () => {
           minChanges: 1,
           subagentModel: undefined,
           subagentGroupingMinFiles: 4,
+          subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
         },
       });

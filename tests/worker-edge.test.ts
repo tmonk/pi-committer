@@ -469,6 +469,7 @@ describe("worker abort at checkpoint", () => {
         minChanges: 1,
         subagentModel: undefined,
         subagentGroupingMinFiles: 4,
+        subagentMessageMinFiles: 3,
         subagentThinkingLevel: "off",
       },
     });
@@ -543,6 +544,7 @@ describe("worker abort at checkpoint", () => {
         minChanges: 1,
         subagentModel: undefined,
         subagentGroupingMinFiles: 4,
+        subagentMessageMinFiles: 3,
         subagentThinkingLevel: "off",
       },
     });
@@ -614,6 +616,7 @@ describe("worker git failure modes", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -653,6 +656,7 @@ describe("worker git failure modes", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -679,6 +683,7 @@ describe("worker git failure modes", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -716,6 +721,7 @@ describe("worker git failure modes", () => {
       minChanges: 100,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -754,6 +760,7 @@ describe("worker IPC edge cases", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -777,6 +784,7 @@ describe("worker IPC edge cases", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -982,6 +990,7 @@ describe("worker IPC result guarantees", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -1014,6 +1023,7 @@ describe("worker IPC result guarantees", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 
@@ -1046,6 +1056,7 @@ describe("worker IPC result guarantees", () => {
       minChanges: 1,
       subagentModel: undefined,
       subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
     });
 

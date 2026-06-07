@@ -337,7 +337,7 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
     runnerLines.push("child.on('message', (msg) => { if (msg && msg.type === 'result') { writeFileSync(donePath, 'done'); process.exit(0); } });");
     runnerLines.push("child.on('exit', (code) => { if (code !== 0) process.exit(code); });");
     runnerLines.push("setTimeout(() => process.exit(2), 10000);");
-    runnerLines.push("child.send({ type: 'start', params: { dir: " + JSON.stringify(testDir) + ", diffStat: '', diffContent: '', allFiles: [], stagedCommits: false, excludePatterns: [], minChanges: 1, subagentModel: undefined, subagentGroupingMinFiles: 4, subagentThinkingLevel: 'off' } });");
+    runnerLines.push("child.send({ type: 'start', params: { dir: " + JSON.stringify(testDir) + ", diffStat: '', diffContent: '', allFiles: [], stagedCommits: false, excludePatterns: [], minChanges: 1, subagentModel: undefined, subagentGroupingMinFiles: 4, subagentMessageMinFiles: 3, subagentThinkingLevel: 'off' } });");
 
     const runnerScript = path.join(nmDir, "runner.mjs");
     writeFileSync(runnerScript, runnerLines.join("\n"));

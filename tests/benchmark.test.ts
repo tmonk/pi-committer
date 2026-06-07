@@ -112,6 +112,8 @@ import {
   resolveWorkerExecArgv,
   _findJitiRegisterForPath,
   batchStageFilesForGroup,
+  tryCommit,
+  __setCreateAgentSessionMock,
 } from "../index.ts";
 
 // ---------------------------------------------------------------------------
@@ -169,6 +171,7 @@ describe("benchmark", () => {
 
   after(() => {
     setConfig(originalConfig);
+    __setCreateAgentSessionMock(undefined);
 
     // Print summary table
     console.log("\n=== BENCHMARK RESULTS ===\n");
@@ -684,6 +687,226 @@ describe("benchmark", () => {
       const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
       assert.ok(avg < 5, `resolveWorkerExecArgv(nm+jiti) should be fast (<5ms avg, got ${Math.round(avg * 100) / 100}ms)`);
     });
+  });
+
+  // ===================================================================
+  // 12. tryCommit single-commit path (subagent mocked, no grouping)
+  // ===================================================================
+
+  describe("tryCommit single-commit path", () => {
+    for (const count of [1, 2, 3, 5, 10, 15, 30, 100]) {
+      it(`${count} file(s)`, () => {
+        const repoDir = mkdtempSync(path.join(tmpDir(), "bench-trycommit-single-"));
+        after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+
+        // Create repo with more files than we'll modify
+        createRepoWithFiles(repoDir, count + 20);
+        modifyFiles(repoDir, count);
+
+        // Mock subagent to return instantly
+        __setCreateAgentSessionMock(async (_opts: any) => ({
+          session: {
+            prompt: async () => {},
+            subscribe: (cb: any) => {
+              cb({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "chore: bench single commit" }],
+                },
+              });
+              return () => {};
+            },
+            abort: () => {},
+          },
+        }));
+
+        // Set threshold high so ALL counts go through single-commit path
+        setConfig({ ...getConfig(), stagedCommits: true, subagentGroupingMinFiles: 9999 });
+
+        const timings: number[] = [];
+        for (let i = 0; i < RUNS; i++) {
+          const start = performance.now();
+          const result = tryCommit(repoDir, { cwd: repoDir, ui: { notify: () => {} }, modelRegistry: { getAvailable: () => [], find: () => undefined } } as any, true);
+          timings.push(performance.now() - start);
+          // Add new changes for next iteration
+          for (let j = 0; j < count; j++) {
+            const subdir = j % 3 === 0 ? "src" : j % 3 === 1 ? "tests" : "lib";
+            const ext = j % 4 === 0 ? ".ts" : j % 4 === 1 ? ".js" : j % 4 === 2 ? ".css" : ".json";
+            const filePath = path.join(repoDir, subdir, `bench-file-${j}.ts`);
+            writeFileSync(filePath, `// bench ${i} ${j}\n`);
+          }
+        }
+        record("tryCommit single-commit", String(count), timings);
+      });
+    }
+  });
+
+  // ===================================================================
+  // 13. tryCommit grouped path (subagent mocked, grouping enabled)
+  // ===================================================================
+
+  describe("tryCommit grouped path", () => {
+    for (const count of [5, 10, 15, 30, 100]) {
+      it(`${count} file(s)`, () => {
+        const repoDir = mkdtempSync(path.join(tmpDir(), "bench-trycommit-group-"));
+        after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+
+        createRepoWithFiles(repoDir, count + 20);
+        modifyFiles(repoDir, count);
+
+        // Build a file list for group output
+        const allFiles: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const subdir = i % 3 === 0 ? "src" : i % 3 === 1 ? "tests" : "lib";
+          const ext = i % 4 === 0 ? ".ts" : i % 4 === 1 ? ".js" : i % 4 === 2 ? ".css" : ".json";
+          allFiles.push(path.join(subdir, `file-${i}${ext}`));
+        }
+
+        const groupOutput = allFiles.length > 15
+          ? [
+              "--- COMMIT GROUP 1 ---",
+              "feat(src): update source files",
+              "",
+              "Update source modules.",
+              `Files: ${allFiles.filter((_, i) => i % 3 === 0).join(", ")}`,
+              "",
+              "--- COMMIT GROUP 2 ---",
+              "test(tests): update test files",
+              "",
+              "Update test modules.",
+              `Files: ${allFiles.filter((_, i) => i % 3 === 1).join(", ")}`,
+              "",
+              "--- COMMIT GROUP 3 ---",
+              "chore(lib): update lib files",
+              "",
+              "Update library modules.",
+              `Files: ${allFiles.filter((_, i) => i % 3 === 2).join(", ")}`,
+            ].join("\n")
+          : [
+              "--- COMMIT GROUP 1 ---",
+              "chore: update all",
+              "",
+              "Bulk update.",
+              `Files: ${allFiles.join(", ")}`,
+            ].join("\n");
+
+        // Mock subagent to produce grouped output
+        __setCreateAgentSessionMock(async (_opts: any) => ({
+          session: {
+            prompt: async () => {},
+            subscribe: (cb: any) => {
+              cb({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: groupOutput }],
+                },
+              });
+              return () => {};
+            },
+            abort: () => {},
+          },
+        }));
+
+        // Set threshold low so ALL counts go through grouped path
+        setConfig({ ...getConfig(), stagedCommits: true, subagentGroupingMinFiles: 1 });
+
+        const timings: number[] = [];
+        for (let i = 0; i < RUNS; i++) {
+          const start = performance.now();
+          const result = tryCommit(repoDir, { cwd: repoDir, ui: { notify: () => {} }, modelRegistry: { getAvailable: () => [], find: () => undefined } } as any, true);
+          timings.push(performance.now() - start);
+          for (let j = 0; j < count; j++) {
+            const subdir = j % 3 === 0 ? "src" : j % 3 === 1 ? "tests" : "lib";
+            const ext = j % 4 === 0 ? ".ts" : j % 4 === 1 ? ".js" : j % 4 === 2 ? ".css" : ".json";
+            const filePath = path.join(repoDir, subdir, `bench-file-${j}.ts`);
+            writeFileSync(filePath, `// bench ${i} ${j}\n`);
+          }
+        }
+        record("tryCommit grouped", String(count), timings);
+      });
+    }
+  });
+
+  // ===================================================================
+  // 14. Threshold parameter sweep — find optimal grouping threshold
+  // ===================================================================
+
+  describe("threshold parameter sweep (15 files at various thresholds)", () => {
+    for (const threshold of [1, 4, 10, 15, 30, 100]) {
+      it(`subagentGroupingMinFiles=${threshold}`, () => {
+        const repoDir = mkdtempSync(path.join(tmpDir(), "bench-threshold-"));
+        after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+
+        const FILE_COUNT = 15;
+        createRepoWithFiles(repoDir, FILE_COUNT + 20);
+        modifyFiles(repoDir, FILE_COUNT);
+
+        // Build group output for 15 files
+        const allFiles: string[] = [];
+        for (let i = 0; i < FILE_COUNT; i++) {
+          const subdir = i % 3 === 0 ? "src" : i % 3 === 1 ? "tests" : "lib";
+          const ext = i % 4 === 0 ? ".ts" : i % 4 === 1 ? ".js" : i % 4 === 2 ? ".css" : ".json";
+          allFiles.push(path.join(subdir, `file-${i}${ext}`));
+        }
+
+        const groupOutput = [
+          "--- COMMIT GROUP 1 ---",
+          "feat(src): update source files",
+          "",
+          "Update source modules.",
+          `Files: ${allFiles.filter((_, i) => i % 3 === 0).join(", ")}`,
+          "",
+          "--- COMMIT GROUP 2 ---",
+          "test(tests): update test files",
+          "",
+          "Update test modules.",
+          `Files: ${allFiles.filter((_, i) => i % 3 === 1).join(", ")}`,
+          "",
+          "--- COMMIT GROUP 3 ---",
+          "chore(lib): update lib files",
+          "",
+          "Update library modules.",
+          `Files: ${allFiles.filter((_, i) => i % 3 === 2).join(", ")}`,
+        ].join("\n");
+
+        // Mock subagent — produces grouped output when called
+        __setCreateAgentSessionMock(async (_opts: any) => ({
+          session: {
+            prompt: async () => {},
+            subscribe: (cb: any) => {
+              cb({
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: groupOutput }],
+                },
+              });
+              return () => {};
+            },
+            abort: () => {},
+          },
+        }));
+
+        setConfig({ ...getConfig(), stagedCommits: true, subagentGroupingMinFiles: threshold });
+
+        const timings: number[] = [];
+        for (let i = 0; i < RUNS; i++) {
+          const start = performance.now();
+          const result = tryCommit(repoDir, { cwd: repoDir, ui: { notify: () => {} }, modelRegistry: { getAvailable: () => [], find: () => undefined } } as any, true);
+          timings.push(performance.now() - start);
+          // Prepare for next iteration
+          for (let j = 0; j < FILE_COUNT; j++) {
+            const subdir = j % 3 === 0 ? "src" : j % 3 === 1 ? "tests" : "lib";
+            const ext = j % 4 === 0 ? ".ts" : j % 4 === 1 ? ".js" : j % 4 === 2 ? ".css" : ".json";
+            const filePath = path.join(repoDir, subdir, `bench-file-${j}.ts`);
+            writeFileSync(filePath, `// bench ${i} ${j}\n`);
+          }
+        }
+        record("threshold sweep (15 files)", String(threshold), timings);
+      });
+    }
   });
 
   // ===================================================================

@@ -37,6 +37,8 @@ interface CommitWorkerParams {
   subagentModel?: string;
   /** Minimum changed files to use the subagent for grouping */
   subagentGroupingMinFiles: number;
+  /** Minimum changed files to use the subagent for a single commit message */
+  subagentMessageMinFiles: number;
   /** Thinking level for the subagent session (off, minimal, low, medium, high, xhigh) */
   subagentThinkingLevel?: string;
 }
@@ -1191,7 +1193,7 @@ process.on("message", async (msg: any) => {
   if (!msg || msg.type !== "start") return;
 
   const params: CommitWorkerParams = msg.params;
-  const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentThinkingLevel } = params;
+  const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentMessageMinFiles, subagentThinkingLevel } = params;
 
   let _warnings: string[] = [];
 
@@ -1252,8 +1254,10 @@ process.on("message", async (msg: any) => {
       _warnings = result.warnings;
     } else {
       // ---- Single commit mode ----
-      // Small change sets below the grouping threshold skip the subagent entirely.
-      const skipSubagent = files.length < params.subagentGroupingMinFiles;
+      // Small change sets below the message threshold skip the subagent entirely.
+      // Above the message threshold but below the grouping threshold, the subagent
+      // generates a single commit message (good descriptions, no grouping).
+      const skipSubagent = files.length < subagentMessageMinFiles;
       const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress }, skipSubagent);
       if (entry) {
         commitCount = 1;

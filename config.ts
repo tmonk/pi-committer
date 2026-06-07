@@ -44,13 +44,21 @@ export interface CommitterConfig {
   /**
    * Minimum number of changed files to use the subagent for commit group
    * generation (logical splitting). When the changed file count is below this
-   * threshold, the grouped path falls through to a single-commit (which still
-   * uses the subagent for the commit message). This avoids the ~90s overhead
-   * of the subagent grouping call for small change sets where grouping is
-   * almost always unnecessary.
-   * Default: 4
+   * threshold, the grouped path falls through to a single-commit (which may
+   * still use the subagent for the commit message if subagentMessageMinFiles
+   * is also met). This avoids the ~35s overhead of the subagent grouping call
+   * for small change sets where grouping is almost always unnecessary.
+   * Default: 15 (determined empirically — see benchmark-results.txt)
    */
   subagentGroupingMinFiles: number;
+  /**
+   * Minimum files before the subagent is called for a single-commit message.
+   * Below this threshold, the deterministic fallback is used directly.
+   * Above it but below subagentGroupingMinFiles, a single-commit with a
+   * subagent-generated message is used (good descriptions, no grouping).
+   * Default: 3 — 1-2 file changes are simple enough for deterministic.
+   */
+  subagentMessageMinFiles: number;
   /**
    * Thinking level for the commit subagent session. Controls how much
    * reasoning the model does before generating a commit message.
@@ -74,7 +82,8 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   stagedCommits: true,
   deferToGoalAudit: false,
   asyncThreshold: 5,
-  subagentGroupingMinFiles: 4,
+  subagentGroupingMinFiles: 15,
+  subagentMessageMinFiles: 3,
   subagentThinkingLevel: "off",
 };
 
@@ -223,6 +232,9 @@ function applyConfig(
 
   if (typeof raw.subagent_grouping_min_files === "number") {
     config.subagentGroupingMinFiles = raw.subagent_grouping_min_files;
+  }
+  if (typeof raw.subagent_message_min_files === "number") {
+    config.subagentMessageMinFiles = raw.subagent_message_min_files;
   }
 
   if (typeof raw.subagent_thinking_level === "string") {

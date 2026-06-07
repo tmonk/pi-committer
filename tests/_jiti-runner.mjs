@@ -52,6 +52,7 @@ child.send({
     minChanges: 1,
     subagentModel: undefined,
     subagentGroupingMinFiles: 4,
+    subagentMessageMinFiles: 3,
     subagentThinkingLevel: "off",
   },
 });

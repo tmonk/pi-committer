@@ -61,9 +61,16 @@ exclude_patterns  = ["*.log", "node_modules/"]
 # defer_to_goal_audit = false
 
 # Minimum number of changed files before the subagent is called for grouping.
-# Small change sets below this threshold use the deterministic fallback
-# directly (faster, no LLM call). Default: 4.
-# subagent_grouping_min_files = 4
+# Small change sets below this threshold use a single commit with a
+# subagent-generated message (unless also below subagent_message_min_files).
+# Default: 15 (determined empirically — see benchmark results).
+# subagent_grouping_min_files = 15
+
+# Minimum number of changed files before the subagent is called for the
+# commit message. Below this threshold, the deterministic fallback is used
+# directly (no LLM call at all). Default: 3 — 1-2 file changes are simple
+# enough for deterministic.
+# subagent_message_min_files = 3
 
 # Optional: override the model used by the commit-message subagent
 # subagent_model = "openai/gpt-4o-mini"

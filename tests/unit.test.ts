@@ -41,6 +41,9 @@ import {
   deterministicCommitMessage,
   findCommonAncestor,
   summarizeChanges,
+  isValidDiffContent,
+  isValidDiffStat,
+  isValidCommitMessage,
   shouldCommitOnTrigger,
   commitStaged,
   singleGroupFallback,
@@ -676,23 +679,86 @@ describe("deterministicCommitMessage", () => {
     assert.ok(!msg.includes("2 modules"), `should not say 'update 2 modules', got: ${msg}`);
   });
 
-  it("body includes description summary line + file list", () => {
+  it("body includes description summary line without file list", () => {
     const diffStat = [
       "src/main.ts | 5 +++++",
       " 1 file changed, 5 insertions(+)",
     ].join("\n");
     const msg = deterministicCommitMessage(diffStat, "changes");
     const lines = msg.split("\n");
-    // Body should have: header, blank, summary line, blank, file list
+    // Body should have: header, blank, summary line
     const blankCount = lines.filter((l) => l === "").length;
     assert.ok(blankCount >= 1, `body should have blank line separator, got lines: ${JSON.stringify(lines)}`);
-    // Should contain file reference
-    assert.ok(lines.some((l) => l.includes("src/main.ts")), "body should list changed files");
+    // Should NOT contain file list in body
+    assert.ok(lines.every((l) => !l.includes("src/main.ts") || l.includes("update main.ts") || l.includes("(src)")),
+      "body should not list individual files, got: " + JSON.stringify(lines));
   });
 });
 
 // ===========================================================================
 // findCommonAncestor
+// ===========================================================================
+// isValidDiffContent / isValidDiffStat / isValidCommitMessage
+// ===========================================================================
+
+describe("isValidDiffContent", () => {
+  it("accepts genuine git diff output", () => {
+    assert.ok(isValidDiffContent("diff --git a/src/main.ts b/src/main.ts\nindex abc..def 100644\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-old line\n+new line"));
+  });
+
+  it("accepts empty string (no changes)", () => {
+    assert.ok(isValidDiffContent(""));
+  });
+
+  it("rejects non-diff content like df command output", () => {
+    assert.ok(!isValidDiffContent("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+
+  it("rejects arbitrary text without diff --git", () => {
+    assert.ok(!isValidDiffContent("This is just some random text that isn't a git diff"));
+  });
+});
+
+describe("isValidDiffStat", () => {
+  it("accepts standard git diff stat lines", () => {
+    assert.ok(isValidDiffStat("src/main.ts | 5 +++++\n 1 file changed"));
+  });
+
+  it("accepts empty string (no changes)", () => {
+    assert.ok(isValidDiffStat(""));
+  });
+
+  it("rejects non-stat content", () => {
+    assert.ok(!isValidDiffStat("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+
+  it("rejects arbitrary text", () => {
+    assert.ok(!isValidDiffStat("This is not a diff stat"));
+  });
+});
+
+describe("isValidCommitMessage", () => {
+  it("accepts a valid conventional commit message", () => {
+    assert.ok(isValidCommitMessage("feat(api): add user endpoint\n\nAdd a new REST endpoint for user management."));
+  });
+
+  it("accepts a commit message without scope", () => {
+    assert.ok(isValidCommitMessage("fix: correct null pointer\n\nFixed the null pointer exception in the parser."));
+  });
+
+  it("rejects very short messages", () => {
+    assert.ok(!isValidCommitMessage("short"));
+  });
+
+  it("rejects messages not starting with conventional type", () => {
+    assert.ok(!isValidCommitMessage("This is a long message that doesn't start with a conventional commit type"));
+  });
+
+  it("rejects garbled content like df output", () => {
+    assert.ok(!isValidCommitMessage("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+});
+
 // ===========================================================================
 
 describe("findCommonAncestor", () => {

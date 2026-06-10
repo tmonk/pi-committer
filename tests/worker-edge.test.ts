@@ -36,6 +36,9 @@ import {
   unstageExcludedFiles,
   deterministicCommitMessage,
   findCommonAncestor,
+  isValidDiffContent,
+  isValidDiffStat,
+  isValidCommitMessage,
   parseCommitGroups,
   sendResultAndExit,
   type CommitLogEntry,
@@ -266,11 +269,14 @@ describe("worker exported deterministicCommitMessage", () => {
     assert.ok(msg.includes("feat"), "feat content should produce feat type");
   });
 
-  it("includes body with file list when diff stat is provided", () => {
+  it("includes body with description summary when diff stat is provided", () => {
     const diffStat = `src/main.ts | 5 +++++\n`;
     const msg = deterministicCommitMessage(diffStat, "changes", ["src/main.ts"]);
     assert.ok(msg.includes("update main.ts"), "should have body summary");
-    assert.ok(msg.includes("src/main.ts"));
+    // File names in the description from summarizeChanges are fine, but should NOT have a file list body section
+    const bodyLines = msg.split("\n").slice(2).filter((l) => l.trim());
+    assert.ok(!bodyLines.some((l) => l.startsWith("- ")),
+      "body should not contain file list lines, got: " + JSON.stringify(bodyLines));
   });
 
   it("uses smart scope (longest common ancestor)", () => {
@@ -306,6 +312,54 @@ describe("worker exported deterministicCommitMessage", () => {
     );
   });
 });
+
+// ===========================================================================
+// worker exported isValidDiffContent / isValidDiffStat / isValidCommitMessage
+// ===========================================================================
+
+describe("worker exported isValidDiffContent", () => {
+  it("accepts genuine git diff output", () => {
+    assert.ok(isValidDiffContent("diff --git a/src/main.ts b/src/main.ts\nindex abc..def 100644"));
+  });
+
+  it("accepts empty string", () => {
+    assert.ok(isValidDiffContent(""));
+  });
+
+  it("rejects non-diff content", () => {
+    assert.ok(!isValidDiffContent("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+});
+
+describe("worker exported isValidDiffStat", () => {
+  it("accepts standard git diff stat lines", () => {
+    assert.ok(isValidDiffStat("src/main.ts | 5 +++++\n 1 file changed"));
+  });
+
+  it("accepts empty string", () => {
+    assert.ok(isValidDiffStat(""));
+  });
+
+  it("rejects non-stat content", () => {
+    assert.ok(!isValidDiffStat("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+});
+
+describe("worker exported isValidCommitMessage", () => {
+  it("accepts a valid conventional commit message", () => {
+    assert.ok(isValidCommitMessage("feat(api): add user endpoint\n\nNew endpoint."));
+  });
+
+  it("rejects garbled content", () => {
+    assert.ok(!isValidCommitMessage("Filesystem     512-blocks       Used  Available Capacity"));
+  });
+
+  it("rejects very short messages", () => {
+    assert.ok(!isValidCommitMessage("short"));
+  });
+});
+
+// ===========================================================================
 
 describe("worker exported findCommonAncestor", () => {
   it("finds common ancestor for sibling directories", () => {

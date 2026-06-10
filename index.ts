@@ -478,8 +478,9 @@ export function getBranch(dir: string): string {
 /** @internal exported for benchmarking */
 export function getDiffContent(dir: string): string {
   // Fast path: pipe the diff through execSync with a 10MB buffer.
+  let content: string;
   try {
-    return execSync("git diff --cached", {
+    content = execSync("git diff --cached", {
       cwd: dir,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
@@ -492,11 +493,54 @@ export function getDiffContent(dir: string): string {
     const diffFile = path.join(tmpDir, "diff-cached.txt");
     try {
       execSync(`git diff --cached --output="${diffFile}"`, { cwd: dir, stdio: "ignore" });
-      return readFileSync(diffFile, "utf-8").trim();
+      content = readFileSync(diffFile, "utf-8").trim();
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   }
+  // Validate that captured output looks like genuine git diff.
+  // If not, log a diagnostic and return empty to prevent contamination.
+  if (!isValidDiffContent(content)) {
+    console.error(
+      "[pi-committer] DIAG: getDiffContent returned non-diff content — rejecting to prevent contamination",
+    );
+    return "";
+  }
+  return content;
+}
+
+/** Validate that captured git diff content looks like legitimate git diff output. */
+export function isValidDiffContent(content: string): boolean {
+  if (!content) return true; // empty diff is fine (no changes)
+  // Genuine git diff output starts with "diff --git" at the beginning or after context lines.
+  // For safety, we check that at least one line starts with "diff --git".
+  const lines = content.split("\n");
+  return lines.some((l) => l.startsWith("diff --git"));
+}
+
+/** Validate that captured git diff stat looks legitimate. */
+export function isValidDiffStat(stat: string): boolean {
+  if (!stat) return true; // empty stat is fine (no changes)
+  // Each stat line should match "filename | N +/-..." or be a summary line like "N files changed"
+  const lines = stat.split("\n").filter((l) => l.trim().length > 0);
+  return lines.every(
+    (l) =>
+      /\S+\s+\|\s+\d+/.test(l) || // "filename | N +/-..."
+      /\d+ files? changed/.test(l) || // "N files changed"
+      /\d+ deletions?/.test(l) || // "N deletions"
+      /\d+ insertions?/.test(l) || // "N insertions"
+      /\d+ renames?/.test(l), // "N renames"
+  );
+}
+
+/**
+ * Validate that a commit message looks like a legitimate conventional commit.
+ * Checks that the first line matches "type(scope): description" or "type: description".
+ */
+export function isValidCommitMessage(message: string): boolean {
+  if (message.length < 10) return false;
+  const firstLine = message.split("\n")[0];
+  return /^[a-z]+(\([^)]+\))?: .+/.test(firstLine);
 }
 
 /** Stage all changes and return the diff. */
@@ -508,6 +552,12 @@ export function stageAll(dir: string): { diffStat: string; diffContent: string }
     maxBuffer: 10 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
   }).trim();
+  if (!isValidDiffStat(diffStat)) {
+    console.error(
+      "[pi-committer] DIAG: stageAll diffStat failed validation — rejecting to prevent contamination",
+    );
+    return { diffStat: "", diffContent: "" };
+  }
   const diffContent = getDiffContent(dir);
   return { diffStat, diffContent };
 }
@@ -1250,7 +1300,7 @@ export async function generateCommitMessageViaSubagent(
     "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
     "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- Max 72 chars for the header line (type + scope + description combined).",
-    "- Body: a brief paragraph explaining what changed and why, then a blank line, then a bullet list of the changed files.",
+    "- Body: a brief paragraph explaining what changed and why.",
     "- Output ONLY the commit message, nothing else.",
     "",
     "Diff stat:",
@@ -1510,18 +1560,7 @@ export function deterministicCommitMessage(
 
   if (!diffStat.trim()) return header;
 
-  // Body: description line + file list
-  const bodyLines: string[] = [desc, ""];
-  for (const f of files) {
-    const statLine = diffStat
-      .split("\n")
-      .find((l) => l.trim().startsWith(f));
-    const changes = statLine?.match(/(\d+) insertions?|\d+ deletions?/g);
-    bodyLines.push(`- ${f}${changes ? ` (${changes.join(", ")})` : ""}`);
-  }
-  const body = bodyLines.join("\n");
-
-  return `${header}\n\n${body}`;
+  return `${header}\n\n${desc}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,7 +1634,7 @@ export async function commitStaged(
     }
 
     const finalMessage =
-      message.length > 10
+      isValidCommitMessage(message)
         ? message
         : `chore: update ${files.length} file(s)`;
 
@@ -1771,24 +1810,28 @@ export async function tryCommit(
         );
         if (allFailed) continue;
 
-        // Create commit with the group's message
+        // Validate group message before committing; fall back to deterministic if garbled
+        const groupFinalMessage = isValidCommitMessage(group.message)
+          ? group.message
+          : deterministicCommitMessage(diffStat, diffContent);
+
         try {
           execSync("git commit -F -", {
             cwd: dir,
             encoding: "utf-8",
             stdio: ["pipe", "pipe", "ignore"],
-            input: group.message,
+            input: groupFinalMessage,
           });
 
           const hash = getHeadHash(dir);
           const shortHash = hash.slice(0, 7);
-          const summary = group.message.split("\n")[0];
+          const summary = groupFinalMessage.split("\n")[0];
 
           commitCount++;
           if (__committerProgress) {
             __committerProgress.commitLog.push({
               hash,
-              message: group.message,
+              message: groupFinalMessage,
               success: true,
             });
             __committerProgress.completedCommits = commitCount;
@@ -1806,7 +1849,7 @@ export async function tryCommit(
           if (__committerProgress) {
             __committerProgress.commitLog.push({
               hash: "",
-              message: group.message,
+              message: groupFinalMessage,
               success: false,
             });
             updateCommitterWidget();

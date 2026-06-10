@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.12.8] — 2026-06-10
+
+### Fixed
+
+- **Commit message contamination guard:** Added `isValidDiffContent()`, `isValidDiffStat()`,
+  and `isValidCommitMessage()` validation functions that prevent non-diff output (e.g.
+  from unrelated shell commands like `df`) from leaking into commit messages. Validation
+  is integrated at every entry point: `getDiffContent`, `stageAll`, the grouped commit loop,
+  and async worker param ingestion. Invalid content is rejected with a diagnostic log
+  and the message falls back to a safe deterministic format.
+
+### Changed
+
+- **File list removed from commit message bodies:** Both deterministic and subagent-generated
+  commit messages no longer include a bullet list of changed files. The body now contains
+  only the description summary line. Subagent single-message prompt updated to remove the
+  "bullet list of changed files" instruction; grouping prompt's `Files:` line is preserved
+  as a structured group-assignment format (parsed and stripped before committing).
+
 ## [0.12.7] — 2026-06-07
 
 ### Changed

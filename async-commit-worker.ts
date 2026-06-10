@@ -177,10 +177,42 @@ export function unstageAll(dir: string): void {
   }
 }
 
+/** Validate that captured git diff content looks like legitimate git diff output. */
+export function isValidDiffContent(content: string): boolean {
+  if (!content) return true; // empty diff is fine (no changes)
+  // Genuine git diff output starts with "diff --git" at the beginning or after context lines.
+  const lines = content.split("\n");
+  return lines.some((l) => l.startsWith("diff --git"));
+}
+
+/** Validate that captured git diff stat looks legitimate. */
+export function isValidDiffStat(stat: string): boolean {
+  if (!stat) return true; // empty stat is fine (no changes)
+  const lines = stat.split("\n").filter((l) => l.trim().length > 0);
+  return lines.every(
+    (l) =>
+      /\S+\s+\|\s+\d+/.test(l) ||
+      /\d+ files? changed/.test(l) ||
+      /\d+ deletions?/.test(l) ||
+      /\d+ insertions?/.test(l) ||
+      /\d+ renames?/.test(l),
+  );
+}
+
+/**
+ * Validate that a commit message looks like a legitimate conventional commit.
+ */
+export function isValidCommitMessage(message: string): boolean {
+  if (message.length < 10) return false;
+  const firstLine = message.split("\n")[0];
+  return /^[a-z]+(\([^)]+\))?: .+/.test(firstLine);
+}
+
 export function getDiffContent(dir: string): string {
   // Fast path: pipe the diff through execSync with a 10MB buffer.
+  let content: string;
   try {
-    return execSync("git diff --cached", {
+    content = execSync("git diff --cached", {
       cwd: dir,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
@@ -195,11 +227,19 @@ export function getDiffContent(dir: string): string {
         cwd: dir,
         stdio: "ignore",
       });
-      return readFileSync(diffFile, "utf-8").trim();
+      content = readFileSync(diffFile, "utf-8").trim();
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   }
+  // Validate that captured output looks like genuine git diff.
+  if (!isValidDiffContent(content)) {
+    console.error(
+      "[pi-committer] DIAG: getDiffContent returned non-diff content — rejecting to prevent contamination",
+    );
+    return "";
+  }
+  return content;
 }
 
 export function getChangedFiles(diffStat: string): string[] {
@@ -510,18 +550,7 @@ export function deterministicCommitMessage(
 
   if (!diffStat.trim()) return header;
 
-  // Body: description line + file list
-  const bodyLines: string[] = [desc, ""];
-  for (const f of files) {
-    const statLine = diffStat
-      .split("\n")
-      .find((l) => l.trim().startsWith(f));
-    const changes = statLine?.match(/(\d+) insertions?|\d+ deletions?/g);
-    bodyLines.push(`- ${f}${changes ? ` (${changes.join(", ")})` : ""}`);
-  }
-  const body = bodyLines.join("\n");
-
-  return `${header}\n\n${body}`;
+  return `${header}\n\n${desc}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +650,7 @@ export async function generateCommitMessage(
     "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
     "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- Max 72 chars for the header line (type + scope + description combined).",
-    "- Body: a brief paragraph explaining what changed and why, then a blank line, then a bullet list of the changed files.",
+    "- Body: a brief paragraph explaining what changed and why.",
     "- Output ONLY the commit message, nothing else.",
     "",
     "Diff stat:",
@@ -1038,7 +1067,7 @@ export async function doSingleCommit(
     return undefined;
   }
 
-  const finalMessage = message.length > 10 ? message : `chore: update ${files.length} file(s)`;
+  const finalMessage = isValidCommitMessage(message) ? message : `chore: update ${files.length} file(s)`;
 
   execSync("git commit -F -", {
     cwd: dir,
@@ -1160,7 +1189,7 @@ export async function doGroupedCommits(
         return { commitCount, commitLog, warnings };
       }
 
-      const finalMessage = message.length > 10 ? message : `chore: update ${stagedFiles.length} file(s)`;
+      const finalMessage = isValidCommitMessage(message) ? message : `chore: update ${stagedFiles.length} file(s)`;
 
       execSync("git commit -F -", {
         cwd: dir,
@@ -1193,7 +1222,21 @@ process.on("message", async (msg: any) => {
   if (!msg || msg.type !== "start") return;
 
   const params: CommitWorkerParams = msg.params;
-  const { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentMessageMinFiles, subagentThinkingLevel } = params;
+  let { dir, diffStat, diffContent, allFiles, stagedCommits, excludePatterns, minChanges, subagentGroupingMinFiles, subagentMessageMinFiles, subagentThinkingLevel } = params;
+
+  // Validate incoming diff content; reset to empty if contaminated
+  if (!isValidDiffContent(diffContent)) {
+    console.error(
+      "[pi-committer] DIAG: async worker received non-diff content — resetting to prevent contamination",
+    );
+    diffContent = "";
+  }
+  if (!isValidDiffStat(diffStat)) {
+    console.error(
+      "[pi-committer] DIAG: async worker received non-diff stat — resetting to prevent contamination",
+    );
+    diffStat = "";
+  }
 
   let _warnings: string[] = [];
 

@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **Safe widget cleanup on session shutdown:** Delayed widget cleanup timers are now tracked
+  and cancelled during `session_shutdown`, preventing stale extension-context access from
+  crashing Pi after a successful commit.
 - **Commit message contamination guard:** Added `isValidDiffContent()`, `isValidDiffStat()`,
   and `isValidCommitMessage()` validation functions that prevent non-diff output (e.g.
   from unrelated shell commands like `df`) from leaking into commit messages. Validation

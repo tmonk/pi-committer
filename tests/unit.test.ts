@@ -18,7 +18,7 @@ import {
   type CommitterProgress,
 } from "../widget.ts";
 
-import {
+import piCommitter, {
   // Config
   getConfig,
   setConfig,
@@ -71,6 +71,7 @@ import {
   _getAsyncCommitStarted,
   _getAsyncCommitFileCount,
   _getCommitterProgress,
+  _hasPendingCommitterHide,
 
   // State
   getSelectedSubagentModel,
@@ -1801,6 +1802,64 @@ describe("config state accessors", () => {
     setConfig(testCfg);
     assert.strictEqual(getConfig().deferToGoalAudit, false);
     setConfig(original);
+  });
+});
+
+// ===========================================================================
+// Session shutdown cleanup
+// ===========================================================================
+
+describe("session shutdown cleanup", () => {
+  it("cancels delayed widget cleanup before the extension context becomes stale", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    writeFileSync(path.join(dir, "shutdown-fix.ts"), "// shutdown cleanup\n");
+
+    const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void>>();
+    piCommitter({
+      on: (event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
+        handlers.set(event, handler);
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any);
+
+    const originalConfig = getConfig();
+    setConfig({ ...originalConfig, stagedCommits: false, asyncThreshold: 0 });
+
+    let contextIsStale = false;
+    let widgetClearCount = 0;
+    const ctx = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: (_key: string, widget: unknown) => {
+          if (contextIsStale) throw new Error("stale extension context");
+          if (widget === undefined) widgetClearCount++;
+        },
+      },
+    });
+
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      assert.strictEqual(await tryCommit(dir, ctx, true, undefined, false), 1);
+      assert.strictEqual(_hasPendingCommitterHide(), true);
+
+      const shutdown = handlers.get("session_shutdown");
+      assert.ok(shutdown, "session_shutdown handler should be registered");
+      await shutdown({}, ctx);
+      assert.strictEqual(widgetClearCount, 1);
+      assert.strictEqual(_hasPendingCommitterHide(), false);
+
+      contextIsStale = true;
+      mock.timers.tick(6000);
+      assert.strictEqual(widgetClearCount, 1, "no delayed cleanup should use the stale context");
+    } finally {
+      mock.timers.reset();
+      setConfig(originalConfig);
+    }
   });
 });
 

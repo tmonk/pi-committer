@@ -233,6 +233,10 @@ let __asyncCommitFileCount = 0;
 export function _getCommitterProgress(): CommitterProgress | null {
   return __committerProgress;
 }
+/** Export for unit tests. */
+export function _hasPendingCommitterHide(): boolean {
+  return __committerHideTimer !== null;
+}
 
 // ---------------------------------------------------------------------------
 // Widget state
@@ -242,6 +246,7 @@ const COMMITTER_WIDGET_KEY = "pi-committer";
 let __committerProgress: CommitterProgress | null = null;
 let __committerWidgetComponent: CommitterWidgetComponent | null = null;
 let __committerAnimationTimer: ReturnType<typeof setInterval> | null = null;
+let __committerHideTimer: ReturnType<typeof setTimeout> | null = null;
 let __committerAbortController: AbortController | null = null;
 let __committerTerminalInputUnsub: (() => void) | null = null;
 
@@ -304,6 +309,10 @@ function showCommitterWidget(
   ctx: ExtensionContext,
   initial: Omit<CommitterProgress, "startedAt" | "commitLog">,
 ): void {
+  if (__committerHideTimer) {
+    clearTimeout(__committerHideTimer);
+    __committerHideTimer = null;
+  }
   if (__committerProgress) hideCommitterWidget(ctx);
 
   __committerAbortController = new AbortController();
@@ -362,6 +371,10 @@ function killAsyncSubprocess(): void {
 }
 
 function hideCommitterWidget(ctx: ExtensionContext): void {
+  if (__committerHideTimer) {
+    clearTimeout(__committerHideTimer);
+    __committerHideTimer = null;
+  }
   stopCommitterAnimation();
   killAsyncSubprocess();
   if (__committerTerminalInputUnsub) {
@@ -376,6 +389,15 @@ function hideCommitterWidget(ctx: ExtensionContext): void {
   __committerProgress = null;
   __asyncCommitStarted = false;
   __asyncCommitFileCount = 0;
+}
+
+function scheduleHideCommitterWidget(ctx: ExtensionContext, delayMs: number): void {
+  if (__committerHideTimer) clearTimeout(__committerHideTimer);
+  __committerHideTimer = setTimeout(() => {
+    __committerHideTimer = null;
+    hideCommitterWidget(ctx);
+  }, delayMs);
+  __committerHideTimer.unref?.();
 }
 
 function getAbortSignal(): AbortSignal | undefined {
@@ -1924,9 +1946,9 @@ export async function tryCommit(
 
     // Auto-hide the widget after 6 seconds (unless abort was triggered, then hide immediately)
     if (runtimeSignal?.aborted || isAborted()) {
-      setTimeout(() => hideCommitterWidget(ctx), 3000);
+      scheduleHideCommitterWidget(ctx, 3000);
     } else {
-      setTimeout(() => hideCommitterWidget(ctx), 6000);
+      scheduleHideCommitterWidget(ctx, 6000);
     }
   }
 
@@ -2024,7 +2046,7 @@ async function tryCommitAsync(
           __committerProgress.commitLog = msg.commitLog || [];
         }
         updateCommitterWidget();
-        setTimeout(() => hideCommitterWidget(ctx), 6000);
+        scheduleHideCommitterWidget(ctx, 6000);
         __asyncChildProcess = null;
       }
     });
@@ -2036,7 +2058,7 @@ async function tryCommitAsync(
         __committerProgress.phase = "done";
         __committerProgress.error = `Subprocess error: ${err.message}`;
         updateCommitterWidget();
-        setTimeout(() => hideCommitterWidget(ctx), 6000);
+        scheduleHideCommitterWidget(ctx, 6000);
       }
       __asyncChildProcess = null;
     });
@@ -2055,7 +2077,7 @@ async function tryCommitAsync(
               __committerProgress.phase = "done";
               __committerProgress.error = `Subprocess exited with code ${code ?? "unknown"}`;
               updateCommitterWidget();
-              setTimeout(() => hideCommitterWidget(ctx), 6000);
+              scheduleHideCommitterWidget(ctx, 6000);
             }
           }, 500);
 
@@ -2090,7 +2112,7 @@ async function tryCommitAsync(
               __committerProgress!.completedCommits = msg.commitCount ?? 0;
               __committerProgress!.commitLog = msg.commitLog || [];
               updateCommitterWidget();
-              setTimeout(() => hideCommitterWidget(ctx), 6000);
+              scheduleHideCommitterWidget(ctx, 6000);
               child.removeListener("message", onDelayedMsg);
             }
           };
@@ -2101,7 +2123,7 @@ async function tryCommitAsync(
           __committerProgress.totalCommits = 0;
           __committerProgress.completedCommits = 0;
           updateCommitterWidget();
-          setTimeout(() => hideCommitterWidget(ctx), 6000);
+          scheduleHideCommitterWidget(ctx, 6000);
         }
       }
       __asyncChildProcess = null;
@@ -2653,8 +2675,8 @@ export default function (pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
   // Session shutdown — clean up per-session state
   // -----------------------------------------------------------------------
-  pi.on("session_shutdown", async (_event, _ctx) => {
-    // Kill any running async subprocess
-    killAsyncSubprocess();
+  pi.on("session_shutdown", async (_event, ctx) => {
+    // Cancel delayed UI cleanup before this context becomes stale.
+    hideCommitterWidget(ctx);
   });
 }

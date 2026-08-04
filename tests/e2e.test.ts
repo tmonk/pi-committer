@@ -37,6 +37,22 @@ const EXT_PATH = path.resolve(
   "index.ts",
 );
 
+/**
+ * The harness loads pi-committer via a self-referential symlink at
+ * extensions/pi-committer -> .. (gitignored). Create it when missing so the
+ * suite is reproducible from a fresh clone.
+ */
+function ensureExtensionSymlink(): void {
+  try {
+    if (fs.existsSync(EXT_PATH)) return;
+    const linkDir = path.resolve(__dirname, "..", "extensions");
+    fs.mkdirSync(linkDir, { recursive: true });
+    fs.symlinkSync(path.resolve(__dirname, ".."), path.join(linkDir, "pi-committer"), "dir");
+  } catch (err) {
+    console.error(`[e2e] Could not create extension symlink at ${EXT_PATH}: ${err}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -95,6 +111,7 @@ e2e("pi-committer E2E", { timeout: 720_000 }, () => {
   let repo2: string;
 
   before(() => {
+    ensureExtensionSymlink();
     testDir = createTempRepo();
     repo2 = createTempRepo();
   });

@@ -35,6 +35,9 @@ import {
   filterGitignoredFiles,
   unstageExcludedFiles,
   deterministicCommitMessage,
+  resolveCommitMessage,
+  parseDiffHunks,
+  sampleRepoCommitStyle,
   findCommonAncestor,
   isValidDiffContent,
   isValidDiffStat,
@@ -242,56 +245,75 @@ describe("worker exported git helpers", () => {
   });
 });
 
-describe("worker exported deterministicCommitMessage", () => {
-  it("generates a chore commit for generic changes", () => {
-    const msg = deterministicCommitMessage("", "some changes", ["file.ts"]);
-    assert.ok(msg.includes("chore"), "should default to chore");
-    assert.ok(msg.includes("file.ts"));
+describe("worker exported deterministicCommitMessage (content-driven)", () => {
+  /** Build a realistic unified git diff from per-file added/removed lines. */
+  function makeDiff(files: Record<string, { added?: string[]; removed?: string[] }>): string {
+    const out: string[] = [];
+    for (const [file, change] of Object.entries(files)) {
+      out.push(`diff --git a/${file} b/${file}`);
+      out.push("index 1111111..2222222 100644");
+      out.push(`--- a/${file}`);
+      out.push(`+++ b/${file}`);
+      out.push("@@ -1 +1,3 @@");
+      for (const l of change.removed ?? []) out.push(`-${l}`);
+      for (const l of change.added ?? []) out.push(`+${l}`);
+      out.push(" context line");
+    }
+    return out.join("\n");
+  }
+
+  it("derives the description from actual diff content, never file names alone", () => {
+    const diff = makeDiff({ "src/main.ts": { added: ["const retryCount = 3;"] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    assert.ok(msg.includes("retryCount"), `should reference added content, got: ${msg}`);
+    assert.ok(!msg.includes("update main.ts"), `should not be filename-only, got: ${msg}`);
   });
 
   it("detects test type from test files", () => {
-    const msg = deterministicCommitMessage("", "some changes", ["tests/foo.test.ts"]);
-    assert.ok(msg.includes("test"), "test file should produce test type");
+    const diff = makeDiff({ "tests/foo.test.ts": { added: ["assert.equal(1, 1);"] } });
+    const msg = deterministicCommitMessage("tests/foo.test.ts | 1 +", diff, ["tests/foo.test.ts"]);
+    assert.ok(msg.startsWith("test"), `test file should produce test type, got: ${msg}`);
   });
 
   it("detects docs type from docs", () => {
-    const msg = deterministicCommitMessage("", "some changes", ["README.md"]);
-    assert.ok(msg.includes("docs"), "md file should produce docs type");
+    const diff = makeDiff({ "README.md": { added: ["Updated usage section"] } });
+    const msg = deterministicCommitMessage("README.md | 1 +", diff, ["README.md"]);
+    assert.ok(msg.startsWith("docs"), `md file should produce docs type, got: ${msg}`);
   });
 
   it("detects fix type from diff content", () => {
-    const msg = deterministicCommitMessage("", "fix a bug where...", ["src/main.ts"]);
-    assert.ok(msg.includes("fix"), "fix content should produce fix type");
+    const diff = makeDiff({ "src/main.ts": { added: ["fix a bug where the cursor is not reset"] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    assert.ok(msg.startsWith("fix"), `fix content should produce fix type, got: ${msg}`);
   });
 
   it("detects feat type from diff content", () => {
-    const msg = deterministicCommitMessage("", "add new feature for...", ["src/main.ts"]);
-    assert.ok(msg.includes("feat"), "feat content should produce feat type");
+    const diff = makeDiff({ "src/main.ts": { added: ["add new feature flag for dark mode"] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    assert.ok(msg.startsWith("feat"), `feat content should produce feat type, got: ${msg}`);
   });
 
-  it("includes body with description summary when diff stat is provided", () => {
-    const diffStat = `src/main.ts | 5 +++++\n`;
-    const msg = deterministicCommitMessage(diffStat, "changes", ["src/main.ts"]);
-    assert.ok(msg.includes("update main.ts"), "should have body summary");
-    // File names in the description from summarizeChanges are fine, but should NOT have a file list body section
-    const bodyLines = msg.split("\n").slice(2).filter((l) => l.trim());
-    assert.ok(!bodyLines.some((l) => l.startsWith("- ")),
-      "body should not contain file list lines, got: " + JSON.stringify(bodyLines));
+  it("always includes a structured body with per-file details", () => {
+    const diff = makeDiff({ "src/main.ts": { added: ["const retryCount = 3;"] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    const lines = msg.split("\n");
+    assert.strictEqual(lines[1], "", "header should be followed by a blank line");
+    const body = lines.slice(2).join("\n");
+    assert.ok(body.length > 0, "body should be present");
+    assert.ok(body.includes("src/main.ts"), `body should list the file, got: ${body}`);
+    assert.ok(body.includes("retryCount"), `body should reference the content, got: ${body}`);
   });
 
   it("uses smart scope (longest common ancestor)", () => {
-    const diffStat = [
-      "experiments/exposure/config.yaml | 5 +++++",
-      "experiments/exposure/src/adaptation_panel.py | 12 ++++++++++-",
-      "experiments/exposure/tests/test_adaptation_panel.py | 20 ++++++++++++++++++++",
-      " 27 files changed, 300 insertions(+), 10 deletions(-)",
-    ].join("\n");
+    const diff = makeDiff({
+      "experiments/exposure/src/adaptation_panel.py": { added: ["handle new config keys"] },
+      "experiments/exposure/tests/test_adaptation_panel.py": { added: ["assert config keys"] },
+    });
     const files = [
-      "experiments/exposure/config.yaml",
       "experiments/exposure/src/adaptation_panel.py",
       "experiments/exposure/tests/test_adaptation_panel.py",
     ];
-    const msg = deterministicCommitMessage(diffStat, "changes", files);
+    const msg = deterministicCommitMessage("a | 1 +\nb | 1 +", diff, files);
     assert.ok(
       msg.includes("(experiments/exposure)"),
       `scope should be common ancestor, got: ${msg.split("\n")[0]}`,
@@ -299,17 +321,90 @@ describe("worker exported deterministicCommitMessage", () => {
   });
 
   it("omits scope when files have no common ancestor", () => {
-    const diffStat = [
-      "src/main.ts | 5 +++++",
-      "docs/guide.md | 2 ++",
-      " 2 files changed, 7 insertions(+)",
-    ].join("\n");
+    const diff = makeDiff({
+      "src/main.ts": { added: ["const x = 1;"] },
+      "docs/guide.md": { added: ["More details"] },
+    });
     const files = ["src/main.ts", "docs/guide.md"];
-    const msg = deterministicCommitMessage(diffStat, "changes", files);
+    const msg = deterministicCommitMessage("a | 1 +\nb | 1 +", diff, files);
     assert.ok(
-      !msg.includes("("),
+      !msg.split("\n")[0].includes("("),
       `should not have scope when no common ancestor, got: ${msg.split("\n")[0]}`,
     );
+  });
+
+  it("returns '' (block signal) when the diff has no extractable content", () => {
+    assert.strictEqual(deterministicCommitMessage("src/main.ts | 1 +", "", ["src/main.ts"]), "");
+  });
+});
+
+// ===========================================================================
+// worker exported parseDiffHunks / resolveCommitMessage / sampleRepoCommitStyle
+// ===========================================================================
+
+describe("worker exported parseDiffHunks", () => {
+  it("parses added and removed lines per file", () => {
+    const diff =
+      "diff --git a/src/a.ts b/src/a.ts\n" +
+      "index 1111111..2222222 100644\n" +
+      "--- a/src/a.ts\n" +
+      "+++ b/src/a.ts\n" +
+      "@@ -1 +1,3 @@\n" +
+      "-old code\n" +
+      "+new code\n" +
+      " context line\n";
+    const files = parseDiffHunks(diff);
+    assert.strictEqual(files.length, 1);
+    assert.deepStrictEqual(files[0].added, ["new code"]);
+    assert.deepStrictEqual(files[0].removed, ["old code"]);
+  });
+});
+
+describe("worker exported resolveCommitMessage", () => {
+  it("blocks (returns undefined) when no detailed message can be produced", () => {
+    assert.strictEqual(resolveCommitMessage("garbage", "img.png | 1 +", "", ["img.png"]), undefined);
+  });
+
+  it("regenerates deterministically when the message is invalid", () => {
+    const diff =
+      "diff --git a/src/main.ts b/src/main.ts\n" +
+      "index 1111111..2222222 100644\n" +
+      "--- a/src/main.ts\n" +
+      "+++ b/src/main.ts\n" +
+      "@@ -1 +1,3 @@\n" +
+      "+const retryCount = 3;\n" +
+      " context line\n";
+    const resolved = resolveCommitMessage("not valid", "src/main.ts | 1 +", diff, ["src/main.ts"]);
+    assert.ok(resolved, "should regenerate a valid message");
+    assert.ok(isValidCommitMessage(resolved!), `should be valid, got: ${resolved}`);
+  });
+});
+
+describe("worker exported sampleRepoCommitStyle", () => {
+  it("samples types and scopes from git log", () => {
+    const dir = createTempRepo();
+    execSync("git commit --allow-empty -F -", {
+      cwd: dir,
+      input: "feat(api): add login endpoint\n\nAdds the endpoint.\n",
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    execSync('git commit -m "chore: bump deps" --allow-empty', { cwd: dir, stdio: "ignore" });
+    const style = sampleRepoCommitStyle(dir);
+    assert.ok(style.types.includes("feat"), `types should include feat: ${style.types}`);
+    assert.ok(style.types.includes("chore"), `types should include chore: ${style.types}`);
+    assert.ok(style.scopes.includes("api"), `scopes should include api: ${style.scopes}`);
+    assert.strictEqual(style.headerOnly, false, "one commit has a body");
+  });
+
+  it("returns empty style when git log fails", () => {
+    assert.deepStrictEqual(sampleRepoCommitStyle("/nonexistent/dir"), {
+      history: [],
+      types: [],
+      typeCounts: {},
+      scopes: [],
+      headerOnly: true,
+      recentHeader: "",
+    });
   });
 });
 

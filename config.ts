@@ -68,6 +68,15 @@ export interface CommitterConfig {
    * need deep reasoning.
    */
   subagentThinkingLevel: string;
+  /**
+   * When true, the commit-message generator samples the repository's recent
+   * commit history (git log) and uses it as style context — matching the
+   * types, scopes, and tone the repo actually uses. When false (default),
+   * no git-log sampling occurs and generated messages follow the generic
+   * conventional-commit guidance.
+   * Default: false (opt-in).
+   */
+  matchRepoStyle: boolean;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -85,6 +94,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   subagentGroupingMinFiles: 15,
   subagentMessageMinFiles: 3,
   subagentThinkingLevel: "off",
+  matchRepoStyle: false,
 };
 
 const CONVENTIONAL_TYPES = [
@@ -242,6 +252,10 @@ function applyConfig(
     if (["off", "minimal", "low", "medium", "high", "xhigh"].includes(level)) {
       config.subagentThinkingLevel = level;
     }
+  }
+
+  if (typeof raw.match_repo_style === "boolean") {
+    config.matchRepoStyle = raw.match_repo_style;
   }
 
   return config;

@@ -54,6 +54,11 @@ min_changes       = 1
 staged_commits    = true
 exclude_patterns  = ["*.log", "node_modules/"]
 
+# Opt-in: sample the repo's recent commit history (git log) and match its
+# types/scopes/tone when generating messages. Defaults to false — no git-log
+# sampling unless you enable it.
+# match_repo_style = true
+
 # When true and trigger_mode is "on_goal", the commit_changes tool will skip
 # when pi-goal has an active goal and defer to the automatic commit-after-audit
 # flow. Defaults to false — commit_changes always proceeds immediately unless
@@ -157,11 +162,25 @@ If the agent edits files in multiple git repositories during a session, `commit_
 
 ## Deterministic commit message fallback
 
-When the subagent is unavailable (e.g., SDK load failure) or returns no result, pi-committer generates a deterministic commit message using string analysis — no LLM calls needed:
+When the subagent is unavailable (e.g., SDK load failure) or returns no result, pi-committer generates a deterministic commit message from the diff itself — no LLM calls needed:
 
-- **Smart scope**: Uses the longest common ancestor directory across all changed files. If files span unrelated directories, scope is omitted entirely.
-- **Specific description**: Extracts meaningful keywords from file names (strips extensions, skips boilerplate like `__init__` and `conftest`, converts `snake_case` to readable words). Never says "update N modules".
-- **Structured body**: Includes the description summary line followed by a file list with change stats.
+- **Content-driven description**: Reads the actual added/removed lines from the diff and describes what changed (e.g. `add const retryCount = 3`), never falling back to filename-only filler like `update file.ts`.
+- **Smart scope**: Uses the longest common ancestor directory across all changed files. If files span unrelated directories, scope is omitted entirely. When `match_repo_style` is enabled, the scope is normalized to one the repo actually uses.
+- **Structured body**: Always includes a body with a summary line and per-file change details (+N/−M with the first changed line).
+- **Block instead of boilerplate**: If the diff has no extractable content (e.g. empty diffs), the commit is skipped with a clear warning — a generic message is never committed. The old `chore: update N file(s)` substitution was removed from every commit path.
+
+## Matching the repo's commit style (opt-in)
+
+Commit messages are detailed by default; matching the repository's own history is opt-in:
+
+```toml
+[committer]
+# Sample the last 15 commits from git log and use them as style context:
+# the subagent matches the repo's types/scopes/tone, and the deterministic
+# fallback constrains its type/scope to ones the repo actually uses.
+# Default: false — no git-log sampling happens unless you enable this.
+match_repo_style = true
+```
 
 Every subagent fallback decision point logs a `DIAG:` diagnostic message to help identify root causes.
 

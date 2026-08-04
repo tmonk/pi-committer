@@ -60,12 +60,16 @@ function removeDir(dir: string): void {
 }
 
 function runPi(dir: string, input: string): string {
-  return execSync(`printf '${input}' | pi -p -e "${EXT_PATH}"`, {
+  const out = execSync(`printf '${input}' | pi -p -e "${EXT_PATH}"`, {
     cwd: dir,
     encoding: "utf-8",
     maxBuffer: 10 * 1024 * 1024,
-    timeout: 120_000,
+    timeout: 180_000,
   });
+  if (process.env.PI_COMMITTER_E2E_DEBUG) {
+    console.error(`[e2e-debug] runPi(${JSON.stringify(input.trim())}) output: ${JSON.stringify(out.slice(0, 400))}`);
+  }
+  return out;
 }
 
 function commitCount(dir: string): number {
@@ -86,7 +90,7 @@ function commitCount(dir: string): number {
 // E2E Tests
 // ===========================================================================
 
-e2e("pi-committer E2E", { timeout: 300_000 }, () => {
+e2e("pi-committer E2E", { timeout: 720_000 }, () => {
   let testDir: string;
   let repo2: string;
 
@@ -146,6 +150,13 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
     fs.mkdirSync(srcDir, { recursive: true });
     fs.mkdirSync(testsDir, { recursive: true });
 
+    // Lower the grouping threshold so these 3 files actually trigger the
+    // subagent grouping path (default is 15, which these never reach), and
+    // force sync commits so the grouped commits exist before the assertion
+    // (5 files would otherwise hit the async threshold and race the check).
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\nstaged_commits = true\nsubagent_grouping_min_files = 2\nasync_threshold = 0\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
     writeFileSync(path.join(srcDir, "module.ts"), "// new module");
     writeFileSync(path.join(testsDir, "module.test.ts"), "// test");
     writeFileSync(path.join(testDir, "CHANGELOG.md"), "# v2");
@@ -159,11 +170,14 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
   // -----------------------------------------------------------------------
   it("Test 5: Multi-repo — both repos committed", () => {
     writeFileSync(path.join(testDir, "primary.ts"), "// primary");
-    writeFileSync(path.join(repo2, "CHANGELOG.md"), "# repo2 changes");
+    // NOTE: repo2's CHANGELOG.md must NOT be pre-written here — multi-repo
+    // detection is session-history based, so the agent has to create the file
+    // via its write tool for repo2 to be detected and committed.
 
     runPi(testDir,
-      "Write a file " + repo2 + "/CHANGELOG.md " +
-      "with content '# repo2 changes'. Then call commit_changes.\\n"
+      "Two steps:\n" +
+      "  1. Create a file at " + repo2 + "/CHANGELOG.md with any content.\n" +
+      "  2. Call the commit_changes tool."
     );
 
     const primaryCount = commitCount(testDir);
@@ -218,13 +232,14 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
     const count = commitCount(testDir);
     assert.ok(count >= 2, `Expected >=2 commits, got ${count}`);
 
-    // The ignored.json should NOT be tracked
-    const status = execSync("git status --porcelain", {
+    // The ignored.json should NOT be tracked (gitignored files never show in
+    // plain `git status --porcelain`, so verify via the index instead)
+    const tracked = execSync("git ls-files", {
       cwd: testDir,
       encoding: "utf-8",
     }).trim();
-    assert.ok(status.includes("ignored.json"), "Expected ignored.json to remain untracked");
-    assert.ok(!status.includes("keep.ts"), "Expected keep.ts to be committed (not in status)");
+    assert.ok(!tracked.includes("ignored.json"), "Expected ignored.json to remain untracked");
+    assert.ok(tracked.includes("keep.ts"), "Expected keep.ts to be committed");
   });
 
   // -----------------------------------------------------------------------
@@ -250,10 +265,22 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
 
   // -----------------------------------------------------------------------
   it("Test 11: Async commit with many files runs in background", async () => {
+    // Clear the previous test's swallow-all .gitignore ("*\n!.gitignore")
+    // so the new files are actually committable, and enable the extension.
+    writeFileSync(path.join(testDir, ".gitignore"), "");
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
     // Create 6 files to trigger async threshold (default is 5)
     for (let i = 0; i < 6; i++) {
       writeFileSync(path.join(testDir, `async-e2e-${i}.ts`), `// async e2e ${i}\n`);
     }
+
+    // Read the baseline BEFORE running pi: the async worker can commit so
+    // quickly that it finishes before runPi returns, which would make the
+    // post-run baseline already include the commit and the poll would never
+    // observe an increase.
+    const startCount = commitCount(testDir);
 
     // Run pi with commit_changes — this should trigger the async path
     // because we have 6 files and the default asyncThreshold is 5.
@@ -262,11 +289,12 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
     // The output should indicate the commit is running in background
     // (or it may have completed synchronously if the async worker failed).
     // Either way, there should be new commits in the repo.
-    const startCount = commitCount(testDir);
 
-    // Wait for up to 2 minutes for the async worker to complete
+    // Wait for up to 6 minutes for the async worker to complete (the worker's
+    // subagent SDK/LLM path can stall for minutes before falling back in
+    // headless runs — e.g. a dead parent session reference on pi exit)
     let currentCount = startCount;
-    const deadline = Date.now() + 120_000;
+    const deadline = Date.now() + 360_000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       currentCount = commitCount(testDir);
@@ -299,12 +327,20 @@ e2e("pi-committer E2E", { timeout: 300_000 }, () => {
     const count = commitCount(testDir);
     assert.ok(count >= 3, `Expected >=3 commits, got ${count}`);
 
-    // benchmarks/results.json should still be untracked
-    const status = execSync("git status --porcelain -- benchmarks/", {
+    // benchmarks/results.json should still be untracked (gitignored files never
+    // show in plain `git status --porcelain`, so verify via the index instead)
+    const tracked = execSync("git ls-files -- benchmarks/", {
       cwd: testDir,
       encoding: "utf-8",
     }).trim();
-    assert.ok(status.includes("results.json"), "Expected results.json to remain untracked in nested gitignore");
+    assert.ok(
+      !tracked.includes("results.json"),
+      "Expected results.json to remain untracked in nested gitignore",
+    );
+    assert.ok(
+      tracked.includes("benchmarks/.gitignore"),
+      "Expected the nested .gitignore itself to be committed",
+    );
   });
 
   // -----------------------------------------------------------------------

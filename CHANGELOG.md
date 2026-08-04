@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.13.1] — 2026-08-04
+
+### Fixed
+
+- **Async worker no longer killed by the extension itself:** The extension was SIGTERM-ing
+  its own detached background worker in two places — `session_shutdown` (fires immediately
+  after `/commit` returns in print/headless mode, killing the worker before it could boot)
+  and the 6-second `hideCommitterWidget` timer (killing any background commit that needed
+  more than a few seconds, e.g. a real LLM message-generation call). The worker is forked
+  detached + `unref()`'d with its own 5-minute timeout precisely so it can finish after the
+  session ends; both kills are removed. Only the explicit Escape key still cancels a running
+  worker. This fixes GitHub issue #1's symptom end-to-end (installed under `node_modules`,
+  many files, `/commit` in print mode now produces a background commit instead of silently
+  nothing) and makes the async e2e test reliable (~11s instead of a racing multi-minute
+  poll).
+
 ## [0.13.0] — 2026-08-04
 
 ### Added

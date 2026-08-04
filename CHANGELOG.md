@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.13.0] — 2026-08-04
+
+### Added
+
+- **`match_repo_style` config option (default `false`):** Opt-in consistency with the
+  repository's own commit history. When enabled, the last 15 commit messages are sampled
+  from `git log` and passed to message generation as style context; types and scopes are
+  constrained to those the repo actually uses. When disabled (the default), no `git log`
+  sampling occurs at all. Configured via the TOML/JSON key `match_repo_style`.
+
+### Changed
+
+- **Content-driven deterministic fallback:** The deterministic commit message is now derived
+  from the actual added/removed lines of the diff (hunk-aware parsing) instead of file
+  names, and always includes a structured body describing what changed and why. The
+  filename-only `chore: update N file(s)` style of message has been removed from every
+  commit path (single, grouped, and async worker).
+- **Block instead of substitute:** When no detailed content can be extracted from a diff,
+  the commit is skipped with a clear warning instead of committing a generic message.
+- **Subagent prompt quality:** Message-generation prompts now demand specific what/why
+  detail with rejected examples; empty or invalid-format subagent output triggers one
+  retry with stricter instructions before escalating to the deterministic fallback.
+- **Async worker parity:** The fork worker (`async-commit-worker.ts`) mirrors all
+  message-quality logic — content-driven fallback, style sampling, retry/escalation, and
+  the block gate — so background commits follow the same rules.
+
+### Fixed
+
+- **Stale widget timer race:** A 6-second hide-widget timer could clobber the state of a
+  newer commit operation (e.g. one started within the same window). The timer now carries
+  an expected-state guard; this also prevented a crash on a stale extension ctx in
+  headless/print mode.
+- **E2E harness robustness:** Broken assertions and timing in the e2e suite were fixed
+  (gitignore-visibility checks, grouping-threshold configuration, async baseline race), and
+  the harness now creates its own `extensions/pi-committer` symlink when missing so the
+  suite is reproducible from a fresh clone.
+
 ## [0.12.8] — 2026-06-10
 
 ### Fixed

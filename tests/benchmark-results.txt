@@ -1,62 +1,62 @@
-# Benchmark results — 2026-06-07T18:12:24.375Z
+# Benchmark results — 2026-08-04T22:57:55.701Z
 # Git: git version 2.50.1 (Apple Git-155)
 # Run: 57 measurements
 
 Operation                                     Size     Avg (ms)   Min (ms)   Max (ms)   Runs
-getDiffContent                                small    14.79      14.22      15.82      3
-getDiffContent                                medium   17.76      17.24      18.41      3
-getDiffContent                                large    25.8       25.04      27.19      3
-filterGitignoredFiles                         small    13.62      13.18      14.06      3
-filterGitignoredFiles                         medium   13.09      13         13.16      3
-filterGitignoredFiles                         large    13.63      13.22      14         3
-unstageExcludedFiles                          small    14.34      14.03      14.75      3
-unstageExcludedFiles                          medium   14.99      14.64      15.34      3
-unstageExcludedFiles                          large    17.07      16.62      17.39      3
-stageAll                                      small    43.79      42.45      45.97      3
-stageAll                                      medium   54.95      48.96      66.69      3
-stageAll                                      large    84.98      66.58      121.54     3
+getDiffContent                                small    18.14      16.7       20.21      3
+getDiffContent                                medium   20.94      20.68      21.16      3
+getDiffContent                                large    32.51      32.16      32.72      3
+filterGitignoredFiles                         small    16.45      16.06      16.72      3
+filterGitignoredFiles                         medium   17.43      17.19      17.89      3
+filterGitignoredFiles                         large    19.84      17.3       22.93      3
+unstageExcludedFiles                          small    20.17      17.94      22.24      3
+unstageExcludedFiles                          medium   18.45      17.19      19.76      3
+unstageExcludedFiles                          large    21.63      19.22      23.66      3
+stageAll                                      small    54.13      51.96      56.65      3
+stageAll                                      medium   63.16      56.9       74.88      3
+stageAll                                      large    94.1       69.82      136.7      3
 getChangedFiles (parse)                       small    0.01       0          0.01       3
 getChangedFiles (parse)                       medium   0.02       0.01       0.03       3
 getChangedFiles (parse)                       large    0.03       0.02       0.05       3
-git commit                                    small    22.39      21.44      23.64      3
-git commit                                    medium   23.12      21.41      26.17      3
-git commit                                    large    27.49      24.35      33.75      3
-full pipeline stagedCommits=on                small    82.81      82.58      83.05      3
-full pipeline stagedCommits=on                medium   105.75     103.79     108.7      3
-full pipeline stagedCommits=on                large    165.52     165.02     166.16     3
-full pipeline stagedCommits=off               small    83.15      82.61      83.74      3
-full pipeline stagedCommits=off               medium   105.91     104.08     107.16     3
-full pipeline stagedCommits=off               large    166.73     165.77     167.48     3
-deterministicCommitMessage                    small    0.19       0.03       0.5        3
-deterministicCommitMessage                    medium   0.11       0.08       0.16       3
-deterministicCommitMessage                    large    0.45       0.43       0.47       3
-parseCommitGroups                             small    0.11       0          0.27       3
-parseCommitGroups                             medium   0.02       0.01       0.03       3
-parseCommitGroups                             large    0.05       0.04       0.05       3
-resolveWorkerExecArgv (non-nm)                100      0          0          0.02       100
-_findJitiRegisterForPath (nm)                 100      0          0          0.04       100
+git commit                                    small    29.72      28.56      31.17      3
+git commit                                    medium   30.91      28.53      34.92      3
+git commit                                    large    31.19      27.42      37.17      3
+full pipeline stagedCommits=on                small    104.08     99.58      110.03     3
+full pipeline stagedCommits=on                medium   124.59     120.66     129.45     3
+full pipeline stagedCommits=on                large    186.56     185.67     187.43     3
+full pipeline stagedCommits=off               small    99.35      91.7       106.24     3
+full pipeline stagedCommits=off               medium   126.17     123.58     129.95     3
+full pipeline stagedCommits=off               large    179.42     176.27     183.6      3
+deterministicCommitMessage                    small    0.35       0.02       0.96       3
+deterministicCommitMessage                    medium   0.13       0.11       0.18       3
+deterministicCommitMessage                    large    0.26       0.23       0.31       3
+parseCommitGroups                             small    0.12       0.01       0.31       3
+parseCommitGroups                             medium   0.03       0.02       0.04       3
+parseCommitGroups                             large    0.05       0.05       0.06       3
+resolveWorkerExecArgv (non-nm)                100      0          0          0.04       100
+_findJitiRegisterForPath (nm)                 100      0          0          0.06       100
 _findJitiRegisterForPath (no-nm)              100      0          0          0.01       100
 resolveWorkerExecArgv (nm+jiti)               100      0          0          0.01       100
-tryCommit single-commit                       1        121.65     120.05     124.51     3
-tryCommit single-commit                       2        120.95     119.73     122.29     3
-tryCommit single-commit                       3        91.91      88.23      96.51      3
-tryCommit single-commit                       5        95.37      88.48      99.32      3
-tryCommit single-commit                       10       102.75     93.43      109.35     3
-tryCommit single-commit                       15       117.52     106.58     127.63     3
-tryCommit single-commit                       30       128.35     122.79     136.01     3
-tryCommit single-commit                       100      182.45     169.42     196.77     3
-tryCommit grouped                             5        105.83     102.87     108.51     3
-tryCommit grouped                             10       122.24     113.81     126.96     3
-tryCommit grouped                             15       126.83     124.15     128.69     3
-tryCommit grouped                             30       142.66     139.13     144.6      3
-tryCommit grouped                             100      188.04     178.5      198.79     3
-threshold sweep (15 files)                    1        116.85     111.65     122.11     3
-threshold sweep (15 files)                    4        130        126.81     132.4      3
-threshold sweep (15 files)                    10       124.4      123.84     125.35     3
-threshold sweep (15 files)                    15       124.91     122.23     127.09     3
-threshold sweep (15 files)                    30       124.27     121.17     126.91     3
-threshold sweep (15 files)                    100      124.57     121.03     130.29     3
-stageFiles one-by-one (1k)                    1020     14216.29   14216.29   14216.29   1
-stageFiles batched (1k)                       1020     17.69      17.69      17.69      1
-full pipeline batched (10k)                   10020    131.82     131.82     131.82     1
-per-file extrapolated (10k)                   10020    138788.58  138788.58  138788.58  1
+tryCommit single-commit                       1        139.93     137.85     142.12     3
+tryCommit single-commit                       2        136        133.88     137.45     3
+tryCommit single-commit                       3        101.74     98.07      106.12     3
+tryCommit single-commit                       5        114        104.89     130.19     3
+tryCommit single-commit                       10       123.12     106.89     134.34     3
+tryCommit single-commit                       15       135.33     119.78     163.63     3
+tryCommit single-commit                       30       154.23     136.61     181.52     3
+tryCommit single-commit                       100      212.42     190.72     243.06     3
+tryCommit grouped                             5        138.03     124.66     155.85     3
+tryCommit grouped                             10       154.19     148.23     165.07     3
+tryCommit grouped                             15       132.74     125.23     140.15     3
+tryCommit grouped                             30       144.3      141.39     146.63     3
+tryCommit grouped                             100      205.02     195.56     210.89     3
+threshold sweep (15 files)                    1        129.12     122.84     132.71     3
+threshold sweep (15 files)                    4        139.59     130.54     147.42     3
+threshold sweep (15 files)                    10       141.46     136.36     145.92     3
+threshold sweep (15 files)                    15       137.89     133.64     142.67     3
+threshold sweep (15 files)                    30       135.93     129.52     141.54     3
+threshold sweep (15 files)                    100      144.95     128.01     162.15     3
+stageFiles one-by-one (1k)                    1020     16089.16   16089.16   16089.16   1
+stageFiles batched (1k)                       1020     19         19         19         1
+full pipeline batched (10k)                   10020    146.45     146.45     146.45     1
+per-file extrapolated (10k)                   10020    169514.57  169514.57  169514.57  1

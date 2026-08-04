@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 # e2e harness expects a symlink at extensions/pi-committer -> ..
 extensions/
+
+# npm pack artifacts
+*.tgz

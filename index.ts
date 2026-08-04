@@ -350,17 +350,6 @@ function updateCommitterWidget(): void {
   __committerWidgetComponent?.update();
 }
 
-function killAsyncSubprocess(): void {
-  if (__asyncChildProcess && !__asyncChildProcess.killed) {
-    try {
-      __asyncChildProcess.kill("SIGTERM");
-    } catch {
-      // Process may have already exited
-    }
-    __asyncChildProcess = null;
-  }
-}
-
 function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: CommitterProgress | null): void {
   // Guard against stale hide timers: a timer scheduled for a previous commit
   // operation must not clobber the state of a newer one that is still running.
@@ -368,7 +357,12 @@ function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: Committer
     return;
   }
   stopCommitterAnimation();
-  killAsyncSubprocess();
+  // NOTE: deliberately NOT killing the async worker here. The worker is
+  // forked detached + unref'd (and carries its own 5-minute timeout) so it
+  // can finish the background commit even after this widget — or the whole pi
+  // session — is gone. Hiding the widget must not cancel a running commit;
+  // only the explicit Escape key does that (see the onTerminalInput handler
+  // in showCommitterWidget).
   if (__committerTerminalInputUnsub) {
     __committerTerminalInputUnsub();
     __committerTerminalInputUnsub = null;
@@ -3048,7 +3042,11 @@ export default function (pi: ExtensionAPI) {
   // Session shutdown — clean up per-session state
   // -----------------------------------------------------------------------
   pi.on("session_shutdown", async (_event, _ctx) => {
-    // Kill any running async subprocess
-    killAsyncSubprocess();
+    // Do NOT kill the async worker here. It is forked detached + unref'd and
+    // carries its own 5-minute timeout, so it is designed to finish the
+    // background commit after this session ends — essential in print/headless
+    // mode, where the session closes right after /commit returns. Killing it
+    // here silently aborted background commits whenever the worker needed
+    // longer than the session lifetime.
   });
 }

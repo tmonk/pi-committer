@@ -359,30 +359,34 @@ function updateCommitterWidget(): void {
   __committerWidgetComponent?.update();
 }
 
-function killAsyncSubprocess(): void {
-  if (__asyncChildProcess && !__asyncChildProcess.killed) {
-    try {
-      __asyncChildProcess.kill("SIGTERM");
-    } catch {
-      // Process may have already exited
-    }
-    __asyncChildProcess = null;
+function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: CommitterProgress | null): void {
+  // Guard against stale hide timers: a timer scheduled for a previous commit
+  // operation must not clobber the state of a newer one that is still running.
+  if (expectedProgress !== undefined && __committerProgress !== expectedProgress) {
+    return;
   }
-}
-
-function hideCommitterWidget(ctx: ExtensionContext): void {
   if (__committerHideTimer) {
     clearTimeout(__committerHideTimer);
     __committerHideTimer = null;
   }
   stopCommitterAnimation();
-  killAsyncSubprocess();
+  // NOTE: deliberately NOT killing the async worker here. The worker is
+  // forked detached + unref'd (and carries its own 5-minute timeout) so it
+  // can finish the background commit even after this widget — or the whole pi
+  // session — is gone. Hiding the widget must not cancel a running commit;
+  // only the explicit Escape key does that (see the onTerminalInput handler
+  // in showCommitterWidget).
   if (__committerTerminalInputUnsub) {
     __committerTerminalInputUnsub();
     __committerTerminalInputUnsub = null;
   }
-  if (ctx.hasUI) {
-    ctx.ui.setWidget(COMMITTER_WIDGET_KEY, undefined);
+  try {
+    if (ctx.hasUI) {
+      ctx.ui.setWidget(COMMITTER_WIDGET_KEY, undefined);
+    }
+  } catch {
+    // The ctx can be stale when a delayed hide timer fires after the session
+    // ended (print/headless mode) — hiding the widget is impossible then.
   }
   __committerWidgetComponent = null;
   __committerAbortController = null;
@@ -868,14 +872,15 @@ export function singleGroupFallback(
   allFiles: string[],
   repoDir?: string,
   signal?: AbortSignal,
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
 ): Promise<CommitGroup[]> {
   // If the signal is already aborted, return a deterministic fallback immediately
   // instead of spawning a new subagent session that will just be cancelled.
   if (signal?.aborted) {
-    const message = deterministicCommitMessage(diffStat, diffContent);
+    const message = deterministicCommitMessage(diffStat, diffContent, allFiles, style);
     return Promise.resolve([{ message, files: allFiles }]);
   }
-  return generateCommitMessageViaSubagent(ctx, diffStat, diffContent, repoDir, undefined, signal).then(
+  return generateCommitMessageViaSubagent(ctx, diffStat, diffContent, repoDir, undefined, signal, style).then(
     (message) => [{ message, files: allFiles }],
   );
 }
@@ -893,6 +898,7 @@ export async function generateStagedCommitGroups(
   repoDir?: string,
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
 ): Promise<CommitGroup[]> {
   const _ts = performance.now();
   const truncatedDiff =
@@ -912,6 +918,8 @@ export async function generateStagedCommitGroups(
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
     "- Scope: use the single most-specific directory for each group (e.g. 'api', 'exposure', 'config'). NEVER comma-join multiple scopes. If files in a group span unrelated directories, OMIT scope.",
     "- Description: a SHORT imperative phrase summarizing what each group does. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
+    "- NEVER write generic filler in any group's header. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes'. Each header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
+    "- Body: for each group, write a short paragraph explaining what changed and WHY. Never restate the header verbatim.",
     "- Max 72 chars per header line (type + scope + description combined).",
     "- Assign each file to EXACTLY ONE group",
     "- Cover ALL files listed below in your groups",
@@ -936,7 +944,14 @@ export async function generateStagedCommitGroups(
     "...",
     "",
     "If all changes belong in one commit, output a single COMMIT GROUP.",
-  ].join("\n");
+  ];
+
+  const styleBlock = formatStyleContext(style);
+  if (styleBlock) {
+    prompt.push("", styleBlock);
+  }
+
+  const promptStr = prompt.join("\n");
 
   try {
     const model = resolveSubagentModel(ctx);
@@ -1027,9 +1042,9 @@ export async function generateStagedCommitGroups(
     try {
       if (signal?.aborted) {
         __lastGroupGenCallMs = performance.now() - _ts;
-        return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
+        return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal, style);
       }
-      await session.prompt(prompt);
+      await session.prompt(promptStr);
     } finally {
       signal?.removeEventListener("abort", abortSession);
       unsubscribe();
@@ -1037,7 +1052,7 @@ export async function generateStagedCommitGroups(
 
     if (signal?.aborted) {
       __lastGroupGenCallMs = performance.now() - _ts;
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal, style);
     }
 
     const output = outputParts.join("\n\n").trim();
@@ -1046,7 +1061,7 @@ export async function generateStagedCommitGroups(
         `[pi-committer] DIAG: subagent grouping returned empty/short output (${output.length} chars) — falling back to single commit`,
       );
       __lastGroupGenCallMs = performance.now() - _ts;
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, repoDir, signal, style);
     }
 
     const groups = parseCommitGroups(output, allFiles);
@@ -1070,7 +1085,7 @@ export async function generateStagedCommitGroups(
         `[pi-committer] DIAG: subagent grouping produced 0 parseable commit groups — falling back to single commit`,
       );
       __lastGroupGenCallMs = performance.now() - _ts;
-      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
+      return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal, style);
     }
 
     __lastGroupGenCallMs = performance.now() - _ts;
@@ -1081,7 +1096,7 @@ export async function generateStagedCommitGroups(
       `[pi-committer] DIAG: subagent grouping threw — falling back to single commit (${msg})`,
     );
     __lastGroupGenCallMs = performance.now() - _ts;
-    return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal);
+    return singleGroupFallback(ctx, diffStat, diffContent, allFiles, undefined, signal, style);
   }
 }
 
@@ -1257,7 +1272,7 @@ function makeMessageResourceLoader(): ResourceLoader {
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () =>
-      "You generate conventional git commit messages from diffs. Be concise.",
+      "You write clear, specific, detailed conventional git commit messages that describe exactly what changed and why.",
     getAppendSystemPrompt: () => [],
     extendResources: () => {},
     reload: async () => {},
@@ -1295,44 +1310,20 @@ export function resolveSubagentModel(ctx: ExtensionContext): Model<any> | undefi
  * Uses createAgentSession with no tools — the diff is passed inline.
  * Falls back to deterministic generation if the subagent fails.
  */
-export async function generateCommitMessageViaSubagent(
+/**
+ * Run one commit-message subagent session. Returns the generated text, or ""
+ * when the session threw, was aborted, or returned empty/short output.
+ */
+async function runCommitMessageSession(
   ctx: ExtensionContext,
-  diffStat: string,
-  diffContent: string,
-  repoDir?: string,
-  onProgress?: (progress: SubagentProgress) => void,
-  signal?: AbortSignal,
+  prompt: string,
+  repoDir: string | undefined,
+  onProgress: ((progress: SubagentProgress) => void) | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<string> {
-  const _ts = performance.now();
-  const truncatedDiff =
-    diffContent.length > 8000
-      ? diffContent.slice(0, 8000) + "\n... (truncated)"
-      : diffContent;
-
-  const prompt = [
-    "Generate a conventional commit message from this git diff.",
-    "",
-    "Format:",
-    "<type>(<scope>): <short description>",
-    "",
-    "<detailed body explaining what changed and why>",
-    "",
-    "Rules:",
-    "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
-    "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
-    "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
-    "- Max 72 chars for the header line (type + scope + description combined).",
-    "- Body: a brief paragraph explaining what changed and why.",
-    "- Output ONLY the commit message, nothing else.",
-    "",
-    "Diff stat:",
-    diffStat,
-    "",
-    "Full diff:",
-    truncatedDiff,
-  ].join("\n");
-
   try {
+    if (signal?.aborted) return "";
+
     const model = resolveSubagentModel(ctx);
     const cas = resolveCreateAgentSession();
     const result = await cas({
@@ -1419,10 +1410,7 @@ export async function generateCommitMessageViaSubagent(
     signal?.addEventListener("abort", abortSession, { once: true });
 
     try {
-      if (signal?.aborted) {
-        __lastSubagentCallMs = performance.now() - _ts;
-        return deterministicCommitMessage(diffStat, diffContent);
-      }
+      if (signal?.aborted) return "";
       await session.prompt(prompt);
     } finally {
       signal?.removeEventListener("abort", abortSession);
@@ -1430,22 +1418,64 @@ export async function generateCommitMessageViaSubagent(
     }
 
     const generated = outputParts.join("\n\n").trim();
-    if (generated.length > 10) {
-      __lastSubagentCallMs = performance.now() - _ts;
-      return generated;
-    }
+    if (generated.length > 10) return generated;
     console.error(
-      `[pi-committer] DIAG: subagent returned empty/short output (${generated.length} chars) — falling back to deterministic`,
+      `[pi-committer] DIAG: subagent returned empty/short output (${generated.length} chars)`,
     );
+    return "";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
-      `[pi-committer] DIAG: subagent message generation threw — falling back to deterministic (${msg})`,
+      `[pi-committer] DIAG: subagent message generation threw (${msg})`,
+    );
+    return "";
+  }
+}
+
+/**
+ * Spawn a QUICK subagent to generate a conventional commit message.
+ * The prompt demands specific what/why detail (never generic filler).
+ * Empty or invalid-format output triggers ONE retry with stricter
+ * instructions before escalating to the content-driven deterministic
+ * fallback.
+ */
+export async function generateCommitMessageViaSubagent(
+  ctx: ExtensionContext,
+  diffStat: string,
+  diffContent: string,
+  repoDir?: string,
+  onProgress?: (progress: SubagentProgress) => void,
+  signal?: AbortSignal,
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+): Promise<string> {
+  const _ts = performance.now();
+  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style);
+
+  let generated = await runCommitMessageSession(ctx, prompt, repoDir, onProgress, signal);
+  if (generated && !isValidCommitMessage(generated)) {
+    console.error(
+      "[pi-committer] DIAG: subagent output is not a valid conventional commit — retrying once with stricter instructions",
+    );
+    generated = await runCommitMessageSession(
+      ctx,
+      prompt +
+        "\n\nYour previous output was rejected: it is not a valid conventional commit message (format: <type>(<scope>): <description> followed by a detailed body). Write a NEW commit message following the format and rules above. Do not repeat the rejected text.",
+      repoDir,
+      onProgress,
+      signal,
     );
   }
 
+  if (generated && isValidCommitMessage(generated)) {
+    __lastSubagentCallMs = performance.now() - _ts;
+    return generated;
+  }
+
+  console.error(
+    "[pi-committer] DIAG: subagent output empty/invalid after retry — escalating to deterministic content analysis",
+  );
   __lastSubagentCallMs = performance.now() - _ts;
-  return deterministicCommitMessage(diffStat, diffContent);
+  return deterministicCommitMessage(diffStat, diffContent, getChangedFiles(diffStat), style);
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,77 +1509,166 @@ export function findCommonAncestor(dirs: string[]): string | undefined {
   return common.join("/");
 }
 
-/**
- * Generate a concise description of changes by extracting meaningful
- * keywords from file names. Avoids generic "update N modules".
- */
-export function summarizeChanges(
-  files: string[],
-  _diffContent: string,
-  scope?: string,
-): string {
-  if (files.length === 0) return "update";
-  if (files.length === 1) {
-    return `update ${path.basename(files[0])}`;
-  }
+/** One file's worth of parsed diff content. */
+export interface DiffFileChange {
+  /** File path from the diff (b/ side). */
+  file: string;
+  /** Meaningful added lines (content). */
+  added: string[];
+  /** Meaningful removed lines (content). */
+  removed: string[];
+  /** Raw added line count. */
+  addedCount: number;
+  /** Raw removed line count. */
+  removedCount: number;
+}
 
-  // Collect meaningful terms from file stems
-  const terms: string[] = [];
-  const seen = new Set<string>();
-
-  for (const f of files) {
-    const stem = path.basename(f).replace(/\.[^.]+$/, "");
-    // Skip boilerplate files
-    if (
-      stem === "__init__" ||
-      stem === "conftest" ||
-      stem === "index"
-    )
-      continue;
-    // Remove test_/e2e_ prefix, convert separators to spaces
-    const cleaned = stem
-      .replace(/^test[-_]/, "")
-      .replace(/^e2e[-_]/, "")
-      .replace(/[-_]/g, " ")
-      .trim();
-    if (cleaned.length < 2) continue;
-    const key = cleaned.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    terms.push(cleaned);
-  }
-
-  const maxTerms = 6;
-  let desc = terms.slice(0, maxTerms).join(", ");
-
-  // Append "and tests" if test files present but not captured in terms
-  const hasTests = files.some(
-    (f) => /\.(test|spec|e2e)\./.test(f) || /\/test_/.test(f),
-  );
-  if (hasTests && !desc.toLowerCase().includes("test")) {
-    desc += ", and tests";
-  }
-
-  if (scope) {
-    const moduleName = scope.split("/").pop() || scope;
-    return `update ${moduleName}: ${desc}`;
-  }
-
-  return `update ${desc}`;
+/** Drop noise lines that add no information to a commit message. */
+function cleanDiffLine(line: string): string | undefined {
+  const t = line.trim();
+  if (!t) return undefined;
+  if (t.length < 3) return undefined;
+  if (/^[{}()\[\];,=+\-*/\\"'`|<>!?.@#%^&]+$/.test(t)) return undefined;
+  if (/^diff --git /.test(t)) return undefined;
+  if (/^index [0-9a-f]+\.\.[0-9a-f]+/.test(t)) return undefined;
+  if (/^@@ /.test(t)) return undefined;
+  if (/^(---|\+\+\+) /.test(t)) return undefined;
+  return t;
 }
 
 /**
- * Deterministic commit message generation — used as fallback when the
- * subagent is unavailable or fails. Produces conventional commit format
- * with smart scope (longest common ancestor) and a concise description
- * derived from file names.
+ * Parse a unified git diff into per-file change summaries with the actual
+ * added/removed content lines. Used to derive detailed, content-driven
+ * deterministic commit messages.
  */
-export function deterministicCommitMessage(
-  diffStat: string,
-  diffContent: string,
-): string {
-  const files = getChangedFiles(diffStat);
+export function parseDiffHunks(diffContent: string): DiffFileChange[] {
+  const files: DiffFileChange[] = [];
+  let current: DiffFileChange | null = null;
+  let inHunk = false;
 
+  for (const raw of diffContent.split("\n")) {
+    if (raw.startsWith("diff --git ")) {
+      if (current) files.push(current);
+      const m = raw.match(/diff --git a\/(.*?) b\/(.*)/);
+      current = {
+        file: m ? m[2] : raw.slice("diff --git ".length),
+        added: [],
+        removed: [],
+        addedCount: 0,
+        removedCount: 0,
+      };
+      inHunk = false;
+      continue;
+    }
+    if (!current) continue;
+    if (raw.startsWith("@@ ")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (raw.startsWith("+++") || raw.startsWith("---")) continue;
+    if (raw.startsWith("+")) {
+      current.addedCount++;
+      const cleaned = cleanDiffLine(raw.slice(1));
+      if (cleaned && current.added.length < 8) current.added.push(cleaned);
+      continue;
+    }
+    if (raw.startsWith("-")) {
+      current.removedCount++;
+      const cleaned = cleanDiffLine(raw.slice(1));
+      if (cleaned && current.removed.length < 8) current.removed.push(cleaned);
+      continue;
+    }
+    // context lines: nothing to record
+  }
+  if (current) files.push(current);
+  return files;
+}
+
+/** Detect binary-only changes ("Binary files a/x and b/x differ"). */
+export function hasBinaryChanges(diffContent: string): boolean {
+  return /Binary files? .* differ/.test(diffContent);
+}
+
+/** First meaningful snippet across changed files (added preferred, then removed). */
+function firstMeaningfulSnippet(
+  changes: DiffFileChange[],
+): { snippet: string; verb: "add" | "remove" } | undefined {
+  for (const c of changes) {
+    if (c.added.length > 0) {
+      return { snippet: c.added[0], verb: "add" };
+    }
+  }
+  for (const c of changes) {
+    if (c.removed.length > 0) {
+      return { snippet: c.removed[0], verb: "remove" };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Derive a header description from actual diff content. Returns "" when the
+ * diff has no extractable content (callers must then block the commit).
+ */
+function describeDiffContent(
+  hunks: DiffFileChange[],
+  files: string[],
+  binaryOnly: boolean,
+): string {
+  if (binaryOnly) {
+    // Binary content changed — the most detailed deterministic description possible
+    const names = files
+      .slice(0, 3)
+      .map((f) => path.basename(f))
+      .join(", ");
+    return `update binary ${names}${files.length > 3 ? " and more" : ""}`;
+  }
+  const first = firstMeaningfulSnippet(hunks);
+  if (!first) return "";
+  let snippet = first.snippet.replace(/[;,.!?]+$/, "").trim();
+  if (snippet.length > 55) snippet = snippet.slice(0, 55).trim() + "\u2026";
+  return `${first.verb} ${snippet}`;
+}
+
+/** Build the structured, always-present body for a deterministic message. */
+function buildDeterministicBody(
+  hunks: DiffFileChange[],
+  files: string[],
+  binaryOnly: boolean,
+  desc: string,
+): string {
+  const totalAdd = hunks.reduce((n, h) => n + h.addedCount, 0);
+  const totalDel = hunks.reduce((n, h) => n + h.removedCount, 0);
+  const fileWord = files.length === 1 ? "file" : "files";
+  const lines: string[] = [];
+
+  if (binaryOnly) {
+    lines.push(`Summary: binary content changed in ${files.length} ${fileWord}.`);
+    for (const f of files.slice(0, 15)) {
+      lines.push(`- ${f}: binary content changed`);
+    }
+    if (files.length > 15) lines.push(`- ... and ${files.length - 15} more`);
+    return lines.join("\n");
+  }
+
+  lines.push(`Summary: ${desc} — ${files.length} ${fileWord}, +${totalAdd}/-${totalDel}.`);
+  for (const h of hunks.slice(0, 15)) {
+    const bits: string[] = [];
+    if (h.added.length > 0) bits.push(`+${h.addedCount} ${h.added[0]}`);
+    if (h.removed.length > 0) bits.push(`-${h.removedCount} ${h.removed[0]}`);
+    lines.push(`- ${h.file}: ${bits.join(", ")}`);
+  }
+  if (hunks.length > 15) lines.push(`- ... and ${hunks.length - 15} more files`);
+  return lines.join("\n");
+}
+
+/** Detect the conventional type from files and diff content, constrained to repo style. */
+function detectCommitType(
+  diffContent: string,
+  files: string[],
+  style: RepoCommitStyle,
+): string {
   let type = "chore";
   if (files.some((f) => /\.(test|spec|e2e)\./.test(f) || f.startsWith("test")))
     type = "test";
@@ -1557,32 +1676,262 @@ export function deterministicCommitMessage(
     type = "docs";
   else if (files.some((f) => f.includes("config") || f.includes("package")))
     type = "chore";
-  else if (
-    diffContent.includes("fix") ||
-    diffContent.includes("bug") ||
-    diffContent.includes("error")
-  )
+  else if (/(^|[^a-z])(fix|bug|error|crash|issue)([^a-z]|$)/i.test(diffContent))
     type = "fix";
-  else if (
-    diffContent.includes("feat") ||
-    diffContent.includes("add") ||
-    diffContent.includes("new")
-  )
+  else if (/(^|[^a-z])(feat|feature|add|new|implement)([^a-z]|$)/i.test(diffContent))
     type = "feat";
 
-  // Compute smart scope: longest common ancestor directory, or omit
-  const dirs = files.map((f) => path.dirname(f)).filter((d) => d !== ".");
-  const scope = findCommonAncestor(dirs);
+  // Constrain to types the repo actually uses when style sampling is enabled:
+  // if the heuristic type never appears in recent history, use the dominant one.
+  if (style.types.length > 0 && !style.types.includes(type)) {
+    let dominant = "";
+    let max = 0;
+    for (const [t, n] of Object.entries(style.typeCounts)) {
+      if (n > max) {
+        max = n;
+        dominant = t;
+      }
+    }
+    if (dominant) type = dominant;
+  }
+  return type;
+}
 
-  // Generate a descriptive summary from file names
-  const desc = summarizeChanges(files, diffContent, scope);
+/** Truncate a header to the conventional 72-char limit without losing the type/scope. */
+function enforceHeaderLimit(header: string): string {
+  if (header.length <= 72) return header;
+  const colon = header.indexOf(": ");
+  if (colon < 0) return header.slice(0, 72);
+  const prefix = header.slice(0, colon + 2);
+  const desc = header.slice(colon + 2);
+  const maxDesc = Math.max(20, 72 - prefix.length - 1);
+  return prefix + desc.slice(0, maxDesc).trim() + "\u2026";
+}
+
+// ---------------------------------------------------------------------------
+// Repo style sampling (opt-in via config match_repo_style) and prompt builder
+// ---------------------------------------------------------------------------
+
+/** Style of recent commits in a repository, sampled via git log. */
+export interface RepoCommitStyle {
+  /** Full recent commit messages (header + body). */
+  history: string[];
+  /** Conventional types used in recent history. */
+  types: string[];
+  /** Type frequency counts (dominant type wins constraints). */
+  typeCounts: Record<string, number>;
+  /** Scopes used in recent history. */
+  scopes: string[];
+  /** Whether every sampled commit is header-only (no body). */
+  headerOnly: boolean;
+  /** First line of the most recent commit. */
+  recentHeader: string;
+}
+
+/** Empty style — used when style sampling is disabled or a repo has no history. */
+export const EMPTY_COMMIT_STYLE: RepoCommitStyle = {
+  history: [],
+  types: [],
+  typeCounts: {},
+  scopes: [],
+  headerOnly: true,
+  recentHeader: "",
+};
+
+/**
+ * Sample the repo's recent commit style: the last `count` commit messages,
+ * plus the conventional types and scopes they actually use. Used to make
+ * generated messages consistent with the repository's commit history.
+ * Only called when the opt-in `match_repo_style` config is enabled.
+ */
+export function sampleRepoCommitStyle(dir: string, count = 15): RepoCommitStyle {
+  try {
+    // NUL-separate messages (%x00) — blank lines are ambiguous because
+    // message bodies also contain them.
+    const raw = execSync(`git log -${count} --format=%x00%B`, {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (!raw.trim()) return EMPTY_COMMIT_STYLE;
+
+    const messages = raw
+      .split("\x00")
+      .map((m) => m.trim())
+      .filter(Boolean)
+      .slice(0, count);
+
+    const types = new Set<string>();
+    const typeCounts: Record<string, number> = {};
+    const scopes = new Set<string>();
+    let withBody = 0;
+
+    for (const m of messages) {
+      const first = m.split("\n")[0];
+      const tm = first.match(/^([a-z]+)(?:\(([^)]+)\))?:/i);
+      if (tm) {
+        const t = tm[1].toLowerCase();
+        types.add(t);
+        typeCounts[t] = (typeCounts[t] ?? 0) + 1;
+        if (tm[2]) {
+          for (const s of tm[2].split(/[,\s]+/)) {
+            if (s) scopes.add(s);
+          }
+        }
+      }
+      if (m.includes("\n")) withBody++;
+    }
+
+    return {
+      history: messages,
+      types: [...types],
+      typeCounts,
+      scopes: [...scopes],
+      headerOnly: withBody === 0,
+      recentHeader: messages[0]?.split("\n")[0] ?? "",
+    };
+  } catch {
+    return EMPTY_COMMIT_STYLE;
+  }
+}
+
+/**
+ * Format the sampled repo style as guidance text for a subagent prompt.
+ * Empty when there is no history to sample.
+ */
+export function formatStyleContext(style: RepoCommitStyle): string {
+  if (style.history.length === 0) return "";
+  const parts: string[] = [
+    "Recent commit style in this repository — MATCH this style (types, scopes, tone):",
+  ];
+  for (const m of style.history.slice(0, 8)) {
+    parts.push(m.split("\n")[0]);
+  }
+  if (style.types.length > 0) {
+    parts.push(`Types used in this repo: ${style.types.join(", ")} — prefer these; deviate only when clearly necessary.`);
+  }
+  if (style.scopes.length > 0) {
+    parts.push(`Scopes used in this repo: ${style.scopes.join(", ")} — prefer these when applicable.`);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Build the subagent prompt for single-commit message generation.
+ * Includes the diff, conventional-commit rules, detail requirements with
+ * bad/good examples, and the sampled repo style when available.
+ */
+export function buildCommitMessagePrompt(
+  diffStat: string,
+  diffContent: string,
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+): string {
+  const truncatedDiff =
+    diffContent.length > 8000
+      ? diffContent.slice(0, 8000) + "\n... (truncated)"
+      : diffContent;
+
+  const lines = [
+    "Generate a conventional commit message from this git diff.",
+    "",
+    "Format:",
+    "<type>(<scope>): <short description>",
+    "",
+    "<detailed body explaining what changed and why>",
+    "",
+    "Rules:",
+    "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
+    "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
+    "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
+    "- NEVER write generic filler. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes', 'update exposure: config'. The header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
+    "- Body: explain what changed and WHY in a short paragraph, referencing specific code from the diff. Never restate the header verbatim.",
+    "- Max 72 chars for the header line (type + scope + description combined).",
+    "- Output ONLY the commit message, nothing else.",
+  ];
+
+  const styleBlock = formatStyleContext(style);
+  if (styleBlock) {
+    lines.push("", styleBlock);
+  }
+  lines.push("", "Diff stat:", diffStat, "", "Full diff:", truncatedDiff);
+  return lines.join("\n");
+}
+
+/**
+ * Deterministic commit message generation — used as fallback when the
+ * subagent is unavailable or fails. Content-driven: derives the description
+ * from the actual added/removed diff lines, never from file names alone, and
+ * always includes a structured body. Returns "" when the diff has no
+ * extractable content — callers must then skip/block the commit rather than
+ * emit a generic message.
+ */
+export function deterministicCommitMessage(
+  diffStat: string,
+  diffContent: string,
+  files?: string[],
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+): string {
+  const changed = files && files.length > 0 ? files : getChangedFiles(diffStat);
+
+  // Only analyze hunks for the files in this change set (matters for group fallbacks)
+  const hunks = parseDiffHunks(diffContent).filter(
+    (h) => changed.length === 0 || changed.includes(h.file),
+  );
+  const binaryOnly =
+    hunks.every((h) => h.addedCount === 0 && h.removedCount === 0) &&
+    hasBinaryChanges(diffContent);
+
+  const type = detectCommitType(diffContent, changed, style);
+
+  // Scope: longest common ancestor, normalized to a repo-used scope when possible
+  const dirs = changed.map((f) => path.dirname(f)).filter((d) => d !== ".");
+  const ancestor = findCommonAncestor(dirs);
+  let scope = ancestor;
+  if (ancestor && style.scopes.length > 0) {
+    const leaf = ancestor.split("/").pop() || ancestor;
+    if (style.scopes.includes(ancestor)) scope = ancestor;
+    else if (style.scopes.includes(leaf)) scope = leaf;
+    else if (style.scopes.some((s) => ancestor.endsWith(s)))
+      scope = style.scopes.find((s) => ancestor.endsWith(s))!;
+  }
+
+  // Description from actual diff content — empty means "block, no generic message"
+  const desc = describeDiffContent(hunks, changed, binaryOnly);
+  if (!desc) return "";
 
   const scopePart = scope ? `(${scope})` : "";
-  const header = `${type}${scopePart}: ${desc}`;
+  const header = enforceHeaderLimit(`${type}${scopePart}: ${desc}`);
+  const body = buildDeterministicBody(hunks, changed, binaryOnly, desc);
+  return `${header}\n\n${body}`;
+}
 
-  if (!diffStat.trim()) return header;
+/**
+ * Resolve the final message to commit: validates conventional format and
+ * falls back to the content-driven deterministic generator. Returns undefined
+ * to block the commit when no detailed valid message can be produced — a
+ * generic message is never committed. No boilerplate-pattern detector is used.
+ */
+export function resolveCommitMessage(
+  message: string,
+  diffStat: string,
+  diffContent: string,
+  files: string[],
+  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+): string | undefined {
+  if (isValidCommitMessage(message)) return message;
 
-  return `${header}\n\n${desc}`;
+  console.error(
+    `[pi-committer] DIAG: generated message invalid — regenerating deterministically: ${JSON.stringify(message.slice(0, 120))}`,
+  );
+  const fallback = deterministicCommitMessage(diffStat, diffContent, files, style);
+  if (!fallback || !isValidCommitMessage(fallback)) {
+    console.error(
+      "[pi-committer] DIAG: deterministic regeneration produced no detailed valid message — blocking commit",
+    );
+    return undefined;
+  }
+  return fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -1636,9 +1985,13 @@ export async function commitStaged(
 
   const diffContent = precomputedDiffContent ?? getDiffContent(dir);
 
+  // Opt-in repo-style sampling: only when match_repo_style is enabled do we
+  // read the repo's git history for style context (default: no git-log calls).
+  const style = config.matchRepoStyle ? sampleRepoCommitStyle(dir) : EMPTY_COMMIT_STYLE;
+
   try {
     const message = skipSubagent
-      ? deterministicCommitMessage(diffStat, diffContent)
+      ? deterministicCommitMessage(diffStat, diffContent, files, style)
       : await generateCommitMessageViaSubagent(
           ctx,
           diffStat,
@@ -1646,6 +1999,7 @@ export async function commitStaged(
           dir,
           onProgress,
           signal,
+          style,
         );
 
     // Check for abort before actually committing — the subagent may have been
@@ -1655,10 +2009,23 @@ export async function commitStaged(
       return undefined;
     }
 
-    const finalMessage =
-      isValidCommitMessage(message)
-        ? message
-        : `chore: update ${files.length} file(s)`;
+    // Validate and regenerate; block (never commit a generic message) when no
+    // detailed valid message can be produced.
+    const finalMessage = resolveCommitMessage(
+      message,
+      diffStat,
+      diffContent,
+      files,
+      style,
+    );
+    if (finalMessage === undefined) {
+      unstageAll(dir);
+      ctx.ui.notify(
+        "[pi-committer] Skipped commit: could not produce a detailed commit message. Your changes were unstaged and left untouched — run /commit again or commit manually.",
+        "warning",
+      );
+      return undefined;
+    }
 
     execSync("git commit -F -", {
       cwd: dir,
@@ -1773,6 +2140,9 @@ export async function tryCommit(
       // creates the __committerAbortController, so Esc cancellation flows through.
       const opSignal = combineAbortSignals(runtimeSignal, getAbortSignal());
 
+      // Opt-in repo-style sampling for the grouped path (default: no git-log calls)
+      const style = config.matchRepoStyle ? sampleRepoCommitStyle(dir) : EMPTY_COMMIT_STYLE;
+
       const groups = await generateStagedCommitGroups(
         ctx,
         diffStat,
@@ -1786,6 +2156,7 @@ export async function tryCommit(
           }
         },
         opSignal,
+        style,
       );
 
       // If aborted, unstage all and cancel fully (not fallthrough to single commit)
@@ -1832,10 +2203,24 @@ export async function tryCommit(
         );
         if (allFailed) continue;
 
-        // Validate group message before committing; fall back to deterministic if garbled
-        const groupFinalMessage = isValidCommitMessage(group.message)
-          ? group.message
-          : deterministicCommitMessage(diffStat, diffContent);
+        // Validate group message before committing; regenerate deterministically
+        // if garbled, and skip the group (never commit a generic message) when no
+        // detailed valid message can be produced.
+        const groupFinalMessage = resolveCommitMessage(
+          group.message,
+          diffStat,
+          diffContent,
+          groupFiles,
+          style,
+        );
+        if (groupFinalMessage === undefined) {
+          unstageAll(dir);
+          ctx.ui.notify(
+            "[pi-committer] Skipped group — could not produce a detailed, valid commit message (nothing generic was committed)",
+            "warning",
+          );
+          continue;
+        }
 
         try {
           execSync("git commit -F -", {
@@ -1945,6 +2330,8 @@ export async function tryCommit(
     }
 
     // Auto-hide the widget after 6 seconds (unless abort was triggered, then hide immediately)
+    // Capture the progress object so a stale timer can't wipe a newer operation.
+    const expectedProgress = __committerProgress;
     if (runtimeSignal?.aborted || isAborted()) {
       scheduleHideCommitterWidget(ctx, 3000);
     } else {
@@ -2144,6 +2531,7 @@ async function tryCommitAsync(
         subagentGroupingMinFiles: config.subagentGroupingMinFiles,
         subagentMessageMinFiles: config.subagentMessageMinFiles,
         subagentThinkingLevel: config.subagentThinkingLevel,
+        matchRepoStyle: config.matchRepoStyle,
       },
     });
 
@@ -2676,7 +3064,14 @@ export default function (pi: ExtensionAPI) {
   // Session shutdown — clean up per-session state
   // -----------------------------------------------------------------------
   pi.on("session_shutdown", async (_event, ctx) => {
-    // Cancel delayed UI cleanup before this context becomes stale.
+    // Cancel any delayed UI cleanup before this context becomes stale, and
+    // clear the widget. Do NOT kill the async worker here: it is forked
+    // detached + unref'd with its own 5-minute timeout, so it is designed to
+    // finish the background commit after this session ends — essential in
+    // print/headless mode, where the session closes right after /commit
+    // returns. Killing it here silently aborted background commits whenever
+    // the worker needed longer than the session lifetime. Only the explicit
+    // Escape key cancels a running worker (see showCommitterWidget).
     hideCommitterWidget(ctx);
   });
 }

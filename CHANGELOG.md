@@ -1,12 +1,70 @@
 # Changelog
 
-## [0.12.8] — 2026-06-10
+## [Unreleased]
 
 ### Fixed
 
 - **Safe widget cleanup on session shutdown:** Delayed widget cleanup timers are now tracked
-  and cancelled during `session_shutdown`, preventing stale extension-context access from
-  crashing Pi after a successful commit.
+  in a single timer and cancelled during `session_shutdown`, preventing stale
+  extension-context access from crashing Pi after a successful commit. (PR #2)
+
+## [0.13.1] — 2026-08-04
+
+### Fixed
+
+- **Async worker no longer killed by the extension itself:** The extension was SIGTERM-ing
+  its own detached background worker in two places — `session_shutdown` (fires immediately
+  after `/commit` returns in print/headless mode, killing the worker before it could boot)
+  and the 6-second `hideCommitterWidget` timer (killing any background commit that needed
+  more than a few seconds, e.g. a real LLM message-generation call). The worker is forked
+  detached + `unref()`'d with its own 5-minute timeout precisely so it can finish after the
+  session ends; both kills are removed. Only the explicit Escape key still cancels a running
+  worker. This fixes GitHub issue #1's symptom end-to-end (installed under `node_modules`,
+  many files, `/commit` in print mode now produces a background commit instead of silently
+  nothing) and makes the async e2e test reliable (~11s instead of a racing multi-minute
+  poll).
+
+## [0.13.0] — 2026-08-04
+
+### Added
+
+- **`match_repo_style` config option (default `false`):** Opt-in consistency with the
+  repository's own commit history. When enabled, the last 15 commit messages are sampled
+  from `git log` and passed to message generation as style context; types and scopes are
+  constrained to those the repo actually uses. When disabled (the default), no `git log`
+  sampling occurs at all. Configured via the TOML/JSON key `match_repo_style`.
+
+### Changed
+
+- **Content-driven deterministic fallback:** The deterministic commit message is now derived
+  from the actual added/removed lines of the diff (hunk-aware parsing) instead of file
+  names, and always includes a structured body describing what changed and why. The
+  filename-only `chore: update N file(s)` style of message has been removed from every
+  commit path (single, grouped, and async worker).
+- **Block instead of substitute:** When no detailed content can be extracted from a diff,
+  the commit is skipped with a clear warning instead of committing a generic message.
+- **Subagent prompt quality:** Message-generation prompts now demand specific what/why
+  detail with rejected examples; empty or invalid-format subagent output triggers one
+  retry with stricter instructions before escalating to the deterministic fallback.
+- **Async worker parity:** The fork worker (`async-commit-worker.ts`) mirrors all
+  message-quality logic — content-driven fallback, style sampling, retry/escalation, and
+  the block gate — so background commits follow the same rules.
+
+### Fixed
+
+- **Stale widget timer race:** A 6-second hide-widget timer could clobber the state of a
+  newer commit operation (e.g. one started within the same window). The timer now carries
+  an expected-state guard; this also prevented a crash on a stale extension ctx in
+  headless/print mode.
+- **E2E harness robustness:** Broken assertions and timing in the e2e suite were fixed
+  (gitignore-visibility checks, grouping-threshold configuration, async baseline race), and
+  the harness now creates its own `extensions/pi-committer` symlink when missing so the
+  suite is reproducible from a fresh clone.
+
+## [0.12.8] — 2026-06-10
+
+### Fixed
+
 - **Commit message contamination guard:** Added `isValidDiffContent()`, `isValidDiffStat()`,
   and `isValidCommitMessage()` validation functions that prevent non-diff output (e.g.
   from unrelated shell commands like `df`) from leaking into commit messages. Validation

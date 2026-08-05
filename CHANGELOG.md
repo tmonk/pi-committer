@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Safe widget cleanup on session shutdown:** Delayed widget cleanup timers are now tracked
+  in a single timer and cancelled during `session_shutdown`, preventing stale
+  extension-context access from crashing Pi after a successful commit. (PR #2)
+
 ## [0.13.1] — 2026-08-04
 
 ### Fixed

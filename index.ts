@@ -233,6 +233,23 @@ let __asyncCommitFileCount = 0;
 export function _getCommitterProgress(): CommitterProgress | null {
   return __committerProgress;
 }
+/** Export for unit tests. */
+export function _hasPendingCommitterHide(): boolean {
+  return __committerHideTimer !== null;
+}
+
+function cancelPendingCommitterHide(): void {
+  if (__committerHideTimer) {
+    clearTimeout(__committerHideTimer);
+    __committerHideTimer = null;
+  }
+}
+
+/** Export for unit tests: cancel a pending delayed hide timer (e.g. one leaked
+ * from an earlier test that used real timers). */
+export function _cancelPendingCommitterHide(): void {
+  cancelPendingCommitterHide();
+}
 
 // ---------------------------------------------------------------------------
 // Widget state
@@ -242,6 +259,7 @@ const COMMITTER_WIDGET_KEY = "pi-committer";
 let __committerProgress: CommitterProgress | null = null;
 let __committerWidgetComponent: CommitterWidgetComponent | null = null;
 let __committerAnimationTimer: ReturnType<typeof setInterval> | null = null;
+let __committerHideTimer: ReturnType<typeof setTimeout> | null = null;
 let __committerAbortController: AbortController | null = null;
 let __committerTerminalInputUnsub: (() => void) | null = null;
 
@@ -304,6 +322,10 @@ function showCommitterWidget(
   ctx: ExtensionContext,
   initial: Omit<CommitterProgress, "startedAt" | "commitLog">,
 ): void {
+  if (__committerHideTimer) {
+    clearTimeout(__committerHideTimer);
+    __committerHideTimer = null;
+  }
   if (__committerProgress) hideCommitterWidget(ctx);
 
   __committerAbortController = new AbortController();
@@ -356,6 +378,7 @@ function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: Committer
   if (expectedProgress !== undefined && __committerProgress !== expectedProgress) {
     return;
   }
+  cancelPendingCommitterHide();
   stopCommitterAnimation();
   // NOTE: deliberately NOT killing the async worker here. The worker is
   // forked detached + unref'd (and carries its own 5-minute timeout) so it
@@ -380,6 +403,15 @@ function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: Committer
   __committerProgress = null;
   __asyncCommitStarted = false;
   __asyncCommitFileCount = 0;
+}
+
+function scheduleHideCommitterWidget(ctx: ExtensionContext, delayMs: number): void {
+  if (__committerHideTimer) clearTimeout(__committerHideTimer);
+  __committerHideTimer = setTimeout(() => {
+    __committerHideTimer = null;
+    hideCommitterWidget(ctx);
+  }, delayMs);
+  __committerHideTimer.unref?.();
 }
 
 function getAbortSignal(): AbortSignal | undefined {
@@ -2311,9 +2343,9 @@ export async function tryCommit(
     // Capture the progress object so a stale timer can't wipe a newer operation.
     const expectedProgress = __committerProgress;
     if (runtimeSignal?.aborted || isAborted()) {
-      setTimeout(() => hideCommitterWidget(ctx, expectedProgress), 3000);
+      scheduleHideCommitterWidget(ctx, 3000);
     } else {
-      setTimeout(() => hideCommitterWidget(ctx, expectedProgress), 6000);
+      scheduleHideCommitterWidget(ctx, 6000);
     }
   }
 
@@ -2411,7 +2443,7 @@ async function tryCommitAsync(
           __committerProgress.commitLog = msg.commitLog || [];
         }
         updateCommitterWidget();
-        setTimeout(() => hideCommitterWidget(ctx, __committerProgress), 6000);
+        scheduleHideCommitterWidget(ctx, 6000);
         __asyncChildProcess = null;
       }
     });
@@ -2423,7 +2455,7 @@ async function tryCommitAsync(
         __committerProgress.phase = "done";
         __committerProgress.error = `Subprocess error: ${err.message}`;
         updateCommitterWidget();
-        setTimeout(() => hideCommitterWidget(ctx, __committerProgress), 6000);
+        scheduleHideCommitterWidget(ctx, 6000);
       }
       __asyncChildProcess = null;
     });
@@ -2442,7 +2474,7 @@ async function tryCommitAsync(
               __committerProgress.phase = "done";
               __committerProgress.error = `Subprocess exited with code ${code ?? "unknown"}`;
               updateCommitterWidget();
-              setTimeout(() => hideCommitterWidget(ctx, __committerProgress), 6000);
+              scheduleHideCommitterWidget(ctx, 6000);
             }
           }, 500);
 
@@ -2477,7 +2509,7 @@ async function tryCommitAsync(
               __committerProgress!.completedCommits = msg.commitCount ?? 0;
               __committerProgress!.commitLog = msg.commitLog || [];
               updateCommitterWidget();
-              setTimeout(() => hideCommitterWidget(ctx, __committerProgress), 6000);
+              scheduleHideCommitterWidget(ctx, 6000);
               child.removeListener("message", onDelayedMsg);
             }
           };
@@ -2488,7 +2520,7 @@ async function tryCommitAsync(
           __committerProgress.totalCommits = 0;
           __committerProgress.completedCommits = 0;
           updateCommitterWidget();
-          setTimeout(() => hideCommitterWidget(ctx, __committerProgress), 6000);
+          scheduleHideCommitterWidget(ctx, 6000);
         }
       }
       __asyncChildProcess = null;
@@ -3041,12 +3073,15 @@ export default function (pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
   // Session shutdown — clean up per-session state
   // -----------------------------------------------------------------------
-  pi.on("session_shutdown", async (_event, _ctx) => {
-    // Do NOT kill the async worker here. It is forked detached + unref'd and
-    // carries its own 5-minute timeout, so it is designed to finish the
-    // background commit after this session ends — essential in print/headless
-    // mode, where the session closes right after /commit returns. Killing it
-    // here silently aborted background commits whenever the worker needed
-    // longer than the session lifetime.
+  pi.on("session_shutdown", async (_event, ctx) => {
+    // Cancel any delayed UI cleanup before this context becomes stale, and
+    // clear the widget. Do NOT kill the async worker here: it is forked
+    // detached + unref'd with its own 5-minute timeout, so it is designed to
+    // finish the background commit after this session ends — essential in
+    // print/headless mode, where the session closes right after /commit
+    // returns. Killing it here silently aborted background commits whenever
+    // the worker needed longer than the session lifetime. Only the explicit
+    // Escape key cancels a running worker (see showCommitterWidget).
+    hideCommitterWidget(ctx);
   });
 }

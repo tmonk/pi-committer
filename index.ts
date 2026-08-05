@@ -201,6 +201,10 @@ function findJitiRegister(): string | null {
  */
 export function resolveWorkerExecArgv(workerPath: string = __workerPath): string[] {
   if (workerPath.includes("node_modules")) {
+    // node's --experimental-strip-types refuses to strip .ts files inside
+    // node_modules (still true on node 26 — verified by the crash-scenario
+    // tests), so the installed worker MUST run under jiti. Dev-repo workers
+    // (not under node_modules) use native strip-types.
     const jitiRegister = _findJitiRegisterForPath(workerPath);
     if (jitiRegister) {
       return ["--import", jitiRegister];
@@ -579,23 +583,50 @@ export function isValidCommitMessage(message: string): boolean {
   return /^[a-z]+(\([^)]+\))?: .+/.test(firstLine);
 }
 
-/** Stage all changes and return the diff. */
+/** Stage all changes and return the diff. The stat is synthesized in JS from the
+ *  diff content (parseDiffHunks) so we make ONE git call for the diff instead of
+ *  two (--stat + content) — the file list and change counts are derivable from
+ *  the content itself. */
 export function stageAll(dir: string): { diffStat: string; diffContent: string } {
   execSync("git add -A", { cwd: dir, stdio: "ignore" });
-  const diffStat = execSync("git diff --cached --stat", {
-    cwd: dir,
-    encoding: "utf-8",
-    maxBuffer: 10 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "ignore"],
-  }).trim();
-  if (!isValidDiffStat(diffStat)) {
-    console.error(
-      "[pi-committer] DIAG: stageAll diffStat failed validation — rejecting to prevent contamination",
-    );
-    return { diffStat: "", diffContent: "" };
-  }
   const diffContent = getDiffContent(dir);
+  const diffStat = buildDiffStatFromContent(diffContent);
   return { diffStat, diffContent };
+}
+
+/** Synthesize a git --stat-style summary from unified diff content. Handles
+ *  text hunks (via parseDiffHunks) and binary-only changes ("Binary files ..."). */
+export function buildDiffStatFromContent(diffContent: string): string {
+  if (!diffContent) return "";
+  const lines: string[] = [];
+  let totalAdd = 0;
+  let totalDel = 0;
+  let fileCount = 0;
+
+  const hunks = parseDiffHunks(diffContent);
+  for (const h of hunks) {
+    const n = h.addedCount + h.removedCount;
+    const sigs =
+      "+".repeat(Math.min(h.addedCount, 8)) +
+      "-".repeat(Math.min(h.removedCount, 8)) +
+      (n > 8 ? "..." : "");
+    lines.push(`${h.file} | ${n} ${sigs}`);
+    totalAdd += h.addedCount;
+    totalDel += h.removedCount;
+    fileCount++;
+  }
+
+  // Binary-only changes have no hunks; list them so binary commits are not skipped
+  const binaryRe = /^Binary files? a\/(.*?) and b\/(.*?) differ$/gm;
+  let bm: RegExpExecArray | null;
+  while ((bm = binaryRe.exec(diffContent)) !== null) {
+    lines.push(`${bm[2]} | Bin`);
+    fileCount++;
+  }
+
+  if (fileCount === 0) return "";
+  lines.push(`${fileCount} file${fileCount === 1 ? "" : "s"} changed, ${totalAdd} insertions(+), ${totalDel} deletions(-)`);
+  return lines.join("\n");
 }
 
 /** Check for any changes (staged or unstaged). */
@@ -887,7 +918,11 @@ export function singleGroupFallback(
   // If the signal is already aborted, return a deterministic fallback immediately
   // instead of spawning a new subagent session that will just be cancelled.
   if (signal?.aborted) {
-    const message = deterministicCommitMessage(diffStat, diffContent, allFiles, style);
+    // Deterministic fallback only when the setting is on; otherwise an empty
+    // message that resolveCommitMessage will block (agent required).
+    const message = config.deterministicFallback
+      ? deterministicCommitMessage(diffStat, diffContent, allFiles, style)
+      : "";
     return Promise.resolve([{ message, files: allFiles }]);
   }
   return generateCommitMessageViaSubagent(ctx, diffStat, diffContent, repoDir, undefined, signal, style).then(
@@ -1482,10 +1517,13 @@ export async function generateCommitMessageViaSubagent(
   }
 
   console.error(
-    "[pi-committer] DIAG: subagent output empty/invalid after retry — escalating to deterministic content analysis",
+    "[pi-committer] DIAG: subagent output empty/invalid after retry" +
+      (config.deterministicFallback ? " — escalating to deterministic content analysis" : " — blocking commit (deterministic fallback disabled)"),
   );
   __lastSubagentCallMs = performance.now() - _ts;
-  return deterministicCommitMessage(diffStat, diffContent, getChangedFiles(diffStat), style);
+  return config.deterministicFallback
+    ? deterministicCommitMessage(diffStat, diffContent, getChangedFiles(diffStat), style)
+    : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -1917,10 +1955,11 @@ export function deterministicCommitMessage(
 }
 
 /**
- * Resolve the final message to commit: validates conventional format and
- * falls back to the content-driven deterministic generator. Returns undefined
- * to block the commit when no detailed valid message can be produced — a
- * generic message is never committed. No boilerplate-pattern detector is used.
+ * Resolve the final message to commit: validates conventional format and,
+ * only when allowDeterministic is true (deterministic_fallback setting), falls
+ * back to the content-driven deterministic generator. Returns undefined to
+ * block the commit when no detailed valid message can be produced — a generic
+ * message is never committed. No boilerplate-pattern detector is used.
  */
 export function resolveCommitMessage(
   message: string,
@@ -1928,8 +1967,16 @@ export function resolveCommitMessage(
   diffContent: string,
   files: string[],
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  allowDeterministic = false,
 ): string | undefined {
   if (isValidCommitMessage(message)) return message;
+
+  if (!allowDeterministic) {
+    console.error(
+      "[pi-committer] DIAG: generated message invalid and deterministic fallback is disabled — blocking commit",
+    );
+    return undefined;
+  }
 
   console.error(
     `[pi-committer] DIAG: generated message invalid — regenerating deterministically: ${JSON.stringify(message.slice(0, 120))}`,
@@ -1970,6 +2017,14 @@ export function shouldCommitOnTrigger(
 // Core commit logic
 // ---------------------------------------------------------------------------
 
+/** Last committed message, set by commitStaged — avoids a `git log -1` call when
+ *  the widget log needs the message text (the message is already known here). */
+let __lastCommittedMessage = "";
+/** @internal exported for tests */
+export function _getLastCommittedMessage(): string {
+  return __lastCommittedMessage;
+}
+
 /**
  * Commit all currently staged files as a single commit.
  * Uses the subagent to generate the commit message.
@@ -2000,7 +2055,11 @@ export async function commitStaged(
   const style = config.matchRepoStyle ? sampleRepoCommitStyle(dir) : EMPTY_COMMIT_STYLE;
 
   try {
-    const message = skipSubagent
+    // Deterministic generation only runs when deterministic_fallback is
+    // enabled (default off). With the gate off, the subagent is required for
+    // every commit — skipSubagent is a no-op (see doSingleCommit).
+    const useDeterministic = skipSubagent && config.deterministicFallback;
+    const message = useDeterministic
       ? deterministicCommitMessage(diffStat, diffContent, files, style)
       : await generateCommitMessageViaSubagent(
           ctx,
@@ -2019,32 +2078,39 @@ export async function commitStaged(
       return undefined;
     }
 
-    // Validate and regenerate; block (never commit a generic message) when no
-    // detailed valid message can be produced.
+    // Validate; regenerate deterministically only when the setting is on, and
+    // block (never commit a generic message) when no detailed valid message
+    // can be produced. The block leaves changes staged for a retry.
     const finalMessage = resolveCommitMessage(
       message,
       diffStat,
       diffContent,
       files,
       style,
+      config.deterministicFallback,
     );
     if (finalMessage === undefined) {
-      unstageAll(dir);
       ctx.ui.notify(
-        "[pi-committer] Skipped commit: could not produce a detailed commit message. Your changes were unstaged and left untouched — run /commit again or commit manually.",
+        "[pi-committer] Skipped commit: could not produce a detailed, valid commit message. Changes were left staged — run /commit again or commit manually.",
         "warning",
       );
       return undefined;
     }
 
-    execSync("git commit -F -", {
+    // `git commit` prints the summary line "[branch <short-hash>] subject" on
+    // stdout (non-tty); parse the hash from it instead of an extra rev-parse.
+    // Hooks may write to stdout, so fall back to rev-parse when no hash matches.
+    const commitOut = execSync("git commit -F -", {
       cwd: dir,
       encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
       stdio: ["pipe", "pipe", "ignore"],
       input: finalMessage,
     });
 
-    const hash = getHeadHash(dir);
+    __lastCommittedMessage = finalMessage;
+    const hashMatch = /\[[^\]\s]*\s+([0-9a-f]{7,40})\]/.exec(commitOut);
+    const hash = hashMatch ? hashMatch[1] : getHeadHash(dir);
     const shortHash = hash.slice(0, 7);
     const summary = finalMessage.split("\n")[0];
 
@@ -2077,12 +2143,23 @@ export async function tryCommit(
 ): Promise<number> {
   if (runtimeSignal?.aborted) return 0;
 
-  if (!isGitRepo(dir)) {
+  // One git call does the work of the old two (isGitRepo + hasAnyChanges):
+  // `git status --porcelain` exits 128 outside a repo (caught below) and prints
+  // nothing when there are no changes.
+  let status: string;
+  try {
+    status = execSync("git status --porcelain", {
+      cwd: dir,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
     ctx.ui.notify("[pi-committer] Not a git repository — skipping", "info");
     return 0;
   }
 
-  if (!hasAnyChanges(dir)) {
+  if (!status) {
     if (force) ctx.ui.notify("[pi-committer] No changes to commit", "info");
     return 0;
   }
@@ -2100,8 +2177,8 @@ export async function tryCommit(
   // Apply exclusion patterns
   allFiles = unstageExcludedFiles(dir, allFiles, config.excludePatterns);
 
-  // Filter out gitignored files before proceeding
-  allFiles = filterGitignoredFiles(dir, allFiles);
+  // (git add -A already respects .gitignore, so staged files are by definition
+  // non-ignored — the redundant filterGitignoredFiles call was removed here.)
 
   if (allFiles.length === 0) {
     unstageAll(dir);
@@ -2213,34 +2290,37 @@ export async function tryCommit(
         );
         if (allFailed) continue;
 
-        // Validate group message before committing; regenerate deterministically
-        // if garbled, and skip the group (never commit a generic message) when no
-        // detailed valid message can be produced.
+        // Validate group message; regenerate deterministically only when the
+        // setting is on. Skip the group (never commit a generic message) when
+        // no detailed valid message can be produced — the group's changes stay
+        // staged (the flow re-stages remaining changes at the end).
         const groupFinalMessage = resolveCommitMessage(
           group.message,
           diffStat,
           diffContent,
           groupFiles,
           style,
+          config.deterministicFallback,
         );
         if (groupFinalMessage === undefined) {
-          unstageAll(dir);
           ctx.ui.notify(
-            "[pi-committer] Skipped group — could not produce a detailed, valid commit message (nothing generic was committed)",
+            "[pi-committer] Skipped group — could not produce a detailed, valid commit message (nothing generic was committed; changes left staged)",
             "warning",
           );
           continue;
         }
 
         try {
-          execSync("git commit -F -", {
+          const commitOut = execSync("git commit -F -", {
             cwd: dir,
             encoding: "utf-8",
+            maxBuffer: 10 * 1024 * 1024,
             stdio: ["pipe", "pipe", "ignore"],
             input: groupFinalMessage,
           });
 
-          const hash = getHeadHash(dir);
+          const hashMatch = /\[[^\]\s]*\s+([0-9a-f]{7,40})\]/.exec(commitOut);
+          const hash = hashMatch ? hashMatch[1] : getHeadHash(dir);
           const shortHash = hash.slice(0, 7);
           const summary = groupFinalMessage.split("\n")[0];
 
@@ -2317,11 +2397,12 @@ export async function tryCommit(
         return 0;
       }
       const opSignal = combineAbortSignals(runtimeSignal, getAbortSignal());
-      // Small change sets below the message threshold skip the subagent entirely
-      // and use the deterministic fallback directly (faster, no LLM call needed).
-      // Above the message threshold but below the grouping threshold, the subagent
-      // generates a single commit message (good descriptions, no grouping).
-      const skipSubagent = allFiles.length < config.subagentMessageMinFiles;
+      // Small change sets below the message threshold skip the subagent and use
+      // the deterministic fallback directly (faster, no LLM call) — but only
+      // when deterministic_fallback is enabled (default off). With the gate
+      // off, the subagent is required for every commit.
+      const skipSubagent =
+        config.deterministicFallback && allFiles.length < config.subagentMessageMinFiles;
       commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent, diffStat, diffContent);
     }
   } finally {
@@ -2542,6 +2623,7 @@ async function tryCommitAsync(
         subagentMessageMinFiles: config.subagentMessageMinFiles,
         subagentThinkingLevel: config.subagentThinkingLevel,
         matchRepoStyle: config.matchRepoStyle,
+        deterministicFallback: config.deterministicFallback,
       },
     });
 
@@ -2603,17 +2685,8 @@ async function doSingleCommit(
   );
 
   if (hash && progress) {
-    // Get the actual commit message from git
-    let message = hash;
-    try {
-      message = execSync("git log -1 --format=%B", {
-        cwd: dir,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-    } catch {
-      // fallback to hash
-    }
+    // Use the message commitStaged already knows (no git log -1 subprocess)
+    let message = __lastCommittedMessage || hash;
     progress.commitLog.push({
       hash,
       message,
@@ -2635,14 +2708,46 @@ async function doSingleCommit(
  * Returns undefined if the path is not inside a git repo.
  */
 export function gitRoot(dir: string): string | undefined {
+  // Fast path: resolve the repo root by walking up for a .git entry (dir or
+  // worktree/submodule pointer file) — ~0.01ms vs ~15ms for a git subprocess.
+  // Called once per session tool-call dir, so this is the dominant session
+  // discovery cost (see benchmarks: gitRoot x60 = 942ms -> ~1ms).
+  const cached = __gitRootCache.get(dir);
+  if (cached !== undefined) return cached;
+  const found = gitRootByWalk(dir);
+  if (found !== undefined) {
+    __gitRootCache.set(dir, found);
+    return found;
+  }
+  // Fallback: git semantics we can't replicate with a walk (e.g. bare repos
+  // nested inside a working repo) — use the subprocess like before.
   try {
-    return execSync("git rev-parse --show-toplevel", {
+    const root = execSync("git rev-parse --show-toplevel", {
       cwd: dir,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
+    __gitRootCache.set(dir, root);
+    return root;
   } catch {
+    __gitRootCache.set(dir, undefined);
     return undefined;
+  }
+}
+
+const __gitRootCache = new Map<string, string | undefined>();
+
+export function _clearGitRootCache(): void {
+  __gitRootCache.clear();
+}
+
+function gitRootByWalk(dir: string): string | undefined {
+  let cur = path.resolve(dir);
+  for (;;) {
+    if (existsSync(path.join(cur, ".git"))) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return undefined;
+    cur = parent;
   }
 }
 
@@ -2741,6 +2846,20 @@ export function isDirtyRepo(repoDir: string): boolean {
   }
 }
 
+/** Concurrent variant used by commitAllRepos — git subprocesses run in parallel. */
+async function isDirtyRepoAsync(repoDir: string): Promise<boolean> {
+  try {
+    const { execFile } = await import("node:child_process/promises");
+    const { stdout } = await execFile("git", ["status", "--porcelain"], {
+      cwd: repoDir,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Commit changes across all dirty git repos.
  * Returns total commits created across all repos.
@@ -2761,12 +2880,13 @@ export async function commitAllRepos(
     return tryCommit(dir, ctx, force, runtimeSignal);
   }
 
-  // Filter to only dirty repos
-  const dirtyRepos = repos.filter((r) => {
-    // For the primary repo, check with the force flag semantics
-    if (r === repos[0]) return true;
-    return isDirtyRepo(r);
-  });
+  // Filter to only dirty repos. The primary repo is always included; the rest
+  // are checked concurrently (git status subprocesses run in parallel) instead
+  // of sequentially — N x ~15ms -> ~25ms at 10 repos (see benchmarks).
+  const dirtyFlags = await Promise.all(
+    repos.map((r) => (r === repos[0] ? Promise.resolve(true) : isDirtyRepoAsync(r))),
+  );
+  const dirtyRepos = repos.filter((_, i) => dirtyFlags[i]);
 
   if (dirtyRepos.length <= 1) {
     return tryCommit(dir, ctx, force, runtimeSignal);

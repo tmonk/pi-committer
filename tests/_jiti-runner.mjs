@@ -54,6 +54,7 @@ child.send({
     subagentGroupingMinFiles: 4,
     subagentMessageMinFiles: 3,
     subagentThinkingLevel: "off",
+    deterministicFallback: true,
   },
 });
 

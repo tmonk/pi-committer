@@ -5,13 +5,13 @@
  * known IPC quirks when forking with IPC channels, so we isolate the forks
  * here and report timings over stdout).
  *
- * Usage: node _worker-bench-driver.mjs <repoDir> <execArgvJson> <runs>
+ * Usage: node _worker-bench-driver.mjs <repoDir> <execArgvJson> <runs> [deterministic]
  *
  * For each run: forks async-commit-worker.ts with the given execArgv, sends a
- * deterministic "start" (no subagent — the content-driven fallback runs), and
- * reports:
+ * "start" (no subagent), and reports:
  *   bootMs      — fork → first "progress" message (worker loaded + initial git work)
- *   roundtripMs — fork → "result" message (full deterministic pipeline + commit)
+ *   roundtripMs — fork → "result" message (full pipeline + block, or + commit when
+ *                 deterministic=1 enables the deterministic_fallback gate)
  * Between runs the driver re-modifies and re-stages a file so each run has a
  * fresh change to commit.
  */
@@ -22,13 +22,14 @@ import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-const [repoDir, execArgvJson, runsArg] = process.argv.slice(2);
+const [repoDir, execArgvJson, runsArg, deterministicArg] = process.argv.slice(2);
 if (!repoDir || !execArgvJson || !runsArg) {
-  console.error("usage: node _worker-bench-driver.mjs <repoDir> <execArgvJson> <runs>");
+  console.error("usage: node _worker-bench-driver.mjs <repoDir> <execArgvJson> <runs> [deterministic]");
   process.exit(1);
 }
 const execArgv = JSON.parse(execArgvJson);
 const runs = parseInt(runsArg, 10);
+const deterministic = deterministicArg === "1";
 const workerPath = new URL("../async-commit-worker.ts", import.meta.url).pathname;
 
 const WORK_FILE = "work.ts";
@@ -80,6 +81,7 @@ function runOnce(runIdx) {
         subagentGroupingMinFiles: 4,
         subagentMessageMinFiles: 3,
         subagentThinkingLevel: "off",
+        deterministicFallback: deterministic,
       },
     });
     setTimeout(() => finish(performance.now() - t0), 15000);

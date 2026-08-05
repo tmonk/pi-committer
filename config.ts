@@ -53,12 +53,22 @@ export interface CommitterConfig {
   subagentGroupingMinFiles: number;
   /**
    * Minimum files before the subagent is called for a single-commit message.
-   * Below this threshold, the deterministic fallback is used directly.
-   * Above it but below subagentGroupingMinFiles, a single-commit with a
-   * subagent-generated message is used (good descriptions, no grouping).
+   * Below this threshold, the deterministic fallback is used directly — but
+   * only when deterministicFallback is enabled (see below). Otherwise the
+   * subagent is always called, regardless of file count.
    * Default: 3 — 1-2 file changes are simple enough for deterministic.
    */
   subagentMessageMinFiles: number;
+  /**
+   * When true, the content-driven deterministic commit-message generator is
+   * available as a fallback: it is used for small change sets (below
+   * subagentMessageMinFiles) and to regenerate garbled subagent output.
+   * When false (default), the subagent is required for every commit and an
+   * unavailable/failed/invalid message blocks the commit with a warning,
+   * leaving changes staged — a generic message is never committed.
+   * Default: false (opt-in — deterministic messages are poor quality).
+   */
+  deterministicFallback: boolean;
   /**
    * Thinking level for the commit subagent session. Controls how much
    * reasoning the model does before generating a commit message.
@@ -93,6 +103,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   asyncThreshold: 5,
   subagentGroupingMinFiles: 15,
   subagentMessageMinFiles: 3,
+  deterministicFallback: false,
   subagentThinkingLevel: "off",
   matchRepoStyle: false,
 };
@@ -245,6 +256,10 @@ function applyConfig(
   }
   if (typeof raw.subagent_message_min_files === "number") {
     config.subagentMessageMinFiles = raw.subagent_message_min_files;
+  }
+
+  if (typeof raw.deterministic_fallback === "boolean") {
+    config.deterministicFallback = raw.deterministic_fallback;
   }
 
   if (typeof raw.subagent_thinking_level === "string") {

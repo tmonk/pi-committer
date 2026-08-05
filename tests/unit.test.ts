@@ -816,10 +816,25 @@ describe("resolveCommitMessage", () => {
       "src/main.ts | 1 +",
       diff,
       ["src/main.ts"],
+      undefined,
+      true, // allowDeterministic — deterministic_fallback setting
     );
     assert.ok(resolved, "should regenerate a valid message");
     assert.ok(isValidCommitMessage(resolved!), `regenerated message should be valid, got: ${resolved}`);
     assert.ok(resolved!.includes("retryCount"), `should be content-driven, got: ${resolved}`);
+  });
+
+  it("blocks (returns undefined) when the deterministic fallback is disabled (default)", () => {
+    const diff = makeDiff({ "src/main.ts": { added: ["const retryCount = 3;"] } });
+    const resolved = resolveCommitMessage(
+      "not a commit message",
+      "src/main.ts | 1 +",
+      diff,
+      ["src/main.ts"],
+      undefined,
+      false,
+    );
+    assert.strictEqual(resolved, undefined, "should block without the deterministic fallback");
   });
 
   it("blocks (returns undefined) when no detailed message can be produced", () => {
@@ -1573,6 +1588,11 @@ describe("cancel flow integration", () => {
     const ac = new AbortController();
     ac.abort(); // Already aborted before call
 
+    // Enable the deterministic_fallback gate — the aborted-signal path uses
+    // the deterministic generator, which is gated behind the setting (off by
+    // default, where an aborted signal returns a blockable empty message).
+    setConfig({ ...getConfig(), deterministicFallback: true });
+
     const result = await singleGroupFallback(
       mockCtx(),
       "src/main.ts | 1 +",
@@ -1889,6 +1909,11 @@ describe("gitignore commit integration", () => {
     writeFileSync(path.join(repoDir, "feat.ts"), "// new feature");
     execSync("git add feat.ts", { cwd: repoDir, stdio: "ignore" });
 
+    // With the deterministic_fallback gate ON, the output-less mock subagent
+    // escalates to the deterministic generator (default off would block).
+    const originalCfg = getConfig();
+    setConfig({ ...originalCfg, deterministicFallback: true });
+
     // Mock subagent to return a commit message
     const originalMock = __createAgentSessionMock;
     __setCreateAgentSessionMock(async (_opts: any) => ({
@@ -1910,7 +1935,7 @@ describe("gitignore commit integration", () => {
 
       // commitStaged should return a hash (commit succeeded)
       assert.ok(result, "Expected commitStaged to return a hash");
-      assert.strictEqual(result.length, 40, "Expected a 40-char SHA hash");
+      assert.match(result, /^[0-9a-f]{7,40}$/, "Expected a hex commit hash");
 
       // Verify the commit was created
       const log = execSync("git log --oneline", {
@@ -2003,7 +2028,7 @@ describe("match_repo_style behavior (opt-in style sampling)", () => {
     execSync('git commit -m "chore: baseline one" --allow-empty', { cwd: dir, stdio: "ignore" });
     execSync('git commit -m "chore: baseline two" --allow-empty', { cwd: dir, stdio: "ignore" });
 
-    setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: false });
+    setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: false, deterministicFallback: true });
 
     writeFileSync(path.join(dir, "feature.ts"), "// add retry logic\n");
     const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
@@ -2019,7 +2044,7 @@ describe("match_repo_style behavior (opt-in style sampling)", () => {
     execSync('git commit -m "chore: baseline one" --allow-empty', { cwd: dir, stdio: "ignore" });
     execSync('git commit -m "chore: baseline two" --allow-empty', { cwd: dir, stdio: "ignore" });
 
-    setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: true });
+    setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: true, deterministicFallback: true });
 
     writeFileSync(path.join(dir, "feature.ts"), "// add retry logic\n");
     const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
@@ -2050,7 +2075,7 @@ describe("session shutdown cleanup", () => {
     } as any);
 
     const originalConfig = getConfig();
-    setConfig({ ...originalConfig, stagedCommits: false, asyncThreshold: 0 });
+    setConfig({ ...originalConfig, stagedCommits: false, asyncThreshold: 0, deterministicFallback: true });
 
     let contextIsStale = false;
     let widgetClearCount = 0;
@@ -3510,7 +3535,7 @@ describe("commit error handling", () => {
     const repoDir = createTempRepo();
     after(() => removeDir(repoDir));
 
-    setConfig({ ...originalConfig, stagedCommits: true });
+    setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: true });
 
     writeFileSync(path.join(repoDir, "feature.ts"), "export const feat = () => 2;\n");
     writeFileSync(path.join(repoDir, "feature.test.ts"), "import { test } from 'node:test';\n");
@@ -3859,7 +3884,7 @@ describe("commit error handling", () => {
       // Either the commit succeeds (hash returned) or fails gracefully (undefined)
       // The important thing is no crash/unhandled error
       if (result) {
-        assert.strictEqual(result.length, 40, "Expected 40-char SHA on success");
+        assert.match(result, /^[0-9a-f]{7,40}$/, "Expected a hex commit hash on success");
       } else {
         // Fail gracefully: no commit was created but no crash
         const log = execSync("git log --oneline", {
@@ -4053,7 +4078,7 @@ Files: module.test.ts, nonexistent.ts`,
     dir = createTempRepo();
     after(() => removeDir(dir));
 
-    setConfig({ ...originalConfig, stagedCommits: true });
+    setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: true });
 
     writeFileSync(path.join(dir, "real.ts"), "// real\n");
 
@@ -4544,7 +4569,7 @@ Files: file-y.ts`,
     dir = createTempRepo();
     after(() => removeDir(dir));
 
-    setConfig({ ...originalConfig, stagedCommits: true });
+    setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: true });
 
     writeFileSync(path.join(dir, "only-one.ts"), "// only one\n");
     writeFileSync(path.join(dir, "only-two.ts"), "// only two\n");
@@ -4618,6 +4643,46 @@ Files: file-y.ts`,
 
       assert.strictEqual(result, 1, "should produce 1 commit");
       assert.ok(subagentCalled, "subagent should be called when files are above threshold");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("blocks the commit when no agent message and deterministic_fallback is off (default)", async () => {
+    dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: false });
+
+    writeFileSync(path.join(dir, "blocked.ts"), "// blocked\n");
+
+    // No subagent mock — no agent message can be produced
+    __setCreateAgentSessionMock(undefined);
+    let warningText = "";
+    const ctx = mockCtx({
+      cwd: dir,
+      ui: {
+        notify: (msg: string, _kind?: string) => {
+          warningText += msg;
+        },
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctx, true, undefined);
+      assert.strictEqual(result, 0, "should block (0 commits) without an agent message");
+      assert.ok(
+        warningText.includes("could not produce"),
+        `should warn about the blocked commit, got: ${warningText}`,
+      );
+
+      // Changes stay staged — the block path must not unstage
+      const staged = execSync("git diff --cached --name-only", {
+        cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+      }).trim().split("\n").filter(Boolean);
+      assert.deepStrictEqual(staged, ["blocked.ts"], "blocked changes remain staged");
     } finally {
       __setCreateAgentSessionMock(undefined);
     }
@@ -4825,6 +4890,7 @@ describe("async worker IPC integration", () => {
           subagentGroupingMinFiles: 4,
           subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
+          deterministicFallback: true,
         },
       });
     });
@@ -4900,6 +4966,7 @@ describe("async worker IPC integration", () => {
           subagentGroupingMinFiles: 4,
           subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
+          deterministicFallback: true,
         },
       });
     });
@@ -4962,6 +5029,7 @@ describe("async worker IPC integration", () => {
           subagentGroupingMinFiles: 4,
           subagentMessageMinFiles: 3,
           subagentThinkingLevel: "off",
+          deterministicFallback: true,
         },
       });
     });

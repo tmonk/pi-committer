@@ -374,7 +374,7 @@ describe("worker exported resolveCommitMessage", () => {
       "@@ -1 +1,3 @@\n" +
       "+const retryCount = 3;\n" +
       " context line\n";
-    const resolved = resolveCommitMessage("not valid", "src/main.ts | 1 +", diff, ["src/main.ts"]);
+    const resolved = resolveCommitMessage("not valid", "src/main.ts | 1 +", diff, ["src/main.ts"], undefined, true);
     assert.ok(resolved, "should regenerate a valid message");
     assert.ok(isValidCommitMessage(resolved!), `should be valid, got: ${resolved}`);
   });
@@ -620,6 +620,7 @@ describe("worker abort at checkpoint", () => {
         subagentGroupingMinFiles: 4,
         subagentMessageMinFiles: 3,
         subagentThinkingLevel: "off",
+        deterministicFallback: true,
       },
     });
 
@@ -695,6 +696,7 @@ describe("worker abort at checkpoint", () => {
         subagentGroupingMinFiles: 4,
         subagentMessageMinFiles: 3,
         subagentThinkingLevel: "off",
+        deterministicFallback: true,
       },
     });
 
@@ -767,6 +769,7 @@ describe("worker git failure modes", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.ok(msg, "should send a result message");
@@ -807,6 +810,7 @@ describe("worker git failure modes", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.ok(msg, "should send a result message");
@@ -834,6 +838,7 @@ describe("worker git failure modes", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.ok(msg, "should send a result message");
@@ -872,6 +877,7 @@ describe("worker git failure modes", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.strictEqual(exitCode, 0, "worker should exit with code 0");
@@ -911,6 +917,7 @@ describe("worker IPC edge cases", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.ok(msg, "IPC result should be received");
@@ -935,6 +942,7 @@ describe("worker IPC edge cases", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     // The worker should not crash — should return error via IPC
@@ -942,6 +950,51 @@ describe("worker IPC edge cases", () => {
     assert.strictEqual(msg.type, "result");
     assert.ok(msg.error, "should report an error for invalid repo");
     assert.strictEqual(exitCode, 0, "exit code must be 0 even with error");
+  });
+
+  it("blocks commit when no agent and deterministic_fallback is off (default)", async () => {
+    const dir = createTempRepo();
+
+    writeFileSync(path.join(dir, "blocked.ts"), "// blocked\n");
+    execSync("git add blocked.ts", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = ["blocked.ts"];
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir,
+      diffStat,
+      diffContent,
+      allFiles,
+      stagedCommits: false,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: false,
+    });
+
+    assert.ok(msg, "should send a result message");
+    assert.strictEqual(msg.type, "result");
+    assert.strictEqual(msg.commitCount, 0, "no commit without an agent message");
+    assert.ok(
+      (msg.warnings ?? []).some((w: string) => w.includes("could not produce")),
+      `should warn about the blocked commit, got: ${JSON.stringify(msg.warnings)}`,
+    );
+    assert.strictEqual(exitCode, 0, "exit code must be 0");
+
+    // Changes stay staged — nothing was unstaged
+    const staged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split("\n").filter(Boolean);
+    assert.deepStrictEqual(staged, ["blocked.ts"], "blocked changes remain staged");
   });
 });
 
@@ -1141,6 +1194,7 @@ describe("worker IPC result guarantees", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.strictEqual(exitCode, 0, "exit code must be 0 for success");
@@ -1174,6 +1228,7 @@ describe("worker IPC result guarantees", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     assert.strictEqual(msg.type, "result");
@@ -1207,6 +1262,7 @@ describe("worker IPC result guarantees", () => {
       subagentGroupingMinFiles: 4,
       subagentMessageMinFiles: 3,
       subagentThinkingLevel: "off",
+      deterministicFallback: true,
     });
 
     if (msg.commitCount > 0 && msg.commitLog.length > 0) {

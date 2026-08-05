@@ -1271,9 +1271,29 @@ describe("benchmark", () => {
       const fx = createSessionTriggerFixture();
       after(() => { try { rmSync(fx.root, { recursive: true, force: true }); } catch { /* */ } });
 
+      // Agent required by default (deterministic_fallback off) — mock the
+      // agent so the commit message is produced without an LLM call.
+      __setCreateAgentSessionMock(async (_opts: any) => ({
+        session: {
+          prompt: async () => {},
+          subscribe: (cb: any) => {
+            cb({
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "chore: bench session trigger" }],
+              },
+            });
+            return () => {};
+          },
+          abort: () => {},
+        },
+      }));
+      after(() => __setCreateAgentSessionMock(undefined));
+
       const timings: number[] = [];
       for (let i = 0; i < 2; i++) {
-        // Stage a small change in the primary repo (deterministic fallback path)
+        // Stage a small change in the primary repo (mocked-agent commit path)
         writeFileSync(path.join(fx.primary, "readme.md"), `# primary v${i}\n`);
         execSync("git add -A", { cwd: fx.primary, stdio: "ignore" });
 
@@ -1298,34 +1318,37 @@ describe("benchmark", () => {
       driver = new URL("_worker-bench-driver.mjs", import.meta.url).pathname;
     });
 
-    function runDriver(repoDir: string, execArgv: string[]) {
+    function runDriver(repoDir: string, execArgv: string[], deterministic: boolean) {
       const out = execSync(
-        `node ${JSON.stringify(driver)} ${JSON.stringify(repoDir)} ${JSON.stringify(JSON.stringify(execArgv))} ${WORKER_RUNS}`,
+        `node ${JSON.stringify(driver)} ${JSON.stringify(repoDir)} ${JSON.stringify(JSON.stringify(execArgv))} ${WORKER_RUNS} ${deterministic ? "1" : "0"}`,
         { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 },
       );
       return out.trim().split("\n").map((l) => JSON.parse(l));
     }
 
     for (const mode of ["strip-types", "jiti"] as const) {
-      it(`${mode} execArgv (boot + deterministic round-trip)`, () => {
-        const repoDir = mkdtempSync(path.join(tmpDir(), "bench-worker-"));
-        after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
-        makeBenchRepo(repoDir, "worker");
+      for (const deterministic of [false, true] as const) {
+        const label = deterministic ? "deterministic on" : "default (block)";
+        it(`${mode} execArgv (boot + ${label} round-trip)`, () => {
+          const repoDir = mkdtempSync(path.join(tmpDir(), "bench-worker-"));
+          after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+          makeBenchRepo(repoDir, "worker");
 
-        const execArgv =
-          mode === "strip-types"
-            ? ["--experimental-strip-types"]
-            : ["--import", _findJitiRegisterForPath("/x/node_modules/pi-committer/async-commit-worker.ts")!];
+          const execArgv =
+            mode === "strip-types"
+              ? ["--experimental-strip-types"]
+              : ["--import", _findJitiRegisterForPath("/x/node_modules/pi-committer/async-commit-worker.ts")!];
 
-        const rows = runDriver(repoDir, execArgv);
-        assert.strictEqual(rows.length, WORKER_RUNS, "driver should report one row per run");
-        for (const r of rows) {
-          assert.ok(typeof r.bootMs === "number" && r.bootMs > 0, "bootMs should be > 0");
-          assert.ok(typeof r.roundtripMs === "number" && r.roundtripMs > 0, "roundtripMs should be > 0");
-        }
-        record(`worker boot->progress (${mode})`, String(WORKER_RUNS), rows.map((r) => r.bootMs));
-        record(`worker boot->result (${mode})`, String(WORKER_RUNS), rows.map((r) => r.roundtripMs));
-      });
+          const rows = runDriver(repoDir, execArgv, deterministic);
+          assert.strictEqual(rows.length, WORKER_RUNS, "driver should report one row per run");
+          for (const r of rows) {
+            assert.ok(typeof r.bootMs === "number" && r.bootMs > 0, "bootMs should be > 0");
+            assert.ok(typeof r.roundtripMs === "number" && r.roundtripMs > 0, "roundtripMs should be > 0");
+          }
+          record(`worker boot->progress (${mode}, ${label})`, String(WORKER_RUNS), rows.map((r) => r.bootMs));
+          record(`worker boot->result (${mode}, ${label})`, String(WORKER_RUNS), rows.map((r) => r.roundtripMs));
+        });
+      }
     }
   });
 
@@ -1497,14 +1520,21 @@ describe("benchmark", () => {
       record("isValidCommitMessage", "20", timings);
     });
 
-    it("resolveCommitMessage (valid passthrough + deterministic fallback)", () => {
+    it("resolveCommitMessage (valid passthrough + gated deterministic fallback)", () => {
       const timings: number[] = [];
       for (let i = 0; i < 20; i++) {
         const start = performance.now();
         const valid = resolveCommitMessage("feat(scope): add thing with detail here", diffStat, diffContent, ["src/a.ts", "src/b.ts"]);
         assert.ok(valid, "valid message should pass through");
-        const regenerated = resolveCommitMessage("garbage", diffStat, diffContent, ["src/a.ts", "src/b.ts"]);
-        assert.ok(regenerated && regenerated.includes(":"), "invalid message should regenerate deterministically");
+        // deterministic_fallback ON: invalid message regenerates deterministically
+        const regenerated = resolveCommitMessage("garbage", diffStat, diffContent, ["src/a.ts", "src/b.ts"], undefined, true);
+        assert.ok(regenerated && regenerated.includes(":"), "invalid message should regenerate deterministically when the gate is on");
+        // deterministic_fallback OFF (default): invalid message blocks
+        assert.strictEqual(
+          resolveCommitMessage("garbage", diffStat, diffContent, ["src/a.ts", "src/b.ts"], undefined, false),
+          undefined,
+          "invalid message should block when the gate is off",
+        );
         timings.push(performance.now() - start);
       }
       record("resolveCommitMessage", "20", timings);

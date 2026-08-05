@@ -46,6 +46,14 @@ interface CommitWorkerParams {
    * as style context for generated messages. Opt-in, default false.
    */
   matchRepoStyle: boolean;
+  /**
+   * When true, the content-driven deterministic commit-message generator is
+   * available as a fallback (small change sets + garbled-output regeneration).
+   * When false (default), the subagent is required for every commit and an
+   * unavailable/failed/invalid message blocks the commit, leaving changes
+   * staged. Mirrors the deterministic_fallback config setting.
+   */
+  deterministicFallback: boolean;
 }
 
 interface CommitLogEntry {
@@ -853,9 +861,10 @@ export function deterministicCommitMessage(
 }
 
 /**
- * Resolve the final message to commit: validates conventional format and
- * falls back to the content-driven deterministic generator. Returns undefined
- * to block the commit when no detailed valid message can be produced — a
+ * Resolve the final message to commit: validates conventional format and,
+ * only when allowDeterministic is true (deterministic_fallback setting), falls
+ * back to the content-driven deterministic generator. Returns undefined to
+ * block the commit when no detailed valid message can be produced — a
  * generic message is never committed. No boilerplate-pattern detector is used.
  */
 export function resolveCommitMessage(
@@ -864,8 +873,16 @@ export function resolveCommitMessage(
   diffContent: string,
   files: string[],
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  allowDeterministic = false,
 ): string | undefined {
   if (isValidCommitMessage(message)) return message;
+
+  if (!allowDeterministic) {
+    console.error(
+      "[pi-committer] DIAG: generated message invalid and deterministic fallback is disabled — blocking commit",
+    );
+    return undefined;
+  }
 
   console.error(
     `[pi-committer] DIAG: generated message invalid — regenerating deterministically: ${JSON.stringify(message.slice(0, 120))}`,
@@ -1052,15 +1069,16 @@ export async function generateCommitMessage(
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  allowDeterministic = false,
 ): Promise<string> {
   const _sdkOk = await tryLoadSDK();
   if (!_sdkOk || !subagentModel) {
     console.error(
       `[pi-committer] DIAG: subagent message generation skipped — ${
         !_sdkOk ? "SDK unavailable" : "no model configured"
-      } — falling back to deterministic`,
+      }${allowDeterministic ? " — falling back to deterministic" : " — blocking commit (deterministic fallback disabled)"}`,
     );
-    return deterministicCommitMessage(diffStat, diffContent, files, style);
+    return gatedDeterministicMessage(diffStat, diffContent, files, style, allowDeterministic);
   }
 
   const prompt = buildCommitMessagePrompt(diffStat, diffContent, style);
@@ -1089,9 +1107,23 @@ export async function generateCommitMessage(
   if (generated && isValidCommitMessage(generated)) return generated;
 
   console.error(
-    "[pi-committer] DIAG: worker subagent output empty/invalid after retry — escalating to deterministic content analysis",
+    "[pi-committer] DIAG: worker subagent output empty/invalid after retry" +
+      (allowDeterministic ? " — escalating to deterministic content analysis" : " — blocking commit (deterministic fallback disabled)"),
   );
-  return deterministicCommitMessage(diffStat, diffContent, files, style);
+  return gatedDeterministicMessage(diffStat, diffContent, files, style, allowDeterministic);
+}
+
+/** Deterministic message when the deterministic_fallback gate is on, else ""
+ *  (the caller's resolveCommitMessage then blocks the commit — the agent is
+ *  required for every commit when the gate is off). */
+function gatedDeterministicMessage(
+  diffStat: string,
+  diffContent: string,
+  files: string[],
+  style: RepoCommitStyle,
+  allowDeterministic: boolean,
+): string {
+  return allowDeterministic ? deterministicCommitMessage(diffStat, diffContent, files, style) : "";
 }
 
 /**
@@ -1106,6 +1138,7 @@ export async function generateCommitGroups(
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  allowDeterministic = false,
 ): Promise<Array<{ message: string; files: string[] }>> {
   // Fallback: single group (SDK not available or no model configured)
   const _sdkOk = await tryLoadSDK();
@@ -1115,7 +1148,7 @@ export async function generateCommitGroups(
         !_sdkOk ? "SDK unavailable" : "no model configured"
       } — falling back to single commit`,
     );
-    const message = deterministicCommitMessage(diffStat, diffContent, allFiles, style);
+    const message = gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic);
     return [{ message, files: [...allFiles] }];
   }
 
@@ -1239,7 +1272,7 @@ export async function generateCommitGroups(
 
     try {
       if (aborted) {
-        return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles, style), files: [...allFiles] }];
+        return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
       }
       await session.prompt(promptStr);
     } finally {
@@ -1251,7 +1284,7 @@ export async function generateCommitGroups(
       console.error(
         `[pi-committer] DIAG: worker subagent grouping returned empty/short output (${output.length} chars) — falling back to single commit`,
       );
-      return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles, style), files: [...allFiles] }];
+      return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
     }
 
     // Parse commit groups
@@ -1273,7 +1306,7 @@ export async function generateCommitGroups(
       console.error(
         `[pi-committer] DIAG: worker subagent grouping produced 0 parseable groups — falling back to single commit`,
       );
-      return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles, style), files: [...allFiles] }];
+      return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
     }
 
     return groups;
@@ -1282,7 +1315,7 @@ export async function generateCommitGroups(
     console.error(
       `[pi-committer] DIAG: worker subagent grouping threw — falling back to single commit (${msg})`,
     );
-    return [{ message: deterministicCommitMessage(diffStat, diffContent, allFiles, style), files: [...allFiles] }];
+    return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
   }
 }
 
@@ -1430,25 +1463,25 @@ export async function doSingleCommit(
     return undefined;
   }
 
-  // Validate and regenerate; block (never commit a generic message) when no
-  // detailed valid message can be produced. Files are unstaged and left for
-  // the user — a failed entry surfaces the reason via the widget/IPC.
+  // Validate; regenerate deterministically only when the setting is on, and
+  // block (never commit a generic message) when no detailed valid message can
+  // be produced. The block leaves changes staged for a retry.
   const finalMessage = resolveCommitMessage(
     message,
     diffStat,
     diffContent,
     files,
     style,
+    params.deterministicFallback,
   );
   if (finalMessage === undefined) {
-    unstageAll(dir);
     console.error(
       "[pi-committer] DIAG: worker blocked commit — could not produce a detailed, valid commit message",
     );
     return {
       hash: "",
       message:
-        "Skipped commit: could not produce a detailed, valid commit message (nothing generic was committed). Files are unstaged and untouched.",
+        "Skipped commit: could not produce a detailed, valid commit message (nothing generic was committed). Changes were left staged.",
       success: false,
     };
   }
@@ -1496,6 +1529,7 @@ export async function doGroupedCommits(
     },
     params.subagentThinkingLevel,
     style,
+    params.deterministicFallback,
   );
 
   if (aborted) {
@@ -1572,6 +1606,7 @@ export async function doGroupedCommits(
         },
         params.subagentThinkingLevel,
         style,
+        params.deterministicFallback,
       );
 
       if (aborted) {
@@ -1579,18 +1614,20 @@ export async function doGroupedCommits(
         return { commitCount, commitLog, warnings };
       }
 
-      // Validate and regenerate; skip the group (never commit a generic
-      // message) when no detailed valid message can be produced.
+      // Validate; regenerate deterministically only when the setting is on.
+      // Skip the group (never commit a generic message) when no detailed valid
+      // message can be produced — changes stay staged for a retry.
       const finalMessage = resolveCommitMessage(
         message,
         diffStat,
         diffContent,
         stagedFiles,
         style,
+        params.deterministicFallback,
       );
       if (finalMessage === undefined) {
         warnings.push(
-          "Skipped group — could not produce a detailed, valid commit message (nothing generic was committed)",
+          "Skipped group — could not produce a detailed, valid commit message (nothing generic was committed; changes left staged)",
         );
         continue;
       }
@@ -1704,7 +1741,8 @@ process.on("message", async (msg: any) => {
       // Small change sets below the message threshold skip the subagent entirely.
       // Above the message threshold but below the grouping threshold, the subagent
       // generates a single commit message (good descriptions, no grouping).
-      const skipSubagent = files.length < subagentMessageMinFiles;
+      const skipSubagent =
+        params.deterministicFallback && files.length < subagentMessageMinFiles;
       const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress }, skipSubagent);
       if (entry && entry.success) {
         commitCount = 1;

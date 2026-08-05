@@ -73,9 +73,17 @@ exclude_patterns  = ["*.log", "node_modules/"]
 
 # Minimum number of changed files before the subagent is called for the
 # commit message. Below this threshold, the deterministic fallback is used
-# directly (no LLM call at all). Default: 3 — 1-2 file changes are simple
-# enough for deterministic.
+# directly (no LLM call at all) — but ONLY when deterministic_fallback is
+# enabled (see below). Default: 3.
 # subagent_message_min_files = 3
+
+# Opt-in: allow the content-driven deterministic commit-message generator
+# (small change sets below subagent_message_min_files, and regeneration of
+# garbled subagent output). Default: false. With this OFF (default), the
+# subagent is required for every commit: when it is unavailable, fails, or
+# returns an invalid message, the commit is BLOCKED with a clear warning and
+# the changes are left staged — a generic message is never committed.
+# deterministic_fallback = false
 
 # Optional: override the model used by the commit-message subagent
 # subagent_model = "openai/gpt-4o-mini"
@@ -160,14 +168,22 @@ The subagent decides the grouping from the diff content, not from file extension
 
 If the agent edits files in multiple git repositories during a session, `commit_changes` finds and commits in all of them. Detection works via session tool-call history — repos where the agent created or modified files using `write` or `edit` tools are detected and added on top of the primary working directory.
 
-## Deterministic commit message fallback
+## Commit message generation & the block gate
 
-When the subagent is unavailable (e.g., SDK load failure) or returns no result, pi-committer generates a deterministic commit message from the diff itself — no LLM calls needed:
+By default the commit-message subagent is **required for every commit**.
+When the subagent is unavailable (e.g., SDK load failure), fails, or returns
+an invalid message, the commit is **blocked** with a clear warning and the
+changes are **left staged** — a generic message is never committed.
+
+Opt-in deterministic fallback (`deterministic_fallback = true`) restores the
+previous behavior: when the subagent is unavailable or returns no result,
+pi-committer generates a deterministic commit message from the diff itself —
+no LLM calls needed:
 
 - **Content-driven description**: Reads the actual added/removed lines from the diff and describes what changed (e.g. `add const retryCount = 3`), never falling back to filename-only filler like `update file.ts`.
 - **Smart scope**: Uses the longest common ancestor directory across all changed files. If files span unrelated directories, scope is omitted entirely. When `match_repo_style` is enabled, the scope is normalized to one the repo actually uses.
 - **Structured body**: Always includes a body with a summary line and per-file change details (+N/−M with the first changed line).
-- **Block instead of boilerplate**: If the diff has no extractable content (e.g. empty diffs), the commit is skipped with a clear warning — a generic message is never committed. The old `chore: update N file(s)` substitution was removed from every commit path.
+- **Block instead of boilerplate**: If the diff has no extractable content (e.g. empty diffs), the commit is skipped with a clear warning — a generic message is never committed in either mode. The old `chore: update N file(s)` substitution was removed from every commit path.
 
 ## Matching the repo's commit style (opt-in)
 

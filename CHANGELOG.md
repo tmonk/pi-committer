@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The deterministic commit-message generator is now gated behind a new
+  opt-in setting `deterministic_fallback` (default **off**). By default the
+  subagent is required for every commit: an unavailable, failed, or invalid
+  agent message blocks the commit with a clear warning and leaves changes
+  staged — a generic message is never committed. Enable
+  `deterministic_fallback = true` to restore the previous fallback behavior.
+- Non-agent pipelines optimized for real-clock latency: repo-root discovery
+  (`gitRoot`) is a filesystem walk instead of a git subprocess (~2,550x on
+  the 60-dir session scan), the dirty-repo scan runs concurrently, and the
+  sync commit pipeline was reduced from 9 to 5 git calls (merged status,
+  JS-synthesized diff stat, commit hash parsed from `git commit` stdout).
+  The session-trigger aggregate is 18x faster (see docs/benchmarking.md).
+
 ## [0.13.2] — 2026-08-05
 
 ### Fixed

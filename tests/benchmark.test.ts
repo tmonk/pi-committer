@@ -80,6 +80,76 @@ function modifyFiles(repoDir: string, fileCount: number): void {
   }
 }
 
+/** Create a fresh repo with one committed file (fast: no per-file loop). */
+function makeBenchRepo(repoDir: string, name: string): void {
+  execSync("git init", { cwd: repoDir, stdio: "ignore" });
+  execSync("git config user.email bench@test.com", { cwd: repoDir, stdio: "ignore" });
+  execSync("git config user.name Bench", { cwd: repoDir, stdio: "ignore" });
+  writeFileSync(path.join(repoDir, "readme.md"), `# ${name}\n`);
+  execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+  execSync("git commit -q -m 'initial'", { cwd: repoDir, stdio: "ignore" });
+}
+
+/** Build a session-trigger fixture: 10 repos, 9 "other" repos referenced from a
+ *  mock 30-entry session history with 2 write/edit tool calls each (60 dirs). */
+function createSessionTriggerFixture() {
+  const root = mkdtempSync(path.join(tmpDir(), "bench-session-"));
+  const primary = path.join(root, "primary");
+  mkdirSync(primary, { recursive: true });
+  makeBenchRepo(primary, "primary");
+
+  const otherRepos: string[] = [];
+  for (let r = 0; r < 9; r++) {
+    const repoDir = path.join(root, `repo-${r}`);
+    mkdirSync(repoDir, { recursive: true });
+    makeBenchRepo(repoDir, `repo-${r}`);
+    otherRepos.push(repoDir);
+  }
+
+  // 6 tool-call dirs per repo (spread over src/lib/tests), one file each
+  const allDirs: string[] = [];
+  for (const repoDir of [primary, ...otherRepos]) {
+    for (const sub of ["src", "lib", "tests"]) {
+      for (let i = 0; i < 2; i++) {
+        const d = path.join(repoDir, sub, `area-${i}`);
+        mkdirSync(d, { recursive: true });
+        writeFileSync(path.join(d, "f.ts"), "// f\n");
+        allDirs.push(d);
+      }
+    }
+    // Keep the fixture repos CLEAN: commit the tool-call dirs too.
+    execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+    execSync("git commit -q -m 'seed tool-call dirs'", { cwd: repoDir, stdio: "ignore" });
+  }
+
+  // Mock session history: 30 assistant entries × 2 tool calls = 60 tool-call dirs
+  const entries = [];
+  let idx = 0;
+  for (let e = 0; e < 30; e++) {
+    entries.push({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", name: "edit", arguments: { path: path.join(allDirs[idx % allDirs.length], "f.ts") } },
+          { type: "toolCall", name: "write", arguments: { path: path.join(allDirs[(idx + 1) % allDirs.length], "f.ts") } },
+        ],
+      },
+    });
+    idx += 2;
+  }
+
+  const ctx = {
+    cwd: primary,
+    hasUI: false,
+    ui: { notify: () => {} },
+    modelRegistry: { getAvailable: () => [], find: () => undefined },
+    sessionManager: { getEntries: () => entries },
+  } as any;
+
+  return { root, primary, otherRepos, ctx };
+}
+
 function createMixedChanges(repoDir: string, changeCount: number, ignoredCount = 3): void {
   modifyFiles(repoDir, changeCount);
   for (let i = 0; i < Math.ceil(changeCount / 2); i++) {
@@ -114,7 +184,20 @@ import {
   batchStageFilesForGroup,
   tryCommit,
   __setCreateAgentSessionMock,
+  gitRoot,
+  isDirtyRepo,
+  commitAllRepos,
+  parseDiffHunks,
+  sampleRepoCommitStyle,
+  resolveCommitMessage,
+  isValidCommitMessage,
 } from "../index.ts";
+import {
+  renderCommitterWidgetLines,
+  truncateText,
+  formatDuration,
+  type CommitterProgress,
+} from "../widget.ts";
 
 // ---------------------------------------------------------------------------
 // Benchmark configuration
@@ -1124,4 +1207,308 @@ describe("benchmark", () => {
       );
     });
   });
+  // ===================================================================
+  // Repo discovery — gitRoot per session tool-call dir (dominant session cost)
+  // ===================================================================
+
+  describe("repo discovery (gitRoot)", () => {
+    it("60 sequential gitRoot calls (session-style tool-call dirs)", () => {
+      const fx = createSessionTriggerFixture();
+      after(() => { try { rmSync(fx.root, { recursive: true, force: true }); } catch { /* */ } });
+
+      // Collect the 60 tool-call dirs exactly like findOtherReposFromSession would
+      const dirs: string[] = [];
+      for (const entry of fx.ctx.sessionManager.getEntries()) {
+        for (const part of entry.message.content) {
+          dirs.push(path.dirname(part.arguments.path));
+        }
+      }
+      assert.strictEqual(dirs.length, 60, "fixture should have 60 tool-call dirs");
+
+      const timings: number[] = [];
+      for (let i = 0; i < 2; i++) {
+        const start = performance.now();
+        for (const d of dirs) {
+          const root = gitRoot(d);
+          assert.ok(root, "gitRoot should resolve a repo root");
+        }
+        timings.push(performance.now() - start);
+      }
+      record("gitRoot x60 dirs", "60", timings);
+    });
+  });
+
+  // ===================================================================
+  // Dirty scan — isDirtyRepo across repos (sequential in commitAllRepos)
+  // ===================================================================
+
+  describe("dirty scan (isDirtyRepo)", () => {
+    it("10 sequential isDirtyRepo calls (clean repos)", () => {
+      const fx = createSessionTriggerFixture();
+      after(() => { try { rmSync(fx.root, { recursive: true, force: true }); } catch { /* */ } });
+
+      const repos = [fx.primary, ...fx.otherRepos];
+      const timings: number[] = [];
+      for (let i = 0; i < 2; i++) {
+        const start = performance.now();
+        for (const r of repos) {
+          assert.strictEqual(isDirtyRepo(r), false, "fixture repos should be clean");
+        }
+        timings.push(performance.now() - start);
+      }
+      record("isDirtyRepo x10 (seq)", "10", timings);
+    });
+  });
+
+  // ===================================================================
+  // Session trigger — the full user-facing /commit latency:
+  // discovery (60 dirs) + dirty scan (10 repos) + one small sync commit.
+  // This is the AGGREGATE benchmark for the 10x real-clock target.
+  // ===================================================================
+
+  describe("session trigger (discovery + scan + commit)", () => {
+    it("commitAllRepos with 60 tool-call dirs and 10 repos (1 dirty primary)", async () => {
+      const fx = createSessionTriggerFixture();
+      after(() => { try { rmSync(fx.root, { recursive: true, force: true }); } catch { /* */ } });
+
+      const timings: number[] = [];
+      for (let i = 0; i < 2; i++) {
+        // Stage a small change in the primary repo (deterministic fallback path)
+        writeFileSync(path.join(fx.primary, "readme.md"), `# primary v${i}\n`);
+        execSync("git add -A", { cwd: fx.primary, stdio: "ignore" });
+
+        const start = performance.now();
+        const count = await commitAllRepos(fx.primary, fx.ctx, true);
+        timings.push(performance.now() - start);
+        assert.strictEqual(count, 1, "exactly one commit expected");
+      }
+      record("session trigger (60 dirs, 10 repos)", "1", timings);
+    });
+  });
+
+  // ===================================================================
+  // Worker boot + IPC round-trip (async pipeline; deterministic fallback)
+  // ===================================================================
+
+  describe("worker boot + IPC round-trip", () => {
+    const WORKER_RUNS = 5;
+    let driver: string;
+
+    before(() => {
+      driver = new URL("_worker-bench-driver.mjs", import.meta.url).pathname;
+    });
+
+    function runDriver(repoDir: string, execArgv: string[]) {
+      const out = execSync(
+        `node ${JSON.stringify(driver)} ${JSON.stringify(repoDir)} ${JSON.stringify(JSON.stringify(execArgv))} ${WORKER_RUNS}`,
+        { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 },
+      );
+      return out.trim().split("\n").map((l) => JSON.parse(l));
+    }
+
+    for (const mode of ["strip-types", "jiti"] as const) {
+      it(`${mode} execArgv (boot + deterministic round-trip)`, () => {
+        const repoDir = mkdtempSync(path.join(tmpDir(), "bench-worker-"));
+        after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+        makeBenchRepo(repoDir, "worker");
+
+        const execArgv =
+          mode === "strip-types"
+            ? ["--experimental-strip-types"]
+            : ["--import", _findJitiRegisterForPath("/x/node_modules/pi-committer/async-commit-worker.ts")!];
+
+        const rows = runDriver(repoDir, execArgv);
+        assert.strictEqual(rows.length, WORKER_RUNS, "driver should report one row per run");
+        for (const r of rows) {
+          assert.ok(typeof r.bootMs === "number" && r.bootMs > 0, "bootMs should be > 0");
+          assert.ok(typeof r.roundtripMs === "number" && r.roundtripMs > 0, "roundtripMs should be > 0");
+        }
+        record(`worker boot->progress (${mode})`, String(WORKER_RUNS), rows.map((r) => r.bootMs));
+        record(`worker boot->result (${mode})`, String(WORKER_RUNS), rows.map((r) => r.roundtripMs));
+      });
+    }
+  });
+
+  // ===================================================================
+  // parseDiffHunks — pure diff-content parser (large synthetic diff)
+  // ===================================================================
+
+  describe("parseDiffHunks (pure)", () => {
+    it("500 files x 10 hunks synthetic diff", () => {
+      const lines: string[] = [];
+      for (let f = 0; f < 500; f++) {
+        lines.push(`diff --git a/src/mod-${f}.ts b/src/mod-${f}.ts`);
+        lines.push(`index 0000001..1000002 100644`);
+        lines.push(`--- a/src/mod-${f}.ts`);
+        lines.push(`+++ b/src/mod-${f}.ts`);
+        for (let h = 0; h < 10; h++) {
+          lines.push(`@@ -${h * 5},6 +${h * 5},7 @@ function area${f}_${h}()`);
+          lines.push(` const a${h} = ${h};`);
+          lines.push(`-const old${h} = ${h - 1};`);
+          lines.push(`+const next${h} = ${h + 1};`);
+          lines.push(` return a${h} + next${h};`);
+          lines.push(`}`);
+        }
+      }
+      const diff = lines.join("\n");
+
+      const timings: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const start = performance.now();
+        const hunks = parseDiffHunks(diff);
+        timings.push(performance.now() - start);
+        assert.strictEqual(hunks.length, 500, "should parse 500 files");
+      }
+      record("parseDiffHunks (500 files)", "5000", timings);
+    });
+  });
+
+  // ===================================================================
+  // sampleRepoCommitStyle — opt-in git-log sampling (match_repo_style)
+  // ===================================================================
+
+  describe("sampleRepoCommitStyle", () => {
+    it("repo with 30 commits", () => {
+      const repoDir = mkdtempSync(path.join(tmpDir(), "bench-style-"));
+      after(() => { try { rmSync(repoDir, { recursive: true, force: true }); } catch { /* */ } });
+      makeBenchRepo(repoDir, "style");
+      for (let i = 0; i < 29; i++) {
+        execSync(`git commit --allow-empty -q -m "feat(area): change ${i}"`, {
+          cwd: repoDir, stdio: "ignore",
+        });
+      }
+
+      const timings: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        const style = sampleRepoCommitStyle(repoDir, 15);
+        timings.push(performance.now() - start);
+        assert.ok(style.history.length > 0, "should sample commit history");
+      }
+      record("sampleRepoCommitStyle (30 commits)", "15", timings);
+    });
+  });
+
+  // ===================================================================
+  // loadConfig — config file discovery + TOML parse
+  // ===================================================================
+
+  describe("loadConfig", () => {
+    it("without config file", () => {
+      const dir = mkdtempSync(path.join(tmpDir(), "bench-cfg-"));
+      after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } });
+      const timings: number[] = [];
+      for (let i = 0; i < 20; i++) {
+        const start = performance.now();
+        loadConfig(dir);
+        timings.push(performance.now() - start);
+      }
+      record("loadConfig (no file)", "20", timings);
+    });
+
+    it("with config file", () => {
+      const dir = mkdtempSync(path.join(tmpDir(), "bench-cfg2-"));
+      after(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } });
+      writeFileSync(
+        path.join(dir, ".pi-committer.toml"),
+        "trigger_mode = \"on_goal\"\nstaged_commits = true\nasync_threshold = 5\nmatch_repo_style = false\n",
+      );
+      const timings: number[] = [];
+      for (let i = 0; i < 20; i++) {
+        const start = performance.now();
+        const cfg = loadConfig(dir);
+        timings.push(performance.now() - start);
+        assert.strictEqual(cfg.asyncThreshold, 5);
+      }
+      record("loadConfig (with file)", "20", timings);
+    });
+  });
+
+  // ===================================================================
+  // Widget rendering — JS-side widget state assembly (TUI render is pi-tui's)
+  // ===================================================================
+
+  describe("widget render (JS-side)", () => {
+    const theme = {
+      fg: (_c: string, s: string) => s,
+      bg: (_c: string, s: string) => s,
+      dim: (s: string) => s,
+      bold: (s: string) => s,
+    } as any;
+
+    it("renderCommitterWidgetLines with populated progress", () => {
+      const progress: CommitterProgress = {
+        phase: "committing",
+        startedAt: Date.now() - 3000,
+        fileCount: 42,
+        statusMessage: "Committing 3/5...",
+        commitLog: [
+          { hash: "abc1234", message: "feat: first group", success: true },
+          { hash: "def5678", message: "fix: second group", success: false },
+        ],
+      } as any;
+      const timings: number[] = [];
+      for (let i = 0; i < 100; i++) {
+        const start = performance.now();
+        const lines = renderCommitterWidgetLines(progress, theme, 80);
+        timings.push(performance.now() - start);
+        assert.ok(lines.length > 0);
+      }
+      record("renderCommitterWidgetLines", "100", timings);
+    });
+
+    it("truncateText + formatDuration micro", () => {
+      const timings: number[] = [];
+      for (let i = 0; i < 100; i++) {
+        const start = performance.now();
+        truncateText("some long message ".repeat(10), 40);
+        formatDuration(123.456);
+        timings.push(performance.now() - start);
+      }
+      record("widget text helpers", "100", timings);
+    });
+  });
+
+  // ===================================================================
+  // resolveCommitMessage + validation — pure message pipeline
+  // ===================================================================
+
+  describe("resolveCommitMessage + validation (pure)", () => {
+    const diffStat = "src/a.ts | 3 ++\nsrc/b.ts | 2 +-\n2 files changed, 5 insertions(+), 2 deletions(-)";
+    const diffContent = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "index 111..222 100644",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " const x = 1;",
+      "+export const y = 2;",
+      " return x;",
+    ].join("\n");
+
+    it("isValidCommitMessage (valid + invalid mix)", () => {
+      const timings: number[] = [];
+      for (let i = 0; i < 20; i++) {
+        const start = performance.now();
+        assert.strictEqual(isValidCommitMessage("feat(scope): add thing with detail here"), true);
+        assert.strictEqual(isValidCommitMessage("update 3 files"), false);
+        timings.push(performance.now() - start);
+      }
+      record("isValidCommitMessage", "20", timings);
+    });
+
+    it("resolveCommitMessage (valid passthrough + deterministic fallback)", () => {
+      const timings: number[] = [];
+      for (let i = 0; i < 20; i++) {
+        const start = performance.now();
+        const valid = resolveCommitMessage("feat(scope): add thing with detail here", diffStat, diffContent, ["src/a.ts", "src/b.ts"]);
+        assert.ok(valid, "valid message should pass through");
+        const regenerated = resolveCommitMessage("garbage", diffStat, diffContent, ["src/a.ts", "src/b.ts"]);
+        assert.ok(regenerated && regenerated.includes(":"), "invalid message should regenerate deterministically");
+        timings.push(performance.now() - start);
+      }
+      record("resolveCommitMessage", "20", timings);
+    });
+  });
+
 });

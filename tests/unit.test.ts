@@ -76,6 +76,7 @@ import piCommitter, {
   _getAsyncCommitFileCount,
   _getCommitterProgress,
   _hasPendingCommitterHide,
+  _cancelPendingCommitterHide,
 
   // State
   getSelectedSubagentModel,
@@ -2066,6 +2067,9 @@ describe("session shutdown cleanup", () => {
       },
     });
 
+    // Cancel any leaked real hide timer from earlier tests before enabling
+    // mock timers, so it cannot clear this test's timer mid-test.
+    _cancelPendingCommitterHide();
     mock.timers.enable({ apis: ["setTimeout"] });
     try {
       assert.strictEqual(await tryCommit(dir, ctx, true, undefined, false), 1);
@@ -2109,9 +2113,15 @@ describe("async commit threshold", () => {
   before(() => {
     originalConfig = getConfig();
     repoDir = createTempRepo();
+    // Cancel any leaked real hide timer scheduled by earlier tests (module-level
+    // __committerHideTimer) — it would otherwise fire ~6s in and null
+    // __committerProgress mid-test.
+    _cancelPendingCommitterHide();
   });
 
   after(() => {
+    // Never leave a pending hide timer for the suites that follow.
+    _cancelPendingCommitterHide();
     setConfig(originalConfig);
     __setCreateAgentSessionMock(undefined);
     removeDir(repoDir);
@@ -2132,7 +2142,12 @@ describe("async commit threshold", () => {
     // This would try to commit (no subagent mock), but should NOT trigger async
     // since asyncThreshold is 0. Without a subagent mock, commitStaged will fail
     // so it returns 0.
-    const result = await tryCommit(dir, mockCtx(), true, undefined);
+    let result;
+    try {
+      result = await tryCommit(dir, mockCtx(), true, undefined);
+    } finally {
+      _cancelPendingCommitterHide();
+    }
     assert.strictEqual(typeof result, "number");
     // -1 = async started. We should NOT see -1 since asyncThreshold=0
     assert.notStrictEqual(result, -1, "should NOT trigger async when asyncThreshold=0");
@@ -2151,7 +2166,12 @@ describe("async commit threshold", () => {
     writeFileSync(path.join(dir, "c.ts"), "// c\n");
 
     // Should NOT trigger async since file count (3) < threshold (20)
-    const result = await tryCommit(dir, mockCtx(), true, undefined);
+    let result;
+    try {
+      result = await tryCommit(dir, mockCtx(), true, undefined);
+    } finally {
+      _cancelPendingCommitterHide();
+    }
     assert.notStrictEqual(result, -1, "should NOT trigger async when files < threshold");
     // Without subagent mock, commit may fail, but result should be 0 (not -1)
     assert.ok(result >= 0, "result should be >= 0 when not async");
@@ -2170,7 +2190,12 @@ describe("async commit threshold", () => {
     }
 
     // Call without force (simulates auto-trigger) — should NOT trigger async
-    const result = await tryCommit(dir, mockCtx(), false, undefined);
+    let result;
+    try {
+      result = await tryCommit(dir, mockCtx(), false, undefined);
+    } finally {
+      _cancelPendingCommitterHide();
+    }
     assert.notStrictEqual(result, -1, "should NOT trigger async when force=false");
   });
 
@@ -2214,6 +2239,7 @@ describe("async commit threshold", () => {
       // The async started flag should be set
       assert.ok(_getAsyncCommitStarted(), "async commit flag should be set");
     } finally {
+      _cancelPendingCommitterHide();
       // Restore fork mock
       __setForkMock(undefined);
       // Reset config
@@ -2244,8 +2270,10 @@ describe("async commit threshold", () => {
     mockChild.kill = (signal?: string) => {
       killCalled = true;
       killSignal = signal || "";
-      // Simulate SIGTERM by emitting exit
-      setImmediate(() => mockChild.emit("exit", null));
+      // Simulate SIGTERM by emitting exit synchronously. (A setImmediate here
+      // would fire the exit handler during a *later* test, leaking a stale
+      // fallback timer into it — the source of suite flakiness.)
+      mockChild.emit("exit", null);
     };
     mockChild.send = () => true;
     mockChild.unref = () => {};
@@ -2290,7 +2318,12 @@ describe("async commit threshold", () => {
       // Verify kill was called on the child process
       assert.ok(killCalled, "child.kill should be called on Esc");
       assert.strictEqual(killSignal, "SIGTERM", "should send SIGTERM");
+
+      // Consume the 500ms exit-fallback the synchronous exit just scheduled,
+      // so it cannot fire into the next test.
+      await new Promise((resolve) => setTimeout(resolve, 600));
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2350,6 +2383,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(capturedSend!.params.stagedCommits, originalConfig.stagedCommits, "params should include stagedCommits");
       assert.ok(capturedSend!.params.allFiles.length >= 5, "should have at least 5 files");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2409,6 +2443,7 @@ describe("async commit threshold", () => {
       // The flag should be cleared after result
       assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after error result");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2460,6 +2495,7 @@ describe("async commit threshold", () => {
       // The flag should eventually be cleared
       assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after crash");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2510,7 +2546,11 @@ describe("async commit threshold", () => {
 
       // The flag should be cleared after exit
       assert.strictEqual(_getAsyncCommitStarted(), false, "flag cleared after exit");
+
+      // Consume the 500ms exit-fallback so it cannot fire into the next test.
+      await new Promise((resolve) => setTimeout(resolve, 600));
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2584,6 +2624,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(progress!.commitLog.length, 2, "should have the result's commit log");
       assert.strictEqual(_getAsyncCommitStarted(), false, "async flag cleared");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2663,6 +2704,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(progress!.commitLog.length, 3, "commit log should come from the delayed result");
       assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2736,6 +2778,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(_getAsyncCommitStarted(), true, "async started flag should be set");
       assert.strictEqual(_getAsyncCommitFileCount(), 5, "async file count should be set");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2853,6 +2896,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(progress!.commitLog.length, 2, "commit log should have 2 entries");
       assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared on result");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2923,6 +2967,7 @@ describe("async commit threshold", () => {
       assert.strictEqual(progress!.commitLog.length, 0);
       assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared on result");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -2984,6 +3029,7 @@ describe("async commit threshold", () => {
       );
       assert.strictEqual(_getAsyncCommitStarted(), false, "async flag should be cleared after crash");
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }
@@ -3052,6 +3098,7 @@ describe("async commit threshold", () => {
         "error should mention subprocess exit, got: " + progress!.error,
       );
     } finally {
+      _cancelPendingCommitterHide();
       __setForkMock(undefined);
       setConfig(originalConfig);
     }

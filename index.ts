@@ -238,6 +238,19 @@ export function _hasPendingCommitterHide(): boolean {
   return __committerHideTimer !== null;
 }
 
+function cancelPendingCommitterHide(): void {
+  if (__committerHideTimer) {
+    clearTimeout(__committerHideTimer);
+    __committerHideTimer = null;
+  }
+}
+
+/** Export for unit tests: cancel a pending delayed hide timer (e.g. one leaked
+ * from an earlier test that used real timers). */
+export function _cancelPendingCommitterHide(): void {
+  cancelPendingCommitterHide();
+}
+
 // ---------------------------------------------------------------------------
 // Widget state
 // ---------------------------------------------------------------------------
@@ -365,10 +378,7 @@ function hideCommitterWidget(ctx: ExtensionContext, expectedProgress?: Committer
   if (expectedProgress !== undefined && __committerProgress !== expectedProgress) {
     return;
   }
-  if (__committerHideTimer) {
-    clearTimeout(__committerHideTimer);
-    __committerHideTimer = null;
-  }
+  cancelPendingCommitterHide();
   stopCommitterAnimation();
   // NOTE: deliberately NOT killing the async worker here. The worker is
   // forked detached + unref'd (and carries its own 5-minute timeout) so it

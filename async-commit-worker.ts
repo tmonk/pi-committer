@@ -54,6 +54,19 @@ interface CommitWorkerParams {
    * staged. Mirrors the deterministic_fallback config setting.
    */
   deterministicFallback: boolean;
+  /**
+   * Optional commit-message intent passed by the agent via commit_changes:
+   * - `message`: short freeform summary of what the commit message should
+   *   include or how it should be structured (guides the subagent prompt).
+   * - `verbatim`: exact commit message text to use as-is, overriding
+   *   subagent/deterministic generation. Never edited or reformatted.
+   */
+  messageRequest?: MessageRequest;
+}
+
+interface MessageRequest {
+  message?: string;
+  verbatim?: string;
 }
 
 interface CommitLogEntry {
@@ -780,6 +793,7 @@ export function buildCommitMessagePrompt(
   diffStat: string,
   diffContent: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  request?: MessageRequest,
 ): string {
   const truncatedDiff =
     diffContent.length > 8000
@@ -807,6 +821,14 @@ export function buildCommitMessagePrompt(
   const styleBlock = formatStyleContext(style);
   if (styleBlock) {
     lines.push("", styleBlock);
+  }
+  const requestText = request?.message?.trim();
+  if (requestText) {
+    lines.push(
+      "",
+      "User message request — the commit message MUST cover these points (where they apply to the diff):",
+      requestText,
+    );
   }
   lines.push("", "Diff stat:", diffStat, "", "Full diff:", truncatedDiff);
   return lines.join("\n");
@@ -1070,6 +1092,7 @@ export async function generateCommitMessage(
   subagentThinkingLevel?: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
   allowDeterministic = false,
+  request?: MessageRequest,
 ): Promise<string> {
   const _sdkOk = await tryLoadSDK();
   if (!_sdkOk || !subagentModel) {
@@ -1081,7 +1104,7 @@ export async function generateCommitMessage(
     return gatedDeterministicMessage(diffStat, diffContent, files, style, allowDeterministic);
   }
 
-  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style);
+  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style, request);
 
   let generated = await runWorkerMessageSession(
     prompt,
@@ -1139,6 +1162,7 @@ export async function generateCommitGroups(
   subagentThinkingLevel?: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
   allowDeterministic = false,
+  request?: MessageRequest,
 ): Promise<Array<{ message: string; files: string[] }>> {
   // Fallback: single group (SDK not available or no model configured)
   const _sdkOk = await tryLoadSDK();
@@ -1177,6 +1201,18 @@ export async function generateCommitGroups(
     "",
     `Changed files (${allFiles.length}):`,
     fileListStr,
+  ];
+
+  const requestText = request?.message?.trim();
+  if (requestText) {
+    prompt.push(
+      "",
+      "User message request — each commit message MUST cover these points where they apply to its group:",
+      requestText,
+    );
+  }
+
+  prompt.push(
     "",
     "Diff stat:",
     diffStat,
@@ -1195,7 +1231,7 @@ export async function generateCommitGroups(
     "...",
     "",
     "If all changes belong in one commit, output a single COMMIT GROUP.",
-  ];
+  );
 
   const styleBlock = formatStyleContext(style);
   if (styleBlock) {
@@ -1405,6 +1441,7 @@ export async function doSingleCommit(
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
   skipSubagent = false,
+  request?: MessageRequest,
 ): Promise<CommitLogEntry | undefined> {
   // Batch-stage all files (larger batch = fewer subprocess calls)
   const batchSize = 5000;
@@ -1437,6 +1474,39 @@ export async function doSingleCommit(
   // read the repo's git history for style context (default: no git-log calls).
   const style = params.matchRepoStyle ? sampleRepoCommitStyle(dir) : EMPTY_COMMIT_STYLE;
 
+  // Verbatim path: the caller supplied the exact commit message text.
+  // Message generation is skipped entirely and the text is used exactly as
+  // provided — never edited, prefixed, or reformatted. An invalid verbatim
+  // blocks the commit (changes stay staged) instead of a silent rewrite.
+  const verbatimRaw = request?.verbatim ?? "";
+  const verbatim = verbatimRaw.trim();
+  if (verbatim) {
+    if (aborted) {
+      unstageAll(dir);
+      return undefined;
+    }
+    if (!isValidCommitMessage(verbatim)) {
+      console.error(
+        "[pi-committer] DIAG: worker blocked verbatim commit — message is not a valid conventional commit message",
+      );
+      return {
+        hash: "",
+        message:
+          "Skipped commit: the verbatim commit message is not a valid conventional commit message " +
+          "(expected <type>(<scope>): <description>). Changes were left staged.",
+        success: false,
+      };
+    }
+    execSync("git commit -F -", {
+      cwd: dir,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "ignore"],
+      input: verbatimRaw,
+    });
+    const hash = getHeadHash(dir);
+    return { hash, message: verbatimRaw, success: true };
+  }
+
   // Generate commit message — skip subagent for small change sets
   const message = await generateCommitMessage(
     diffStat,
@@ -1456,6 +1526,7 @@ export async function doSingleCommit(
     },
     params.subagentThinkingLevel,
     style,
+    request,
   );
 
   if (aborted) {
@@ -1530,6 +1601,7 @@ export async function doGroupedCommits(
     params.subagentThinkingLevel,
     style,
     params.deterministicFallback,
+    request,
   );
 
   if (aborted) {
@@ -1708,7 +1780,13 @@ process.on("message", async (msg: any) => {
 
     // Show progress immediately (mimics sync path's initial widget state).
     // Only show 'analyzing' phase when the subagent will actually be called.
-    const useSubagent = stagedCommits && files.length > 1 && files.length >= subagentGroupingMinFiles;
+    // Verbatim forces a single commit containing all changes — staged-commits
+    // grouping is skipped when the caller supplied an exact message.
+    const useSubagent =
+      stagedCommits &&
+      files.length > 1 &&
+      files.length >= subagentGroupingMinFiles &&
+      !params.messageRequest?.verbatim?.trim();
     sendProgress({
       phase: useSubagent ? "analyzing" : "committing",
       fileCount: files.length,
@@ -1730,9 +1808,17 @@ process.on("message", async (msg: any) => {
 
     _warnings = [];
 
-    if (stagedCommits && files.length > 1 && files.length >= params.subagentGroupingMinFiles) {
+    if (
+      stagedCommits &&
+      files.length > 1 &&
+      files.length >= params.subagentGroupingMinFiles &&
+      !params.messageRequest?.verbatim?.trim()
+    ) {
       // ---- Agent-decided staged commit mode ----
-      const result = await doGroupedCommits(dir, ctx, files, params, { onProgress: sendProgress, onCommit: sendCommit });
+      const result = await doGroupedCommits(dir, ctx, files, params, {
+        onProgress: sendProgress,
+        onCommit: sendCommit,
+      }, params.messageRequest);
       commitCount = result.commitCount;
       commitLog = result.commitLog;
       _warnings = result.warnings;
@@ -1743,7 +1829,15 @@ process.on("message", async (msg: any) => {
       // generates a single commit message (good descriptions, no grouping).
       const skipSubagent =
         params.deterministicFallback && files.length < subagentMessageMinFiles;
-      const entry = await doSingleCommit(dir, ctx, files, params, { onProgress: sendProgress }, skipSubagent);
+      const entry = await doSingleCommit(
+        dir,
+        ctx,
+        files,
+        params,
+        { onProgress: sendProgress },
+        skipSubagent,
+        params.messageRequest,
+      );
       if (entry && entry.success) {
         commitCount = 1;
         commitLog = [entry];

@@ -87,6 +87,17 @@ export interface CommitterConfig {
    * Default: false (opt-in).
    */
   matchRepoStyle: boolean;
+  /**
+   * When true (default), an async (background) commit delivers a completion
+   * message into the session when the worker finishes: a custom message the
+   * agent sees (delivered once the agent has no more tool calls, triggering
+   * a turn if idle) summarizing the result (commit hashes + summaries, or
+   * the error). This lets the agent continue working instead of sleeping or
+   * polling for the background commit. Set to false to suppress only the
+   * injected session message — the TUI notification still fires.
+   * Default: true.
+   */
+  notifyAsyncCompletion: boolean;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -106,6 +117,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   deterministicFallback: false,
   subagentThinkingLevel: "off",
   matchRepoStyle: false,
+  notifyAsyncCompletion: true,
 };
 
 const CONVENTIONAL_TYPES = [
@@ -271,6 +283,10 @@ function applyConfig(
 
   if (typeof raw.match_repo_style === "boolean") {
     config.matchRepoStyle = raw.match_repo_style;
+  }
+
+  if (typeof raw.notify_async_completion === "boolean") {
+    config.notifyAsyncCompletion = raw.notify_async_completion;
   }
 
   return config;

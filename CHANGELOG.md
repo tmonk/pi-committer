@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Async (background) commits now deliver a completion notification into the
+  session when the worker finishes: a `pi-committer` custom message the agent
+  sees (commit hashes + summaries, or the error), delivered once the agent has
+  no more tool calls and triggering a turn if idle — plus a TUI notification.
+  The agent therefore never needs to `sleep`, wait, or poll for a background
+  commit; `commit_changes` guidance and the async tool-result text now forbid
+  it explicitly. The injected session message can be disabled with the new
+  `notify_async_completion` config key (default `true`; the TUI notification
+  always fires). Exactly one notification is sent per async run, including the
+  exit-without-result and delayed-result race paths.
+
+- `commit_changes` accepts two optional parameters so the agent can pass
+  commit-message intent: `message` (short freeform summary of what the message
+  should include / how it should be structured, appended to the subagent
+  prompt as a "user message request") and `verbatim` (exact commit message
+  text, used as-is). `verbatim` skips message generation entirely and forces a
+  single commit containing all changes (staged-commits grouping is bypassed);
+  an invalid verbatim (fails the conventional-format check) blocks the commit
+  with a clear warning and leaves changes staged — the text is never edited,
+  prefixed, or reformatted. Both parameters work in the sync and background
+  (async) commit paths. `commit_changes` guidance now directs the agent to
+  prefer passing the user's requested message as `verbatim` rather than
+  rewriting it.
+
 ## [0.14.0] — 2026-08-05
 
 ### Changed

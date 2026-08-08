@@ -43,6 +43,7 @@ import piCommitter, {
   parseDiffHunks,
   hasBinaryChanges,
   sampleRepoCommitStyle,
+  EMPTY_COMMIT_STYLE,
   buildCommitMessagePrompt,
   findCommonAncestor,
   isValidDiffContent,
@@ -59,6 +60,16 @@ import piCommitter, {
 
   // Fork mock
   __setForkMock,
+
+  // Async completion notification
+  __setSendCompletionMessageMock,
+  formatAsyncCompletion,
+  ASYNC_COMMIT_NO_SLEEP_GUIDELINE,
+  ASYNC_COMMIT_RESULT_TAIL,
+  COMMIT_MESSAGE_REQUEST_GUIDELINE,
+  commitChangesSchema,
+  _getCommitWarnings,
+  resetCommitWarnings,
 
   // Session / goals
   findOtherReposFromSession,
@@ -267,6 +278,40 @@ async_threshold = 0
     assert.strictEqual(cfg.asyncThreshold, 0);
 
     fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("defaults notify_async_completion to true when not in config", () => {
+    const toml = `[committer]
+enabled = true
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.notifyAsyncCompletion, true);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("parses notify_async_completion from .pi-committer.toml", () => {
+    const toml = `[committer]
+notify_async_completion = false
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.notifyAsyncCompletion, false);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("parses notify_async_completion from .pi-committer.json", () => {
+    const json = JSON.stringify({ committer: { notify_async_completion: false } });
+    writeFileSync(path.join(dir, ".pi-committer.json"), json, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.notifyAsyncCompletion, false);
+
+    fs.rmSync(path.join(dir, ".pi-committer.json"));
   });
 
   it("loads .pi-committer.toml", () => {
@@ -3131,6 +3176,464 @@ describe("async commit threshold", () => {
 });
 
 // ===========================================================================
+// Async completion notification tests
+// ===========================================================================
+
+describe("async completion notification", () => {
+  // Full default config (loadConfig merges DEFAULT_CONFIG) — the module-level
+  // `config` is undefined at describe-registration time, so spreading
+  // getConfig() here would drop every default field (incl. notifyAsyncCompletion).
+  const originalConfig = { ...loadConfig(process.cwd()) };
+
+  /**
+   * Set up a fake fork child + ctx pair and start an async commit.
+   * Returns the mock child so the test can emit IPC messages.
+   */
+  async function setupAsyncCommit(
+    dir: string,
+    uiNotify: (msg: string, level?: string) => void,
+  ): Promise<any> {
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 77771;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+    mockChild.send = () => true;
+
+    __setForkMock((_p: string, _a: string[], _o: any) => mockChild as any);
+
+    const ctx = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: uiNotify,
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    const result = await tryCommit(dir, ctx, true, undefined);
+    assert.strictEqual(result, -1, "should start async");
+    return mockChild;
+  }
+
+  /** Create N files so the change set exceeds the (low) async threshold. */
+  function seedFiles(dir: string, prefix: string, n = 5): void {
+    for (let i = 0; i < n; i++) {
+      writeFileSync(path.join(dir, `${prefix}-${i}.ts`), `// ${prefix} ${i}\n`);
+    }
+  }
+
+  it("delivers a session message and TUI notification on success result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-ok");
+
+    const sent: Array<{ content: string; details: unknown; options: unknown }> = [];
+    __setSendCompletionMessageMock((message, options) => {
+      sent.push({ content: message.content, details: message.details, options });
+    });
+
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 2,
+        commitLog: [
+          { hash: "abc1234", message: "feat: first commit", success: true },
+          { hash: "def5678", message: "fix: second commit", success: true },
+        ],
+      });
+
+      // Exactly one session message, delivered as a followUp that triggers a turn
+      assert.strictEqual(sent.length, 1, "exactly one session message");
+      assert.match(sent[0].content, /✓ Background commit complete: 2 commit\(s\)/);
+      assert.match(sent[0].content, /abc1234/);
+      assert.match(sent[0].content, /def5678/);
+      assert.deepStrictEqual(sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
+      const details = sent[0].details as any;
+      assert.strictEqual(details.async, true);
+      assert.strictEqual(details.commitCount, 2);
+
+      // TUI notification fired with the success level (after the initial
+      // "running in background" info notification).
+      const completionNotifies = notifies.filter((n) => /Background commit complete/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1, "TUI completion notification");
+      assert.strictEqual(completionNotifies[0].level, "success");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("delivers a failure session message on error result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-err");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Something went wrong in the worker",
+      });
+
+      assert.strictEqual(sent.length, 1, "exactly one session message");
+      assert.match(sent[0].content, /Background commit failed: Something went wrong in the worker/);
+
+      const completionNotifies = notifies.filter((n) => /Background commit failed/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1);
+      assert.strictEqual(completionNotifies[0].level, "error");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("treats a cancelled worker result as an info notification", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-cancel");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 0,
+        commitLog: [],
+        error: "Cancelled.",
+      });
+
+      assert.strictEqual(sent.length, 1);
+      assert.match(sent[0].content, /Background commit cancelled/);
+
+      const completionNotifies = notifies.filter((n) => /Background commit cancelled/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1);
+      assert.strictEqual(completionNotifies[0].level, "info");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("notifies on unexpected worker exit (after the delayed-result fallback)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-exit");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      // Worker exits with code 1 before sending a result — the parent waits
+      // 500ms for a delayed result, then falls back to the exit error.
+      mockChild.emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+
+      assert.strictEqual(sent.length, 1, "exactly one session message");
+      assert.match(sent[0].content, /Background commit failed: Subprocess exited with code 1/);
+
+      const completionNotifies = notifies.filter((n) => /Subprocess exited with code 1/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1);
+      assert.strictEqual(completionNotifies[0].level, "error");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("notifies success when the result arrives after exit (delayed-result path)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-delayed");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      // Exit arrives before the result (IPC race); the result then lands
+      // within the 500ms window and wins.
+      mockChild.emit("exit", 1);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 1,
+        commitLog: [{ hash: "aaa1111", message: "feat: delayed", success: true }],
+      });
+
+      assert.strictEqual(sent.length, 1, "exactly one session message");
+      assert.match(sent[0].content, /✓ Background commit complete: 1 commit\(s\) — aaa1111/);
+
+      // Let the fallback timer window pass — still exactly one notification.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.strictEqual(sent.length, 1, "fallback must not add a second notification");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("delivers exactly one notification when result is followed by exit (dedupe)", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-dedupe");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const mockChild = await setupAsyncCommit(dir, () => {});
+
+    try {
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 1,
+        commitLog: [{ hash: "bbb2222", message: "feat: one", success: true }],
+      });
+      mockChild.emit("exit", 1);
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 1,
+        commitLog: [{ hash: "ccc3333", message: "feat: dup", success: true }],
+      });
+
+      assert.strictEqual(sent.length, 1, "one notification per async run");
+      assert.match(sent[0].content, /bbb2222/);
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("notifies 'no commits created' on clean worker exit without result", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-clean");
+
+    const sent: Array<{ content: string }> = [];
+    __setSendCompletionMessageMock((message) => {
+      sent.push({ content: message.content });
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      mockChild.emit("exit", 0);
+
+      assert.strictEqual(sent.length, 1, "exactly one session message");
+      assert.match(sent[0].content, /Background commit finished — no commits created/);
+
+      const completionNotifies = notifies.filter((n) => /no commits created/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1);
+      assert.strictEqual(completionNotifies[0].level, "info");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("suppresses the session message when notify_async_completion=false but still TUI-notifies", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3, notifyAsyncCompletion: false });
+    seedFiles(dir, "notify-off");
+
+    let sentCount = 0;
+    __setSendCompletionMessageMock(() => {
+      sentCount++;
+    });
+    const notifies: Array<{ msg: string; level?: string }> = [];
+    const mockChild = await setupAsyncCommit(dir, (msg, level) => notifies.push({ msg, level }));
+
+    try {
+      mockChild.emit("message", {
+        type: "result",
+        commitCount: 1,
+        commitLog: [{ hash: "ddd4444", message: "feat: muted", success: true }],
+      });
+
+      assert.strictEqual(sentCount, 0, "session message suppressed by config");
+      const completionNotifies = notifies.filter((n) => /Background commit complete/.test(n.msg));
+      assert.strictEqual(completionNotifies.length, 1, "TUI notification still fires");
+      assert.strictEqual(completionNotifies[0].level, "success");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      __setSendCompletionMessageMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("async worker start payload carries the commit message request", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+    seedFiles(dir, "notify-payload");
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 77772;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    const sent: any[] = [];
+    mockChild.send = (msg: any) => {
+      sent.push(msg);
+      return true;
+    };
+    __setForkMock((_p: string, _a: string[], _o: any) => mockChild as any);
+
+    const ctx = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctx, true, undefined, true, {
+        message: "cover the retry logic",
+        verbatim: "feat(api): exact async message",
+      });
+      assert.strictEqual(result, -1, "should start async");
+
+      const start = sent.find((m) => m?.type === "start");
+      assert.ok(start, "start IPC message must be sent");
+      assert.deepStrictEqual(start.params.messageRequest, {
+        message: "cover the retry logic",
+        verbatim: "feat(api): exact async message",
+      });
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("formatAsyncCompletion formats success, failure, cancelled, and empty results", () => {
+    const ok = formatAsyncCompletion({
+      commitCount: 1,
+      commitLog: [{ hash: "abc1234", message: "feat: x", success: true }],
+    });
+    assert.strictEqual(ok.level, "success");
+    assert.match(ok.text, /✓ Background commit complete: 1 commit\(s\) — abc1234 feat: x/);
+
+    const err = formatAsyncCompletion({ commitCount: 0, commitLog: [], error: "boom" });
+    assert.strictEqual(err.level, "error");
+    assert.match(err.text, /Background commit failed: boom/);
+
+    const cancelled = formatAsyncCompletion({ commitCount: 0, commitLog: [], error: "Cancelled." });
+    assert.strictEqual(cancelled.level, "info");
+    assert.match(cancelled.text, /Background commit cancelled/);
+
+    const empty = formatAsyncCompletion({ commitCount: 0, commitLog: [] });
+    assert.strictEqual(empty.level, "info");
+    assert.match(empty.text, /no commits created/);
+  });
+
+  it("guidance forbids sleeping/waiting/polling and announces the completion notification", () => {
+    assert.match(ASYNC_COMMIT_NO_SLEEP_GUIDELINE, /NEVER sleep, wait, or poll/i);
+    assert.match(ASYNC_COMMIT_NO_SLEEP_GUIDELINE, /completion notification/i);
+    assert.match(ASYNC_COMMIT_NO_SLEEP_GUIDELINE, /Continue your work/i);
+    assert.match(ASYNC_COMMIT_RESULT_TAIL, /NEVER sleep, wait, or poll/i);
+    assert.match(ASYNC_COMMIT_RESULT_TAIL, /completion notification is delivered to the session/i);
+  });
+
+  it("message-request guidance prefers verbatim commit messages", () => {
+    assert.match(COMMIT_MESSAGE_REQUEST_GUIDELINE, /PREFER passing it as the `verbatim` parameter/i);
+    assert.match(COMMIT_MESSAGE_REQUEST_GUIDELINE, /never silently replace or edit/i);
+    assert.match(COMMIT_MESSAGE_REQUEST_GUIDELINE, /`message` parameter/i);
+  });
+
+  it("commit_changes schema exposes optional message and verbatim string params", () => {
+    assert.strictEqual(commitChangesSchema.type, "object");
+    assert.strictEqual(commitChangesSchema.properties.message.type, "string");
+    assert.strictEqual(commitChangesSchema.properties.verbatim.type, "string");
+    const required = (commitChangesSchema.required ?? []) as string[];
+    assert.ok(!required.includes("message"), "message must be optional");
+    assert.ok(!required.includes("verbatim"), "verbatim must be optional");
+  });
+
+  it("buildCommitMessagePrompt includes the user message request when provided", () => {
+    const prompt = buildCommitMessagePrompt(
+      "src/api.ts | 3 ++",
+      "+export const retry = 3",
+      EMPTY_COMMIT_STYLE,
+      { message: "mention the new retry logic and the config migration" },
+    );
+    assert.match(prompt, /User message request/);
+    assert.match(prompt, /mention the new retry logic and the config migration/);
+    assert.match(prompt, /MUST cover these points/);
+  });
+
+  it("buildCommitMessagePrompt omits the request block when no request is given", () => {
+    const prompt = buildCommitMessagePrompt("src/api.ts | 3 ++", "+export const retry = 3", EMPTY_COMMIT_STYLE);
+    assert.ok(!prompt.includes("User message request"), "no request block without a request");
+    assert.ok(!prompt.includes("MUST cover these points"));
+  });
+});
+
+// ===========================================================================
 // Async commit widget rendering tests
 // ===========================================================================
 
@@ -3442,6 +3945,155 @@ describe("commit error handling", () => {
         cwd: repoDir, encoding: "utf-8",
       }).trim();
       assert.strictEqual(log.split("\n").length, 1, "No commit should have been made");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // commitStaged verbatim + message request (commit_changes params)
+  // -----------------------------------------------------------------------
+
+  it("commitStaged uses the verbatim message exactly as provided", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    writeFileSync(path.join(repoDir, "verbatim-a.ts"), "// a\n");
+    writeFileSync(path.join(repoDir, "verbatim-b.ts"), "// b\n");
+    execSync("git add -A", { cwd: repoDir, stdio: "ignore" });
+
+    // A spy that must never be invoked: verbatim skips generation entirely.
+    let subagentCalls = 0;
+    __setCreateAgentSessionMock(async () => {
+      subagentCalls++;
+      return { session: { prompt: async () => {}, subscribe: () => () => {}, abort: () => {} } };
+    });
+
+    try {
+      const verbatim = "feat(api): add custom endpoint\n\nBody line exactly as given.";
+      const hash = await commitStaged(
+        repoDir,
+        mockCtx(),
+        ["verbatim-a.ts", "verbatim-b.ts"],
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        { verbatim },
+      );
+
+      assert.ok(hash, "verbatim commit should succeed");
+      assert.strictEqual(subagentCalls, 0, "verbatim must skip subagent generation");
+
+      const msg = execSync("git log -1 --format=%B", {
+        cwd: repoDir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+      });
+      assert.strictEqual(
+        msg,
+        verbatim + "\n\n",
+        "commit message must equal the verbatim text exactly (git adds one terminator newline; %B adds another)",
+      );
+
+      const log = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+      assert.strictEqual(log.split("\n").length, 2, "exactly one new commit");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("commitStaged blocks an invalid verbatim message with a warning and leaves changes staged", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    writeFileSync(path.join(repoDir, "bad-verbatim.ts"), "// bad\n");
+    execSync("git add bad-verbatim.ts", { cwd: repoDir, stdio: "ignore" });
+    resetCommitWarnings();
+
+    let subagentCalls = 0;
+    __setCreateAgentSessionMock(async () => {
+      subagentCalls++;
+      return { session: { prompt: async () => {}, subscribe: () => () => {}, abort: () => {} } };
+    });
+
+    try {
+      const result = await commitStaged(
+        repoDir,
+        mockCtx(),
+        ["bad-verbatim.ts"],
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        { verbatim: "this is not a conventional commit message" },
+      );
+
+      assert.strictEqual(result, undefined, "invalid verbatim must block the commit");
+      assert.strictEqual(subagentCalls, 0, "no generation should happen for an invalid verbatim");
+
+      const warnings = _getCommitWarnings();
+      assert.ok(
+        warnings.some((w) => /verbatim/.test(w) && /not a valid conventional commit/.test(w)),
+        `expected a verbatim warning, got: ${JSON.stringify(warnings)}`,
+      );
+
+      const log = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+      assert.strictEqual(log.split("\n").length, 1, "no commit should have been created");
+
+      const staged = execSync("git diff --cached --stat", {
+        cwd: repoDir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      assert.ok(staged, "changes should remain staged for a retry");
+    } finally {
+      __setCreateAgentSessionMock(undefined);
+    }
+  });
+
+  it("tryCommit with verbatim forces a single commit even when staged-commits grouping would trigger", async () => {
+    const repoDir = createTempRepo();
+    after(() => removeDir(repoDir));
+
+    setConfig({
+      ...originalConfig,
+      stagedCommits: true,
+      subagentGroupingMinFiles: 2,
+      subagentMessageMinFiles: 100, // never skip the subagent on size grounds
+      asyncThreshold: 0, // disable async for this test
+      deterministicFallback: false,
+    });
+
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(path.join(repoDir, `verbatim-group-${i}.ts`), `// g${i}\n`);
+    }
+
+    let subagentCalls = 0;
+    __setCreateAgentSessionMock(async () => {
+      subagentCalls++;
+      return { session: { prompt: async () => {}, subscribe: () => () => {}, abort: () => {} } };
+    });
+
+    try {
+      const verbatim = "feat(cli): ship the verbatim group test";
+      const count = await tryCommit(
+        repoDir,
+        mockCtx(),
+        true,
+        undefined,
+        false,
+        { verbatim },
+      );
+
+      assert.strictEqual(count, 1, "verbatim must produce exactly one commit");
+      assert.strictEqual(subagentCalls, 0, "grouping subagent must be bypassed for verbatim");
+
+      const msg = execSync("git log -1 --format=%B", {
+        cwd: repoDir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+      });
+      assert.strictEqual(msg, verbatim + "\n\n", "git stores verbatim + one terminator newline; %B adds another");
+
+      const log = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+      assert.strictEqual(log.split("\n").length, 2, "exactly one new commit");
     } finally {
       __setCreateAgentSessionMock(undefined);
     }

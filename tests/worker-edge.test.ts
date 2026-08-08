@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Import exported worker functions
@@ -57,8 +58,8 @@ import { resolveWorkerExecArgv } from "../index.ts";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/** Base temp directory for all test repos. */
-const _baseDir = fs.mkdtempSync("pi-worker-edge-");
+/** Base temp directory for all test repos (absolute, outside any git worktree). */
+const _baseDir = fs.mkdtempSync(path.join(tmpdir(), "pi-worker-edge-"));
 
 function createTempRepo(): string {
   const dir = mkdtempSync(path.join(_baseDir, "repo-"));
@@ -995,6 +996,120 @@ describe("worker IPC edge cases", () => {
       cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
     }).trim().split("\n").filter(Boolean);
     assert.deepStrictEqual(staged, ["blocked.ts"], "blocked changes remain staged");
+  });
+});
+
+// ===========================================================================
+// Worker message request (verbatim) — commit_changes params
+// ===========================================================================
+
+describe("worker message request (verbatim)", () => {
+  it("commits the verbatim message exactly and skips grouping", async () => {
+    const dir = createTempRepo();
+
+    // 3 files + stagedCommits + low grouping threshold would normally route to
+    // doGroupedCommits; verbatim must force the single-commit path instead.
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(path.join(dir, `verbatim-${i}.ts`), `// v${i}\n`);
+    }
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = diffStat
+      .split("\n").filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+
+    const verbatim = "feat(cli): exact worker verbatim message";
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir,
+      diffStat,
+      diffContent,
+      allFiles,
+      stagedCommits: true,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 2, // grouping would trigger without verbatim
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: true,
+      messageRequest: { verbatim },
+    });
+
+    assert.ok(msg, "should send a result message");
+    assert.strictEqual(msg.type, "result");
+    assert.strictEqual(msg.commitCount, 1, "verbatim must produce exactly one commit");
+    assert.strictEqual(exitCode, 0, "worker should exit with code 0");
+
+    const committed = execSync("git log -1 --format=%B", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    assert.strictEqual(
+      committed,
+      verbatim + "\n\n",
+      "commit message must equal the verbatim text exactly (git adds one terminator newline; %B adds another)",
+    );
+
+    const log = execSync("git log --oneline", { cwd: dir, encoding: "utf-8" }).trim();
+    assert.strictEqual(log.split("\n").length, 2, "exactly one new commit");
+  });
+
+  it("blocks an invalid verbatim with a warning and leaves changes staged", async () => {
+    const dir = createTempRepo();
+
+    writeFileSync(path.join(dir, "bad-v.ts"), "// bad\n");
+    execSync("git add bad-v.ts", { cwd: dir, stdio: "ignore" });
+
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = diffStat
+      .split("\n").filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir,
+      diffStat,
+      diffContent,
+      allFiles,
+      stagedCommits: false,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 4,
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: true,
+      messageRequest: { verbatim: "this is not conventional" },
+    });
+
+    assert.ok(msg, "should send a result message");
+    assert.strictEqual(msg.type, "result");
+    assert.strictEqual(msg.commitCount, 0, "invalid verbatim must not commit");
+    assert.ok(
+      (msg.warnings ?? []).some(
+        (w: string) => w.includes("verbatim") && w.includes("not a valid conventional commit"),
+      ),
+      `should warn about the invalid verbatim, got: ${JSON.stringify(msg.warnings)}`,
+    );
+    assert.strictEqual(exitCode, 0, "exit code must be 0");
+
+    const staged = execSync("git diff --cached --name-only", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim().split("\n").filter(Boolean);
+    assert.deepStrictEqual(staged, ["bad-v.ts"], "blocked changes remain staged");
   });
 });
 

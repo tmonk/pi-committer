@@ -416,4 +416,86 @@ e2e("pi-committer E2E", { timeout: 720_000 }, () => {
     assert.ok(existsSync(doneFlag),
       "Worker should have created done.flag, indicating result message was received");
   });
+
+  // -----------------------------------------------------------------------
+  it("Test 14: Async completion notification reaches the session (no sleep needed)", async () => {
+    // deterministic_fallback is ON so the forked worker commits without an
+    // SDK/LLM call and finishes while pi is still running — the completion
+    // notification then gets delivered into the live session.
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "on_goal"\ndeterministic_fallback = true\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
+    // 6 files → async threshold (default is 5)
+    for (let i = 0; i < 6; i++) {
+      writeFileSync(path.join(testDir, `notify-e2e-${i}.ts`), `// notify e2e ${i}\n`);
+    }
+    const startCount = commitCount(testDir);
+
+    // The agent can only reply with the real commit hash by reading the
+    // pi-committer completion notification: it is told the commit runs in the
+    // background and that it must NOT sleep/poll or run git commands. The hash
+    // exists in the session only inside the notification's message text.
+    const output = runPi(
+      testDir,
+      "Call the commit_changes tool now. The commit runs in the background — do NOT sleep, wait, " +
+        "or poll for it. A pi-committer completion notification will appear in your context when " +
+        "the background commit finishes; it contains the commit hash. Reply with exactly the first " +
+        "7 characters of that commit hash, and nothing else.\n",
+    );
+
+    // The background commit must actually land.
+    let currentCount = startCount;
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      currentCount = commitCount(testDir);
+      if (currentCount > startCount) break;
+    }
+    assert.ok(
+      currentCount > startCount,
+      `Expected new commits after async, got ${currentCount} (was ${startCount})`,
+    );
+
+    // The agent must have read the completion notification to know this hash.
+    const headHash = execSync("git rev-parse --short=7 HEAD", {
+      cwd: testDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    assert.ok(
+      output.includes(headHash),
+      `agent should reply with the commit hash ${headHash} from the completion notification; ` +
+        `output was: ${JSON.stringify(output.slice(0, 200))}`,
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  it("Test 15: commit_changes verbatim param produces exactly that commit message", async () => {
+    const toml = `[committer]\nenabled = true\ntrigger_mode = "manual"\n`;
+    writeFileSync(path.join(testDir, ".pi-committer.toml"), toml, "utf-8");
+
+    writeFileSync(path.join(testDir, "verbatim-e2e.ts"), "// verbatim e2e\n");
+    const startCount = commitCount(testDir);
+
+    const verbatim = "feat(e2e): verbatim smoke test";
+    const output = runPi(
+      testDir,
+      `Call the commit_changes tool now with the verbatim parameter set to exactly: ${JSON.stringify(verbatim)}. ` +
+        "Do not modify the message. Then reply with exactly: DONE\n",
+    );
+
+    assert.match(output, /DONE/i, "agent should acknowledge the commit");
+
+    const count = commitCount(testDir);
+    assert.ok(count > startCount, `Expected a new commit, got ${count} (was ${startCount})`);
+
+    // The commit message must be exactly the verbatim text (git adds one
+    // terminator newline; %B adds another).
+    const committed = execSync("git log -1 --format=%B", {
+      cwd: testDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    assert.strictEqual(committed, verbatim + "\n\n", "git log must show exactly the verbatim message");
+  });
 });

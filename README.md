@@ -94,6 +94,15 @@ exclude_patterns  = ["*.log", "node_modules/"]
 # progress and Esc cancels. Default: 10. Set to 0 to disable async (always sync).
 # async_threshold = 10
 
+# When an async (background) commit finishes, pi-committer delivers a completion
+# message into the session: a custom message the agent sees (delivered once the
+# agent has no more tool calls, triggering a turn if idle) summarizing the result
+# (commit hashes + summaries, or the error). This lets the agent continue working
+# instead of sleeping or polling for the background commit. The TUI notification
+# always fires; this toggle only disables the injected session message.
+# Default: true.
+# notify_async_completion = true
+
 # Optional: extend conventional commit types / restrict scopes
 # custom_types    = ["api", "wip"]
 # allowed_scopes  = ["api", "cli", "core"]
@@ -168,6 +177,23 @@ The subagent decides the grouping from the diff content, not from file extension
 
 If the agent edits files in multiple git repositories during a session, `commit_changes` finds and commits in all of them. Detection works via session tool-call history — repos where the agent created or modified files using `write` or `edit` tools are detected and added on top of the primary working directory.
 
+## Background commits & the completion notification
+
+Large change sets (≥ `async_threshold` files, default 10) are committed in a
+detached subprocess so the conversation continues immediately. The tool result
+explicitly tells the agent **never to sleep, wait, or poll** for the background
+commit. When the worker finishes, pi-committer:
+
+1. **Injects a session message** (custom type `pi-committer`) summarizing the
+   result — `✓ Background commit complete: N commit(s) — <hash> <summary>…` or
+   `Background commit failed: <error>`. It is delivered once the agent has no
+   more tool calls (`deliverAs: "followUp"`) and triggers a turn if idle, so the
+   agent learns the commit finished without sleeping.
+2. **Fires a TUI notification** with the same summary.
+
+Set `notify_async_completion = false` in `.pi-committer.toml` to suppress only
+the injected session message (the TUI notification still fires).
+
 ## Commit message generation & the block gate
 
 By default the commit-message subagent is **required for every commit**.
@@ -184,6 +210,24 @@ no LLM calls needed:
 - **Smart scope**: Uses the longest common ancestor directory across all changed files. If files span unrelated directories, scope is omitted entirely. When `match_repo_style` is enabled, the scope is normalized to one the repo actually uses.
 - **Structured body**: Always includes a body with a summary line and per-file change details (+N/−M with the first changed line).
 - **Block instead of boilerplate**: If the diff has no extractable content (e.g. empty diffs), the commit is skipped with a clear warning — a generic message is never committed in either mode. The old `chore: update N file(s)` substitution was removed from every commit path.
+
+## Agent-specified commit messages
+
+`commit_changes` accepts two optional parameters so the agent can pass what the
+commit message should say:
+
+| Parameter  | Purpose                                                                                                          |
+|------------|------------------------------------------------------------------------------------------------------------------|
+| `message`  | Short freeform summary of what the message should include / how it should be structured. Appended to the subagent prompt as a "user message request" the generated message(s) MUST cover. |
+| `verbatim` | Exact commit message text, used **as-is** — generation is skipped entirely. Forces a **single commit** containing all changes (staged-commits grouping is bypassed). |
+
+When the user tells the agent what the commit message should say, the agent is
+directed to **prefer passing it as `verbatim`** (never silently rewrite what the
+user asked for). A `verbatim` message is validated against the conventional
+commit format (`<type>(<scope>): <description>`); an invalid one **blocks** the
+commit with a clear warning and leaves changes staged — it is never edited,
+prefixed, or reformatted. Both parameters work in the sync and background
+(async) commit paths.
 
 ## Matching the repo's commit style (opt-in)
 

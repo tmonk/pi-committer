@@ -27,8 +27,23 @@ import {
 export { loadConfig, type CommitterConfig } from "./config.ts";
 
 // Tool parameter schemas — exported for isToolCallEventType support
-const commitChangesSchema = Type.Object({});
+export const commitChangesSchema = Type.Object({
+  message: Type.Optional(Type.String()),
+  verbatim: Type.Optional(Type.String()),
+});
 export type CommitChangesInput = Static<typeof commitChangesSchema>;
+
+/**
+ * Optional commit-message intent passed to commit_changes:
+ * - `message`: short freeform summary of what the commit message should
+ *   include or how it should be structured (guides the subagent prompt).
+ * - `verbatim`: exact commit message text to use as-is, overriding
+ *   subagent/deterministic generation. Never edited or reformatted.
+ */
+export interface CommitMessageRequest {
+  message?: string;
+  verbatim?: string;
+}
 
 let config: CommitterConfig;
 
@@ -76,6 +91,11 @@ const __commitWarningFiles = new Set<string>();
 export function resetCommitWarnings(): void {
   __commitWarnings = [];
   __commitWarningFiles.clear();
+}
+
+/** @internal exported for tests */
+export function _getCommitWarnings(): string[] {
+  return [...__commitWarnings];
 }
 
 /**
@@ -233,6 +253,42 @@ export function _getLastGroupGenCallMs(): number { return __lastGroupGenCallMs; 
 /** Flag set when an async commit is launched, checked by the tool handler. */
 let __asyncCommitStarted = false;
 let __asyncCommitFileCount = 0;
+
+/**
+ * ExtensionAPI instance captured from the factory. Used to inject the
+ * async-completion session message (pi.sendMessage). Re-assigned on every
+ * factory invocation so the newest session's API handles late worker results
+ * (async workers are deliberately NOT killed on session shutdown).
+ */
+let __api: ExtensionAPI | null = null;
+
+/** Shape of the session-message sender used for async-completion notifications. */
+type CompletionMessageSender = (
+  message: { customType: string; content: string; display: boolean; details: unknown },
+  options: { triggerTurn: boolean; deliverAs: "followUp" },
+) => void;
+
+/**
+ * Test hook: override the session-message sender used by async-completion
+ * notifications (the real implementation routes through `__api.sendMessage`).
+ */
+export let __sendCompletionMessageMock: CompletionMessageSender | undefined;
+
+/** Set a mock for the async-completion session-message sender (unit tests). */
+export function __setSendCompletionMessageMock(fn: CompletionMessageSender | undefined): void {
+  __sendCompletionMessageMock = fn;
+}
+
+/** Resolve the session-message sender: test mock, else the captured ExtensionAPI. */
+function resolveCompletionMessageSender(): CompletionMessageSender | undefined {
+  if (__sendCompletionMessageMock) return __sendCompletionMessageMock;
+  if (__api) {
+    return (message, options) => {
+      void __api!.sendMessage(message, options);
+    };
+  }
+  return undefined;
+}
 /** Export for unit tests. */
 export function _getCommitterProgress(): CommitterProgress | null {
   return __committerProgress;
@@ -944,6 +1000,7 @@ export async function generateStagedCommitGroups(
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  request?: CommitMessageRequest,
 ): Promise<CommitGroup[]> {
   const _ts = performance.now();
   const truncatedDiff =
@@ -971,6 +1028,18 @@ export async function generateStagedCommitGroups(
     "",
     `Changed files (${allFiles.length}):`,
     fileListStr,
+  ];
+
+  const requestText = request?.message?.trim();
+  if (requestText) {
+    prompt.push(
+      "",
+      "User message request — each commit message MUST cover these points where they apply to its group:",
+      requestText,
+    );
+  }
+
+  prompt.push(
     "",
     "Diff stat:",
     diffStat,
@@ -989,7 +1058,7 @@ export async function generateStagedCommitGroups(
     "...",
     "",
     "If all changes belong in one commit, output a single COMMIT GROUP.",
-  ];
+  );
 
   const styleBlock = formatStyleContext(style);
   if (styleBlock) {
@@ -1492,9 +1561,10 @@ export async function generateCommitMessageViaSubagent(
   onProgress?: (progress: SubagentProgress) => void,
   signal?: AbortSignal,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  request?: CommitMessageRequest,
 ): Promise<string> {
   const _ts = performance.now();
-  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style);
+  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style, request);
 
   let generated = await runCommitMessageSession(ctx, prompt, repoDir, onProgress, signal);
   if (generated && !isValidCommitMessage(generated)) {
@@ -1874,6 +1944,7 @@ export function buildCommitMessagePrompt(
   diffStat: string,
   diffContent: string,
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
+  request?: CommitMessageRequest,
 ): string {
   const truncatedDiff =
     diffContent.length > 8000
@@ -1901,6 +1972,14 @@ export function buildCommitMessagePrompt(
   const styleBlock = formatStyleContext(style);
   if (styleBlock) {
     lines.push("", styleBlock);
+  }
+  const requestText = request?.message?.trim();
+  if (requestText) {
+    lines.push(
+      "",
+      "User message request — the commit message MUST cover these points (where they apply to the diff):",
+      requestText,
+    );
   }
   lines.push("", "Diff stat:", diffStat, "", "Full diff:", truncatedDiff);
   return lines.join("\n");
@@ -2038,6 +2117,7 @@ export async function commitStaged(
   skipSubagent = false,
   precomputedDiffStat?: string,
   precomputedDiffContent?: string,
+  request?: CommitMessageRequest,
 ): Promise<string | undefined> {
   const diffStat = precomputedDiffStat ?? execSync("git diff --cached --stat", {
     cwd: dir,
@@ -2055,6 +2135,46 @@ export async function commitStaged(
   const style = config.matchRepoStyle ? sampleRepoCommitStyle(dir) : EMPTY_COMMIT_STYLE;
 
   try {
+    // Verbatim path: the caller supplied the exact commit message text.
+    // Message generation is skipped entirely and the text is used exactly as
+    // provided — never edited, prefixed, or reformatted. An invalid verbatim
+    // blocks the commit (changes stay staged) instead of a silent rewrite.
+    const verbatimRaw = request?.verbatim ?? "";
+    const verbatim = verbatimRaw.trim();
+    if (verbatim) {
+      if (signal?.aborted) {
+        unstageAll(dir);
+        return undefined;
+      }
+      if (!isValidCommitMessage(verbatim)) {
+        __commitWarnings.push(
+          "Skipping commit \u2014 verbatim commit message is not a valid conventional commit message " +
+            `(expected <type>(<scope>): <description>): ${JSON.stringify(verbatim)}`,
+        );
+        ctx.ui.notify(
+          "[pi-committer] Skipped commit: the verbatim commit message is not a valid conventional commit message (expected <type>(<scope>): <description>). Changes were left staged.",
+          "warning",
+        );
+        return undefined;
+      }
+      const commitOut = execSync("git commit -F -", {
+        cwd: dir,
+        encoding: "utf-8",
+        maxBuffer: 10 * 1024 * 1024,
+        stdio: ["pipe", "pipe", "ignore"],
+        input: verbatimRaw,
+      });
+
+      __lastCommittedMessage = verbatimRaw;
+      const hashMatch = /\[[^\]\s]*\s+([0-9a-f]{7,40})\]/.exec(commitOut);
+      const hash = hashMatch ? hashMatch[1] : getHeadHash(dir);
+      const shortHash = hash.slice(0, 7);
+      const summary = verbatimRaw.split("\n")[0];
+
+      ctx.ui.notify(`[pi-committer] ✓ ${shortHash} ${summary}`, "success");
+      return hash;
+    }
+
     // Deterministic generation only runs when deterministic_fallback is
     // enabled (default off). With the gate off, the subagent is required for
     // every commit — skipSubagent is a no-op (see doSingleCommit).
@@ -2069,6 +2189,7 @@ export async function commitStaged(
           onProgress,
           signal,
           style,
+          request,
         );
 
     // Check for abort before actually committing — the subagent may have been
@@ -2140,6 +2261,7 @@ export async function tryCommit(
   force = false,
   runtimeSignal?: AbortSignal,
   allowAsync = true,
+  request?: CommitMessageRequest,
 ): Promise<number> {
   if (runtimeSignal?.aborted) return 0;
 
@@ -2195,7 +2317,7 @@ export async function tryCommit(
   // Check async threshold: for explicit commits (force=true) with enough files,
   // fork the commit into a subprocess so the conversation can continue immediately.
   if (allowAsync && config.asyncThreshold > 0 && force && allFiles.length >= config.asyncThreshold) {
-    return tryCommitAsync(dir, ctx, diffStat, diffContent, allFiles, runtimeSignal);
+    return tryCommitAsync(dir, ctx, diffStat, diffContent, allFiles, runtimeSignal, request);
   }
 
   // Show the committer widget
@@ -2219,7 +2341,13 @@ export async function tryCommit(
   let commitCount = 0;
 
   try {
-    const useStagedGroups = config.stagedCommits && allFiles.length > 1 && allFiles.length >= config.subagentGroupingMinFiles;
+    // Verbatim forces a single commit containing all changes — staged-commits
+    // grouping is skipped when the caller supplied an exact message.
+    const useStagedGroups =
+      config.stagedCommits &&
+      allFiles.length > 1 &&
+      allFiles.length >= config.subagentGroupingMinFiles &&
+      !request?.verbatim?.trim();
     if (useStagedGroups) {
       // ---- Agent-decided staged commit mode ----
 
@@ -2244,6 +2372,7 @@ export async function tryCommit(
         },
         opSignal,
         style,
+        request,
       );
 
       // If aborted, unstage all and cancel fully (not fallthrough to single commit)
@@ -2403,7 +2532,7 @@ export async function tryCommit(
       // off, the subagent is required for every commit.
       const skipSubagent =
         config.deterministicFallback && allFiles.length < config.subagentMessageMinFiles;
-      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent, diffStat, diffContent);
+      commitCount = await doSingleCommit(dir, ctx, allFiles, __committerProgress, opSignal, skipSubagent, diffStat, diffContent, request);
     }
   } finally {
     // Mark as done or cancelled and schedule cleanup
@@ -2437,6 +2566,89 @@ export async function tryCommit(
  * Fork the commit pipeline into a detached subprocess for large changes.
  * Returns immediately (does not await the subprocess).
  */
+
+/** One entry in the async worker's commit log (mirrors async-commit-worker.ts). */
+interface AsyncCommitLogEntry {
+  hash: string;
+  message: string;
+  success: boolean;
+}
+
+/**
+ * Format the human-readable async-completion notification from a worker result.
+ * Success → "✓ Background commit complete: N commit(s) — <hash> <summary>; …".
+ * Failure → "Background commit failed: <error>" (cancelled → info level).
+ * Empty   → "Background commit finished — no commits created."
+ */
+export function formatAsyncCompletion(result: {
+  commitCount: number;
+  commitLog?: AsyncCommitLogEntry[];
+  error?: string;
+}): { text: string; level: "success" | "error" | "info" } {
+  if (result.error) {
+    const cancelled = /^cancelled\.?$/i.test(result.error.trim());
+    return cancelled
+      ? { text: "[pi-committer] Background commit cancelled.", level: "info" }
+      : { text: `[pi-committer] Background commit failed: ${result.error}`, level: "error" };
+  }
+  const commits = (result.commitLog ?? []).filter((c) => c.success);
+  if (commits.length === 0) {
+    return {
+      text: "[pi-committer] Background commit finished — no commits created.",
+      level: "info",
+    };
+  }
+  const summary = commits.map((c) => `${c.hash} ${c.message}`).join("; ");
+  return {
+    text: `[pi-committer] ✓ Background commit complete: ${commits.length} commit(s) — ${summary}`,
+    level: "success",
+  };
+}
+
+/**
+ * Deliver the async-commit completion into the session. Two best-effort
+ * channels, neither of which may throw:
+ *  1. A custom session message (customType "pi-committer") the agent sees —
+ *     delivered once the agent has no more tool calls (deliverAs "followUp")
+ *     and triggering a turn if idle, so the agent learns the background
+ *     commit finished without sleeping or polling. Gated by the
+ *     notify_async_completion config (default true).
+ *  2. A TUI notification (ctx.ui.notify) with the same summary.
+ */
+function notifyAsyncCompletion(
+  ctx: ExtensionContext,
+  result: { commitCount: number; commitLog?: AsyncCommitLogEntry[]; error?: string },
+): void {
+  const { text, level } = formatAsyncCompletion(result);
+  if (config.notifyAsyncCompletion) {
+    const send = resolveCompletionMessageSender();
+    if (send) {
+      try {
+        void send(
+          {
+            customType: "pi-committer",
+            content: text,
+            display: true,
+            details: {
+              async: true,
+              commitCount: result.commitCount,
+              commitLog: result.commitLog,
+              error: result.error,
+            },
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      } catch {
+        // Best-effort: a dead session or reloaded runtime must not break the IPC handlers.
+      }
+    }
+  }
+  try {
+    ctx.ui.notify(text, level);
+  } catch {
+    // Best-effort: print/headless mode without a UI must not break the IPC handlers.
+  }
+}
 async function tryCommitAsync(
   dir: string,
   ctx: ExtensionContext,
@@ -2444,6 +2656,7 @@ async function tryCommitAsync(
   diffContent: string,
   allFiles: string[],
   runtimeSignal?: AbortSignal,
+  request?: CommitMessageRequest,
 ): Promise<number> {
   // Show widget with "preparing" phase — file count visible immediately
   showCommitterWidget(ctx, {
@@ -2476,6 +2689,20 @@ async function tryCommitAsync(
 
     // Handle early exit (process died before sending result)
     let resultReceived = false;
+
+    // Tracks whether the async-completion notification has been delivered for
+    // this run — guarantees exactly one notification across the result /
+    // error / exit-without-result paths.
+    let completionNotified = false;
+    const deliverCompletion = (result: {
+      commitCount: number;
+      commitLog?: AsyncCommitLogEntry[];
+      error?: string;
+    }): void => {
+      if (completionNotified) return;
+      completionNotified = true;
+      notifyAsyncCompletion(ctx, result);
+    };
 
     child.on("message", (msg: any) => {
       if (!msg || !__committerProgress) return;
@@ -2526,6 +2753,7 @@ async function tryCommitAsync(
         updateCommitterWidget();
         scheduleHideCommitterWidget(ctx, 6000);
         __asyncChildProcess = null;
+        deliverCompletion(msg);
       }
     });
 
@@ -2539,6 +2767,7 @@ async function tryCommitAsync(
         scheduleHideCommitterWidget(ctx, 6000);
       }
       __asyncChildProcess = null;
+      deliverCompletion({ commitCount: 0, commitLog: [], error: `Subprocess error: ${err.message}` });
     });
 
     child.on("exit", (code: number | null) => {
@@ -2557,6 +2786,11 @@ async function tryCommitAsync(
               updateCommitterWidget();
               scheduleHideCommitterWidget(ctx, 6000);
             }
+            deliverCompletion({
+              commitCount: 0,
+              commitLog: [],
+              error: `Subprocess exited with code ${code ?? "unknown"}`,
+            });
           }, 500);
 
           // Listen for a delayed result message arriving after the exit event
@@ -2591,6 +2825,7 @@ async function tryCommitAsync(
               __committerProgress!.commitLog = msg.commitLog || [];
               updateCommitterWidget();
               scheduleHideCommitterWidget(ctx, 6000);
+              deliverCompletion(msg);
               child.removeListener("message", onDelayedMsg);
             }
           };
@@ -2602,6 +2837,7 @@ async function tryCommitAsync(
           __committerProgress.completedCommits = 0;
           updateCommitterWidget();
           scheduleHideCommitterWidget(ctx, 6000);
+          deliverCompletion({ commitCount: 0, commitLog: [] });
         }
       }
       __asyncChildProcess = null;
@@ -2624,6 +2860,10 @@ async function tryCommitAsync(
         subagentThinkingLevel: config.subagentThinkingLevel,
         matchRepoStyle: config.matchRepoStyle,
         deterministicFallback: config.deterministicFallback,
+        messageRequest: {
+          message: request?.message,
+          verbatim: request?.verbatim,
+        },
       },
     });
 
@@ -2659,6 +2899,7 @@ async function doSingleCommit(
   skipSubagent = false,
   precomputedDiffStat?: string,
   precomputedDiffContent?: string,
+  request?: CommitMessageRequest,
 ): Promise<number> {
   if (progress) {
     progress.phase = "committing";
@@ -2682,6 +2923,7 @@ async function doSingleCommit(
     skipSubagent,
     precomputedDiffStat,
     precomputedDiffContent,
+    request,
   );
 
   if (hash && progress) {
@@ -2869,6 +3111,7 @@ export async function commitAllRepos(
   ctx: ExtensionContext,
   force = false,
   runtimeSignal?: AbortSignal,
+  request?: CommitMessageRequest,
 ): Promise<number> {
   const repos = findDirtyRepos(ctx);
   let totalCommits = 0;
@@ -2877,7 +3120,7 @@ export async function commitAllRepos(
 
   if (repos.length === 1) {
     // Single repo — normal behavior
-    return tryCommit(dir, ctx, force, runtimeSignal);
+    return tryCommit(dir, ctx, force, runtimeSignal, true, request);
   }
 
   // Filter to only dirty repos. The primary repo is always included; the rest
@@ -2889,7 +3132,7 @@ export async function commitAllRepos(
   const dirtyRepos = repos.filter((_, i) => dirtyFlags[i]);
 
   if (dirtyRepos.length <= 1) {
-    return tryCommit(dir, ctx, force, runtimeSignal);
+    return tryCommit(dir, ctx, force, runtimeSignal, true, request);
   }
 
   ctx.ui.notify(
@@ -2902,7 +3145,7 @@ export async function commitAllRepos(
     const label = repoDir === dir ? "primary" : repoDir.split("/").pop() ?? "";
     ctx.ui.notify(`[pi-committer] Committing in ${label}...`, "info");
     // Allow async only for single-repo (multi-repo async is out of scope)
-    const count = await tryCommit(repoDir, ctx, force, runtimeSignal, false);
+    const count = await tryCommit(repoDir, ctx, force, runtimeSignal, false, request);
     if (count > 0) totalCommits += count;
   }
 
@@ -2913,8 +3156,35 @@ export async function commitAllRepos(
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * No-sleep guidance appended to the commit_changes prompt guidelines. The
+ * agent must never sleep/wait/poll for a background commit — a completion
+ * notification is delivered to the session instead.
+ */
+export const ASYNC_COMMIT_NO_SLEEP_GUIDELINE =
+  "When the change set is large, the commit runs in the background. " +
+  "NEVER sleep, wait, or poll for a background commit to finish — do not run `sleep` or any other " +
+  "waiting command, and do not re-check the repository. Continue your work; a completion " +
+  "notification with the commit hashes is delivered to the session when the commit finishes.";
+
+/**
+ * Tail of the commit_changes async tool-result text — tells the agent the
+ * commit is running in the background and to continue instead of waiting.
+ */
+export const ASYNC_COMMIT_RESULT_TAIL =
+  "NEVER sleep, wait, or poll for it — continue your work. A completion notification is delivered to the session when it finishes.";
+
+/**
+ * Message-intent guideline for the commit_changes prompt guidelines: when the
+ * user specified what the commit message should say, prefer passing it as the
+ * `verbatim` parameter (used as-is) — never silently rewrite user intent.
+ */
+export const COMMIT_MESSAGE_REQUEST_GUIDELINE =
+  "When the user specifies what the commit message should say or cover, PREFER passing it as the `verbatim` parameter (exact message text, used as-is) or, for intent/structure guidance, the `message` parameter — never silently replace or edit what the user asked for.";
+
 export default function (pi: ExtensionAPI) {
   config = loadConfig(process.cwd());
+  __api = pi;
   selectedSubagentModel = undefined;
 
   // -----------------------------------------------------------------------
@@ -3014,23 +3284,35 @@ export default function (pi: ExtensionAPI) {
     label: "Commit Changes",
     description:
       "Stage all changes and create one or more conventional commits with subagent-generated messages. " +
-      "When staged commits is on (default), the subagent groups changes into logical commits.",
+      "When staged commits is on (default), the subagent groups changes into logical commits. " +
+      "Pass `message` to guide what the commit message should include or how it should be structured; " +
+      "pass `verbatim` to use an exact commit message as-is (forces a single commit).",
     promptSnippet:
       "Stage and commit changes with conventional commit messages",
     promptGuidelines: [
       "Use commit_changes when the user asks to commit, save progress, or checkpoint work.",
       "Call commit_changes when completing significant work or on user request.",
+      COMMIT_MESSAGE_REQUEST_GUIDELINE,
       "When pi-goal is active with trigger_mode=on_goal, do NOT call commit_changes before marking the goal complete — the automatic on_goal trigger will commit after the goal audit passes. Calling commit_changes preemptively bypasses the audit.",
       "After calling commit_changes, do NOT run git commands (git status, git log, git diff) to check on the commit. Trust that it completes in the background.",
+      ASYNC_COMMIT_NO_SLEEP_GUIDELINE,
     ],
     parameters: commitChangesSchema,
-    async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) {
         return {
           content: [{ type: "text" as const, text: "Commit cancelled." }],
           details: { commitCount: 0, cancelled: true },
         };
       }
+
+      // Optional commit-message intent from the agent: a freeform summary
+      // (message) and/or an exact commit message (verbatim). Omitted params
+      // leave generation behavior unchanged.
+      const messageRequest: CommitMessageRequest = {
+        message: params.message,
+        verbatim: params.verbatim,
+      };
 
         // Defer to goal audit: if on_goal mode is active and pi-goal has an
       // active (non-complete) goal, skip committing and let the automatic
@@ -3053,7 +3335,7 @@ export default function (pi: ExtensionAPI) {
 
       // Reset warnings from any previous commit operation
       resetCommitWarnings();
-      const count = await commitAllRepos(ctx.cwd, ctx, true, signal);
+      const count = await commitAllRepos(ctx.cwd, ctx, true, signal, messageRequest);
 
       // Build warning summary if any warnings were collected
       const warningText = formatWarningSummary(__commitWarnings);
@@ -3064,7 +3346,9 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Commit running in background for ${__asyncCommitFileCount} file(s).`,
+              text:
+                `Commit running in background for ${__asyncCommitFileCount} file(s). ` +
+                ASYNC_COMMIT_RESULT_TAIL,
             },
           ],
           details: { commitCount: 0, async: true, warnings: __commitWarnings },

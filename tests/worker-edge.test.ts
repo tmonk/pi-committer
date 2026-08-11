@@ -1990,7 +1990,7 @@ describe("worker loads via jiti (node_modules scenario)", () => {
     writeFileSync(path.join(dir, "README.md"), "# test\n");
     execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
 
-    writeFileSync(path.join(dir, "change1.ts"), "// change1\n");
+    writeFileSync(path.join(dir, "change1.ts"), "export function greet(name: string): string {\n  return `hello ${name}`;\n}\n");
     execSync("git add -A", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {

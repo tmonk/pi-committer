@@ -1,13 +1,16 @@
 {
   "name": "pi-committer",
   "version": "0.15.1",
-  "description": "Conventional commit automation for the pi coding agent — auto-commits on goal completion with intelligent, subagent-generated messages",
+  "description": "Reliable conventional commit automation for the pi coding agent with immutable Git snapshots and race-safe background commits",
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "npm run typecheck && node --experimental-strip-types --test tests/unit.test.ts tests/worker-edge.test.ts",
-    "test:e2e": "PI_COMMITTER_E2E=1 node --experimental-strip-types --test tests/e2e.test.ts",
-    "test:all": "npm run typecheck && node --experimental-strip-types --test tests/*.test.ts",
+    "check:runtime": "node --check src/index.mjs && node --check src/config.mjs && node --check src/snapshot-engine.mjs && node --check src/message-engine.mjs && node --check src/worker.mjs",
+    "test": "npm run typecheck && npm run check:runtime && npm run test:reliability && npm run test:legacy",
+    "test:reliability": "node --test tests/reliability-v2.test.mjs",
+    "test:legacy": "node --experimental-strip-types --test tests/unit.test.ts tests/worker-edge.test.ts",
+    "test:e2e": "PI_COMMITTER_E2E=1 node --test tests/e2e-v2.test.mjs",
+    "test:all": "npm test && node --experimental-strip-types --test tests/defer.test.ts tests/benchmark.test.ts",
     "benchmark": "node --experimental-strip-types --test tests/benchmark.test.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -31,7 +34,7 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.mjs"
     ],
     "image": "https://github.com/tmonk/pi-committer/raw/main/screenshot.png"
   },

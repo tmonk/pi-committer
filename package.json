@@ -1,6 +1,6 @@
 {
   "name": "pi-committer",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "Reliable conventional commit automation for the pi coding agent with immutable Git snapshots and race-safe background commits",
   "type": "module",
   "license": "MIT",

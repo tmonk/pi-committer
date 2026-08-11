@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.16.1] — 2026-08-11
+
+### Removed
+
+- **Legacy commit pipeline, tests, and dependencies.** The previous
+  `index.ts` / `async-commit-worker.ts` implementation, its historical test
+  suites (unit, worker-edge, defer, benchmark, e2e), and the tooling they
+  required (TypeScript toolchain, jiti, pi-tui, pi-ai, @types/node) have been
+  removed now that the immutable-transaction runtime has equivalent coverage.
+  `npm test` runs syntax checks plus the v2 reliability suite; runtime
+  dependencies are reduced to smol-toml and typebox (plus the
+  pi-coding-agent SDK seam).
+
+### Changed
+
+- **CI is manual-dispatch only and runs the full suite on the latest
+  supported Node release** (previously an automatic Node 20/22/24 matrix on
+  every push/PR).
+
 ## [0.16.0] — 2026-08-11
 
 ### Changed

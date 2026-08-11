@@ -246,8 +246,8 @@ The reliability suite covers immutable snapshots, worktree races, HEAD races,
 unrelated and same-path index races, exact plan coverage, cancellation, a real
 forked worker, single-result delivery, and durable journals.
 
-GitHub Actions runs the v2 reliability suite on Node 20/22/24 and the full
-regression gate on Node 22/24.
+GitHub Actions (manual dispatch only) runs the v2 reliability suite and the full
+regression gate on the latest supported Node release.
 
 ## Legacy source files
 

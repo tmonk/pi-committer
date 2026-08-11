@@ -57,7 +57,7 @@ Background commits are part of the implemented architecture only because the fol
 
 ## CI
 
-GitHub Actions runs syntax checks and the reliability suite on Node 20, 22, and 24. A regression job also runs the TypeScript typecheck and historical unit/worker-edge tests on Node 22 and 24.
+GitHub Actions (manual dispatch only) runs the reliability suite and the regression gate on the latest supported Node release.
 
 ## Migration decision
 

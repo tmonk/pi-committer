@@ -57,12 +57,12 @@ Background commits are part of the implemented architecture only because the fol
 
 ## CI
 
-GitHub Actions (manual dispatch only) runs the reliability suite and the regression gate on the latest supported Node release.
+GitHub Actions (manual dispatch only) runs the full test suite on the latest supported Node release.
 
 ## Migration decision
 
-Because this repository is under development rather than a live migration, the package entry is switched directly from the legacy root `index.ts` to `src/index.mjs`. The legacy files remain temporarily as regression fixtures for the existing historical tests, but they are not loaded by Pi.
+Because this repository is under development rather than a live migration, the package entry was switched directly from the legacy root `index.ts` to `src/index.mjs`. The legacy implementation and its historical test suite were kept temporarily as regression fixtures while the new runtime proved itself, then removed once the reliability suite (real-Git races, deterministic grouping, message engine, e2e) reached equivalent coverage.
 
 ## Follow-up criteria
 
-Future work should simplify or delete legacy fixtures after equivalent coverage has moved to the new runtime. Any change to snapshot capture, ref movement, reconciliation, cancellation, or worker lifecycle must add or update a race test before merge. Performance optimizations are subordinate to the transaction invariants above.
+Any change to snapshot capture, ref movement, reconciliation, cancellation, or worker lifecycle must add or update a race test before merge. Performance optimizations are subordinate to the transaction invariants above.

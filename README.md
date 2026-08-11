@@ -229,16 +229,13 @@ one already-fixed group and can only generate its message.
 ```bash
 npm install
 
-# Runtime syntax, v2 race tests, typecheck, and legacy regression suite
+# Syntax checks + v2 reliability suite
 npm test
 
 # v2 real-Git transaction/race suite only
 npm run test:reliability
 
-# Full historical benchmark/defer suite as well
-npm run test:all
-
-# Actual Pi extension entry, sync + background paths
+# Actual Pi extension entry, sync + background paths (requires the pi binary)
 npm run test:e2e
 ```
 
@@ -246,14 +243,8 @@ The reliability suite covers immutable snapshots, worktree races, HEAD races,
 unrelated and same-path index races, exact plan coverage, cancellation, a real
 forked worker, single-result delivery, and durable journals.
 
-GitHub Actions (manual dispatch only) runs the v2 reliability suite and the full
-regression gate on the latest supported Node release.
-
-## Legacy source files
-
-The previous root `index.ts` / `async-commit-worker.ts` implementation remains
-in the repository as a historical regression fixture for the existing test
-suite. It is **not** the package entry point and is not loaded by Pi.
+GitHub Actions (manual dispatch only) runs the full test suite on the latest
+supported Node release.
 
 ## License
 

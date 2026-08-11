@@ -143,7 +143,14 @@ export function matchesExclude(file, pattern) {
   const normalized = file.split(path.sep).join("/");
   const p = pattern.split(path.sep).join("/");
   if (!p.includes("*") && !p.includes("?")) {
-    return p.endsWith("/") ? normalized.startsWith(p) : normalized === p || normalized.includes(p);
+    if (p.endsWith("/")) {
+      // Directory pattern: match a directory of that name at any depth,
+      // never mid-segment (gitignore semantics for patterns without a
+      // leading slash, e.g. "node_modules/" excludes src/node_modules/x).
+      const escaped = p.slice(0, -1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(^|/)${escaped}(/|$)`).test(normalized);
+    }
+    return normalized === p || normalized.includes(p);
   }
   if (!p.includes("/")) return globToRegExp(p).test(path.basename(normalized));
   return globToRegExp(p).test(normalized);

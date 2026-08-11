@@ -23,12 +23,17 @@ function repo() {
 }
 
 function configure(dir, asyncThreshold) {
+  // staged_commits=false keeps /commit deterministic here: the fixture's own
+  // .pi-committer.toml is an untracked repo file (the engine commits untracked
+  // files like the legacy runtime did), so grouping would split it into a
+  // second chore commit. A single group makes the commit count exact.
   writeFileSync(path.join(dir, ".pi-committer.toml"), [
     "[committer]",
     "enabled = true",
     'trigger_mode = "manual"',
     'message_mode = "deterministic"',
     "deterministic_fallback = true",
+    "staged_commits = false",
     `async_threshold = ${asyncThreshold}`,
     "",
   ].join("\n"));
@@ -49,8 +54,9 @@ e2e("new extension entry commits synchronously", () => {
   try {
     configure(dir, 0);
     writeFileSync(path.join(dir, "feature.ts"), "export const value = 1;\n");
+    const before = Number(git(dir, ["rev-list", "--count", "HEAD"]));
     runPi(dir, "/commit\n");
-    assert.equal(git(dir, ["rev-list", "--count", "HEAD"]), "2");
+    assert.equal(Number(git(dir, ["rev-list", "--count", "HEAD"])), before + 1);
     assert.equal(git(dir, ["status", "--porcelain"]), "");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

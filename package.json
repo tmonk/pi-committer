@@ -7,7 +7,7 @@
   "scripts": {
     "check:runtime": "node --check src/index.mjs && node --check src/config.mjs && node --check src/snapshot-engine.mjs && node --check src/message-engine.mjs && node --check src/worker.mjs",
     "test": "npm run typecheck && npm run check:runtime && npm run test:reliability && npm run test:legacy",
-    "test:reliability": "node --test tests/reliability-v2.test.mjs",
+    "test:reliability": "node --test tests/reliability-v2.test.mjs tests/message-engine.test.mjs",
     "test:legacy": "node --experimental-strip-types --test tests/unit.test.ts tests/worker-edge.test.ts",
     "test:e2e": "PI_COMMITTER_E2E=1 node --test tests/e2e-v2.test.mjs",
     "test:all": "npm test && node --experimental-strip-types --test tests/defer.test.ts tests/benchmark.test.ts",

@@ -98,6 +98,17 @@ export interface CommitterConfig {
    * Default: true.
    */
   notifyAsyncCompletion: boolean;
+  /**
+   * When true (default), the commit-message subagent prompt includes the
+   * user's session context whenever no verbatim message is supplied: the
+   * active goal objective/task context (when a goal is active) plus a
+   * trimmed recent-conversation tail. The subagent uses it to align the
+   * commit message with what the user is working on — it never fabricates
+   * diff content. Robust when no goal is active or the conversation is
+   * unavailable (those parts are simply omitted).
+   * Default: true.
+   */
+  contextEnabled: boolean;
 }
 
 export const DEFAULT_CONFIG: CommitterConfig = {
@@ -118,6 +129,7 @@ export const DEFAULT_CONFIG: CommitterConfig = {
   subagentThinkingLevel: "off",
   matchRepoStyle: false,
   notifyAsyncCompletion: true,
+  contextEnabled: true,
 };
 
 const CONVENTIONAL_TYPES = [
@@ -287,6 +299,10 @@ function applyConfig(
 
   if (typeof raw.notify_async_completion === "boolean") {
     config.notifyAsyncCompletion = raw.notify_async_completion;
+  }
+
+  if (typeof raw.context_enabled === "boolean") {
+    config.contextEnabled = raw.context_enabled;
   }
 
   return config;

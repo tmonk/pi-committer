@@ -5,10 +5,11 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/unit.test.ts tests/worker-edge.test.ts",
+    "test": "npm run typecheck && node --experimental-strip-types --test tests/unit.test.ts tests/worker-edge.test.ts",
     "test:e2e": "PI_COMMITTER_E2E=1 node --experimental-strip-types --test tests/e2e.test.ts",
-    "test:all": "node --experimental-strip-types --test tests/*.test.ts",
-    "benchmark": "node --experimental-strip-types --test tests/benchmark.test.ts"
+    "test:all": "npm run typecheck && node --experimental-strip-types --test tests/*.test.ts",
+    "benchmark": "node --experimental-strip-types --test tests/benchmark.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "author": "pi-committer contributors",
   "repository": {
@@ -24,8 +25,9 @@
     "automation"
   ],
   "dependencies": {
+    "@earendil-works/pi-tui": "^0.84.1",
     "smol-toml": "^1.3.0",
-    "@earendil-works/pi-tui": "^0.74.0"
+    "typebox": "^1.3.12"
   },
   "pi": {
     "extensions": [
@@ -34,6 +36,9 @@
     "image": "https://github.com/tmonk/pi-committer/raw/main/screenshot.png"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0"
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^25.9.5",
+    "typescript": "^5.9.3"
   }
 }

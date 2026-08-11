@@ -123,7 +123,7 @@ function createSessionTriggerFixture() {
   }
 
   // Mock session history: 30 assistant entries × 2 tool calls = 60 tool-call dirs
-  const entries = [];
+  const entries: Array<Record<string, unknown>> = [];
   let idx = 0;
   for (let e = 0; e < 30; e++) {
     entries.push({

@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext, Model } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createExtensionRuntime,
@@ -8,7 +9,7 @@ import {
 import type { ExtensionRuntime, ResourceLoader } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { execSync, fork } from "node:child_process";
+import { execFile, execSync, fork, type ForkOptions } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
@@ -503,35 +504,51 @@ export function setSelectedSubagentModel(m: Model<any> | undefined): void {
  * When set, all functions that call createAgentSession will use this mock instead.
  * Reset to undefined to restore real behaviour.
  */
-export let __createAgentSessionMock: typeof createAgentSession | undefined;
+/**
+ * Test seam type: mocks may return partial session shapes (e.g. without
+ * extensionsResult). The real CreateAgentSessionResult contract is restored
+ * by resolveCreateAgentSession so internal callers keep full typing.
+ */
+export type CreateAgentSessionMock = (
+  options?: CreateAgentSessionOptions,
+) => Promise<unknown>;
+
+export let __createAgentSessionMock: CreateAgentSessionMock | undefined;
 
 /** Set a mock for createAgentSession (replaces the real one in test-scoped calls). */
 export function __setCreateAgentSessionMock(
-  mock: typeof createAgentSession | undefined,
+  mock: CreateAgentSessionMock | undefined,
 ): void {
   __createAgentSessionMock = mock;
 }
 
 /** Resolve the current createAgentSession — mock if set, real otherwise. */
 function resolveCreateAgentSession(): typeof createAgentSession {
-  return __createAgentSessionMock ?? createAgentSession;
+  return (__createAgentSessionMock ?? createAgentSession) as typeof createAgentSession;
 }
 
 // ---------------------------------------------------------------------------
 // Fork mock injection for unit tests
 // ---------------------------------------------------------------------------
 
+/** Test seam type for fork() — mocks return fake ChildProcess objects. */
+export type ForkMock = (
+  modulePath: string,
+  args?: readonly string[],
+  options?: ForkOptions,
+) => unknown;
+
 /** Override for fork() used in async commit tests. */
-export let __forkMock: typeof fork | undefined;
+export let __forkMock: ForkMock | undefined;
 
 /** Set a mock for fork (replaces the real one in test-scoped calls). */
-export function __setForkMock(mock: typeof fork | undefined): void {
+export function __setForkMock(mock: ForkMock | undefined): void {
   __forkMock = mock;
 }
 
 /** Resolve the current fork — mock if set, real otherwise. */
 function resolveFork(): typeof fork {
-  return __forkMock ?? fork;
+  return (__forkMock ?? fork) as typeof fork;
 }
 
 // ---------------------------------------------------------------------------
@@ -633,10 +650,40 @@ export function isValidDiffStat(stat: string): boolean {
  * Validate that a commit message looks like a legitimate conventional commit.
  * Checks that the first line matches "type(scope): description" or "type: description".
  */
-export function isValidCommitMessage(message: string): boolean {
+export function isValidCommitMessage(message: string, strict = false): boolean {
+  if (typeof message !== "string") return false;
   if (message.length < 10) return false;
+
   const firstLine = message.split("\n")[0];
-  return /^[a-z]+(\([^)]+\))?: .+/.test(firstLine);
+  const header = /^([a-z]+)(\([^)]+\))?: (.*)$/.exec(firstLine);
+  if (!header) return false;
+
+  const desc = header[3].trim();
+  if (!desc) return false;
+  // Comment-quoted or diff-artifact descriptions are always garbage
+  // (e.g. `test: add # ntfy push (optional): ...`).
+  if (/^[#\/\*+\-]/.test(desc)) return false;
+  if (/^[\u2026.\-_\s]+$/.test(desc)) return false;
+  const wordy = desc.replace(/[^\p{L}\p{N}]+/gu, "");
+  if (wordy.length < 3) return false;
+
+  // Raw diff lines must never appear inside a commit message.
+  if (/^diff --git |^@@ |^index [0-9a-f]+\.\.[0-9a-f]+/m.test(message)) return false;
+
+  if (strict) {
+    // Over-truncated descriptions (ellipsis-terminated) are never committed.
+    if (/\u2026\s*$/.test(desc) || /\.\.\.\s*$/.test(desc)) return false;
+    // Generic filler — the description must say WHAT changed, not just
+    // that files were touched. (Verbatim user messages skip this check.)
+    if (
+      /^(update|updated?|modify|modified?|change[d]?|adjust(ed)?|tweak(ed)?|cleanup|clean up|misc|various|stuff|things?|minor|small|improve[ds]?|bump|refresh|sync)\s*(\d+\s+)?(files?|modules?|things?|stuff|changes?|deps|dependencies?|config|settings?|code|all)?(\s+and\s+(more|other|misc))?\s*$/i.test(
+        desc,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Stage all changes and return the diff. The stat is synthesized in JS from the
@@ -1018,10 +1065,15 @@ export async function generateStagedCommitGroups(
     "- Split unrelated changes into separate commits",
     "- Each commit must use conventional commit format: <type>(<scope>): <description>",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
+    "- Choosing each group's type: feat = new capability or behavior; fix = correcting a bug; refactor = restructuring without behavior change; test = tests only; docs = documentation only; chore = build/config/tooling; perf = performance; style = formatting; ci = CI config; build = build system; revert = undoing a previous change.",
     "- Scope: use the single most-specific directory for each group (e.g. 'api', 'exposure', 'config'). NEVER comma-join multiple scopes. If files in a group span unrelated directories, OMIT scope.",
     "- Description: a SHORT imperative phrase summarizing what each group does. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- NEVER write generic filler in any group's header. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes'. Each header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
     "- Body: for each group, write a short paragraph explaining what changed and WHY. Never restate the header verbatim.",
+    "- Example of a GOOD group header+body:",
+    "  feat(api): add retry with exponential backoff",
+    "",
+    "  Retries failed requests up to 3 times with exponential backoff, surfacing the last error after exhausting attempts.",
     "- Max 72 chars per header line (type + scope + description combined).",
     "- Assign each file to EXACTLY ONE group",
     "- Cover ALL files listed below in your groups",
@@ -1036,6 +1088,15 @@ export async function generateStagedCommitGroups(
       "",
       "User message request — each commit message MUST cover these points where they apply to its group:",
       requestText,
+    );
+  }
+
+  const sessionContext = collectSessionContext(ctx);
+  if (sessionContext) {
+    prompt.push(
+      "",
+      "Session context — what the user is working on. Align each group's commit message with this intent where it applies to that group's diff, but NEVER claim changes the diff does not contain:",
+      sessionContext,
     );
   }
 
@@ -1074,7 +1135,6 @@ export async function generateStagedCommitGroups(
       cwd: repoDir || ctx.cwd,
       model,
       thinkingLevel: config.subagentThinkingLevel as any,
-      modelRegistry: ctx.modelRegistry,
       resourceLoader: makeMessageResourceLoader(),
       sessionManager: SessionManager.inMemory(ctx.cwd),
       settingsManager: SettingsManager.inMemory({
@@ -1388,6 +1448,8 @@ function makeMessageResourceLoader(): ResourceLoader {
     getSystemPrompt: () =>
       "You write clear, specific, detailed conventional git commit messages that describe exactly what changed and why.",
     getAppendSystemPrompt: () => [],
+    getSystemPromptSource: () => undefined,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };
@@ -1419,6 +1481,121 @@ export function resolveSubagentModel(ctx: ExtensionContext): Model<any> | undefi
   return ctx.model;
 }
 
+// ---------------------------------------------------------------------------
+// Session context for the commit-message subagent
+//
+// When context_enabled is on and no verbatim message is supplied, the
+// subagent prompt includes what the user is working on: the active goal
+// objective/task context (goals are an extension — when absent, that part is
+// simply omitted) plus a trimmed recent-conversation tail. Every access is
+// defensive: any failure degrades to no context, never a crash.
+// ---------------------------------------------------------------------------
+
+/** Total budget for the combined context block (chars). */
+const SESSION_CONTEXT_BUDGET = 4000;
+/** Max chars for the goal-context portion. */
+const GOAL_CONTEXT_BUDGET = 1500;
+/** Max chars for the conversation-tail portion. */
+const CONVERSATION_CONTEXT_BUDGET = 2500;
+/** How many recent message entries (user+assistant) to include. */
+const CONVERSATION_TAIL_ENTRIES = 6;
+
+function truncateForContext(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n…[context truncated]`;
+}
+
+/**
+ * Extract the active goal objective from the current system prompt.
+ *
+ * pi-goal (an extension) injects the objective as an
+ * `<untrusted_objective>…</untrusted_objective>` block, optionally with
+ * `[PI GOAL …]` / `[GOAL CHECKPOINT …]` markers and a task list. When no goal
+ * is active (or the goals extension is absent) none of these markers appear
+ * and we return "".
+ */
+function extractGoalContext(ctx: ExtensionContext): string {
+  try {
+    const sys = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : "";
+    if (!sys) return "";
+
+    const objective = /<untrusted_objective>\s*([\s\S]*?)\s*<\/untrusted_objective>/.exec(sys);
+    if (objective && objective[1].trim()) {
+      return truncateForContext(objective[1].trim(), GOAL_CONTEXT_BUDGET);
+    }
+
+    // Fallback: bounded slice starting at a goal marker, cut before the
+    // lifecycle policy block (we only want the objective/task material).
+    const marker =
+      /\[PI GOAL (?:ACTIVE|PAUSED|BUDGET LIMITED)[^\]]*\]|\[GOAL CHECKPOINT[^\]]*\]|<pi_goal_continuation[^>]*>/.exec(
+        sys,
+      );
+    if (marker) {
+      const tail = sys.slice(marker.index);
+      const cut = tail.indexOf("[OUTCOMES]");
+      const slice = cut > 0 ? tail.slice(0, cut) : tail;
+      return truncateForContext(slice.trim(), GOAL_CONTEXT_BUDGET);
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+/** Extract plain text from an AgentMessage content value (string or parts). */
+function extractMessageText(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+      .map((p: any) => p.text.trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+/** Trimmed recent user/assistant message tail from the session manager. */
+function extractConversationTail(ctx: ExtensionContext): string {
+  try {
+    const entries: any[] =
+      (typeof ctx.sessionManager?.getEntries === "function"
+        ? ctx.sessionManager.getEntries()
+        : []) ?? [];
+    const messages = entries.filter(
+      (e) =>
+        e?.type === "message" &&
+        (e.message?.role === "user" || e.message?.role === "assistant"),
+    );
+    const tail = messages.slice(-CONVERSATION_TAIL_ENTRIES);
+    const lines: string[] = [];
+    for (const entry of tail) {
+      const text = extractMessageText(entry.message?.content);
+      if (text) lines.push(`[${entry.message.role}] ${text}`);
+    }
+    const joined = lines.join("\n");
+    return joined ? truncateForContext(joined, CONVERSATION_CONTEXT_BUDGET) : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Collect the session-context block for the commit-message subagent prompt.
+ * Returns "" when context_enabled is off, no context is available, or any
+ * access fails — the caller then omits the section entirely.
+ */
+export function collectSessionContext(ctx: ExtensionContext): string {
+  if (!config.contextEnabled) return "";
+  const parts: string[] = [];
+  const goal = extractGoalContext(ctx);
+  if (goal) parts.push("Goal / current task:", goal);
+  const conversation = extractConversationTail(ctx);
+  if (conversation) parts.push("Recent conversation:", conversation);
+  const joined = parts.join("\n\n");
+  return joined ? truncateForContext(joined, SESSION_CONTEXT_BUDGET) : "";
+}
+
 /**
  * Spawn a VERY QUICK subagent to generate a conventional commit message.
  * Uses createAgentSession with no tools — the diff is passed inline.
@@ -1444,7 +1621,6 @@ async function runCommitMessageSession(
       cwd: repoDir || ctx.cwd,
       model,
       thinkingLevel: config.subagentThinkingLevel as any,
-      modelRegistry: ctx.modelRegistry,
       resourceLoader: makeMessageResourceLoader(),
       sessionManager: SessionManager.inMemory(ctx.cwd),
       settingsManager: SettingsManager.inMemory({
@@ -1564,10 +1740,14 @@ export async function generateCommitMessageViaSubagent(
   request?: CommitMessageRequest,
 ): Promise<string> {
   const _ts = performance.now();
-  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style, request);
+  const prompt = buildCommitMessagePrompt(diffStat, diffContent, {
+    style,
+    request,
+    context: collectSessionContext(ctx),
+  });
 
   let generated = await runCommitMessageSession(ctx, prompt, repoDir, onProgress, signal);
-  if (generated && !isValidCommitMessage(generated)) {
+  if (generated && !isValidCommitMessage(generated, true)) {
     console.error(
       "[pi-committer] DIAG: subagent output is not a valid conventional commit — retrying once with stricter instructions",
     );
@@ -1581,7 +1761,7 @@ export async function generateCommitMessageViaSubagent(
     );
   }
 
-  if (generated && isValidCommitMessage(generated)) {
+  if (generated && isValidCommitMessage(generated, true)) {
     __lastSubagentCallMs = performance.now() - _ts;
     return generated;
   }
@@ -1708,21 +1888,78 @@ export function hasBinaryChanges(diffContent: string): boolean {
   return /Binary files? .* differ/.test(diffContent);
 }
 
+/** Lines that carry no semantic content for a commit description. */
+function isNoiseLine(line: string): boolean {
+  const t = line.trim().toLowerCase();
+  if (!t) return true;
+  // Punctuation/formatting only.
+  if (/^[{}()\[\];,=+\-*/\\"'`|<>!?.@#%^&]+$/.test(t)) return true;
+  // Comments.
+  if (/^(\/\/|#|\/\*|\*|\*\/|<!--)/.test(t)) return true;
+  // Markdown table rows / diff-format separators.
+  if (/^\|/.test(t) || /^\|[-\s|]+\|$/.test(t)) return true;
+  // Imports / re-exports.
+  if (/^(import\s|from\s+["']|require\s*\(|export\s*\{)/.test(t)) return true;
+  // JS/React pragmas ("use strict", "use client", ...).
+  if (/^["']?use (strict|client|server)["']?;?$/.test(t)) return true;
+  // Config noise: JSON key: value (boilerplate keys), lockfile metadata.
+  // Meaningful key=value assignments (e.g. `export NTFY_TOPIC=...`) are
+  // informative — they ARE the content of a config change.
+  if (/^["']?[a-z_][a-z0-9_]*["']?\s*:/.test(t)) return true; // JSON key
+  if (/^(lockfile|package-lock|node_modules|resolved|integrity|sha512|version\s*=|dependencies\s*:|devDependencies\s*:|scripts\s*:)/.test(t)) return true;
+  return false;
+}
+
+/** Paths whose lines should not dominate the description (config/dotfiles). */
+function isConfigPath(file: string): boolean {
+  return (
+    /(^|\/)\.[a-z0-9-]+(\.example)?$/.test(file) ||
+    /\.(json|toml|ya?ml|lock)$/.test(file) ||
+    file.includes("config") ||
+    file.includes("package")
+  );
+}
+
+/** First informative line in a set of added/removed lines (skips noise). */
+function firstInformativeLine(lines: string[]): string | undefined {
+  for (const line of lines) {
+    if (!isNoiseLine(line)) return line;
+  }
+  return undefined;
+}
+
 /** First meaningful snippet across changed files (added preferred, then removed). */
 function firstMeaningfulSnippet(
   changes: DiffFileChange[],
 ): { snippet: string; verb: "add" | "remove" } | undefined {
-  for (const c of changes) {
-    if (c.added.length > 0) {
-      return { snippet: c.added[0], verb: "add" };
-    }
+  // Prefer informative content from CODE files; config/dotfile-only changes
+  // still fall back to their own lines.
+  const codeChanges = changes.filter((c) => !isConfigPath(c.file));
+  for (const c of codeChanges) {
+    const line = firstInformativeLine(c.added);
+    if (line) return { snippet: line, verb: "add" };
+  }
+  for (const c of codeChanges) {
+    const line = firstInformativeLine(c.removed);
+    if (line) return { snippet: line, verb: "remove" };
   }
   for (const c of changes) {
-    if (c.removed.length > 0) {
-      return { snippet: c.removed[0], verb: "remove" };
-    }
+    const line = firstInformativeLine(c.added);
+    if (line) return { snippet: line, verb: "add" };
+  }
+  for (const c of changes) {
+    const line = firstInformativeLine(c.removed);
+    if (line) return { snippet: line, verb: "remove" };
   }
   return undefined;
+}
+
+/** Strip a leading action verb so headers never double-prefix ("add add ..."). */
+function stripLeadingAction(snippet: string): string {
+  return snippet.replace(
+    /^(add(ed|s)?|remove(d|s)?|fix(ed|es)?|update[d]?|change[d]?|refactor(ed)?|implement(ed)?|new|support[s]?|enable[d]?|disable[d]?)\s+/i,
+    "",
+  );
 }
 
 /**
@@ -1744,8 +1981,19 @@ function describeDiffContent(
   }
   const first = firstMeaningfulSnippet(hunks);
   if (!first) return "";
-  let snippet = first.snippet.replace(/[;,.!?]+$/, "").trim();
-  if (snippet.length > 55) snippet = snippet.slice(0, 55).trim() + "\u2026";
+  // Drop declaration prefixes so headers read naturally ("add sendNotification()",
+  // never "add def sendNotification()" or "add const retryCount = 3;").
+  const declStripped = first.snippet.replace(
+    /^(export\s+)?(async\s+)?(function|def|const|let|var|class|interface|type)\s+/,
+    "",
+  );
+  const stripped = stripLeadingAction(declStripped);
+  let snippet = (stripped || first.snippet).replace(/[;,.!?]+$/, "").trim();
+  // Truncate cleanly at a word boundary (never mid-word).
+  if (snippet.length > 58) {
+    const cut = snippet.lastIndexOf(" ", 58);
+    snippet = (cut > 30 ? snippet.slice(0, cut) : snippet.slice(0, 58)).trim() + "\u2026";
+  }
   return `${first.verb} ${snippet}`;
 }
 
@@ -1773,8 +2021,12 @@ function buildDeterministicBody(
   lines.push(`Summary: ${desc} — ${files.length} ${fileWord}, +${totalAdd}/-${totalDel}.`);
   for (const h of hunks.slice(0, 15)) {
     const bits: string[] = [];
-    if (h.added.length > 0) bits.push(`+${h.addedCount} ${h.added[0]}`);
-    if (h.removed.length > 0) bits.push(`-${h.removedCount} ${h.removed[0]}`);
+    const addLine = firstInformativeLine(h.added);
+    const remLine = firstInformativeLine(h.removed);
+    if (addLine) bits.push(`+${h.addedCount} ${addLine}`);
+    if (remLine) bits.push(`-${h.removedCount} ${remLine}`);
+    if (bits.length === 0 && h.addedCount > 0) bits.push(`+${h.addedCount} lines`);
+    if (bits.length === 0 && h.removedCount > 0) bits.push(`-${h.removedCount} lines`);
     lines.push(`- ${h.file}: ${bits.join(", ")}`);
   }
   if (hunks.length > 15) lines.push(`- ... and ${hunks.length - 15} more files`);
@@ -1787,17 +2039,63 @@ function detectCommitType(
   files: string[],
   style: RepoCommitStyle,
 ): string {
-  let type = "chore";
-  if (files.some((f) => /\.(test|spec|e2e)\./.test(f) || f.startsWith("test")))
-    type = "test";
-  else if (files.some((f) => /\.(md|txt|rst)$/.test(f) || f.includes("doc")))
-    type = "docs";
-  else if (files.some((f) => f.includes("config") || f.includes("package")))
-    type = "chore";
-  else if (/(^|[^a-z])(fix|bug|error|crash|issue)([^a-z]|$)/i.test(diffContent))
-    type = "fix";
-  else if (/(^|[^a-z])(feat|feature|add|new|implement)([^a-z]|$)/i.test(diffContent))
+  const isTestFile = (f: string) =>
+    /\.(test|spec|e2e)\./.test(f) || /(^|\/)(test|tests|__tests__)(\/|$)/.test(f);
+  const isDocFile = (f: string) => /\.(md|txt|rst)$/.test(f) || f.includes("doc");
+  const isConfigFile = (f: string) =>
+    f.includes("config") ||
+    f.includes("package") ||
+    /\.(json|toml|ya?ml)$/.test(f) ||
+    // Dotfiles like .envrc, .gitignore, .envrc.example
+    /(^|\/)\.[a-z0-9-]+(\.example)?$/.test(f);
+
+  const testFiles = files.filter(isTestFile);
+  const docFiles = files.filter(isDocFile);
+  const codeFiles = files.filter(
+    (f) => !isTestFile(f) && !isDocFile(f) && !isConfigFile(f),
+  );
+
+  // Content evidence FIRST: analyze the actual added lines of the diff,
+  // never the file names alone. A feature that ships with its tests is a
+  // feat, not a test — the old test-regex-first ordering caused "test:"
+  // headers on feature commits (e.g. `test: add # ntfy push ...`).
+  const hunks = parseDiffHunks(diffContent).filter(
+    (h) => files.length === 0 || files.includes(h.file),
+  );
+  const addedText = hunks.flatMap((h) => h.added).join("\n").toLowerCase();
+
+  const hasFeatureSignal =
+    /(^|\b)(feat|feature|implement|implemented|implements|introduce|introduces|introduced|adds?\b|new (api|endpoint|module|function|class|feature|command|flag))(\b|$)/.test(
+      addedText,
+    ) ||
+    // New definitions/symbols in code lines.
+    /^\s*(export\s+)?(async\s+)?function\s+|^\s*(export\s+)?class\s+|^\s*(export\s+)?(const|let|var)\s+[a-z_$][\w$]*\s*=\s*(async\s*)?\(|^\s*(export\s+)?interface\s+|^\s*def\s+[a-z_]\w*\s*\(/m.test(
+      addedText,
+    );
+
+  const hasFixSignal =
+    /(^|\b)(fix(es|ed|ing)?|bug|bugfix|crash|regression|workaround)(\b|$)/.test(addedText);
+
+  let type: string;
+  if (hasFeatureSignal && codeFiles.length > 0) {
     type = "feat";
+  } else if (hasFixSignal && codeFiles.length > 0) {
+    type = "fix";
+  } else if (testFiles.length > 0 && codeFiles.length === 0) {
+    // Test-only change: no production code touched.
+    type = "test";
+  } else if (testFiles.length > 0 && testFiles.length > codeFiles.length) {
+    // Test-dominated change set (e.g. a test-suite overhaul with small
+    // supporting edits) and no stronger code-content signal.
+    type = "test";
+  } else if (docFiles.length > 0 && codeFiles.length === 0 && testFiles.length === 0) {
+    type = "docs";
+  } else if (files.length > 0 && codeFiles.length === 0 && testFiles.length === 0 && docFiles.length === 0) {
+    // Config/dotfile-only change.
+    type = "chore";
+  } else {
+    type = "chore";
+  }
 
   // Constrain to types the repo actually uses when style sampling is enabled:
   // if the heuristic type never appears in recent history, use the dominant one.
@@ -1940,12 +2238,19 @@ export function formatStyleContext(style: RepoCommitStyle): string {
  * Includes the diff, conventional-commit rules, detail requirements with
  * bad/good examples, and the sampled repo style when available.
  */
+export interface CommitMessagePromptOptions {
+  style?: RepoCommitStyle;
+  request?: CommitMessageRequest;
+  /** Session context (goal/task + recent conversation) for intent alignment. */
+  context?: string;
+}
+
 export function buildCommitMessagePrompt(
   diffStat: string,
   diffContent: string,
-  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
-  request?: CommitMessageRequest,
+  opts: CommitMessagePromptOptions = {},
 ): string {
+  const { style = EMPTY_COMMIT_STYLE, request, context } = opts;
   const truncatedDiff =
     diffContent.length > 8000
       ? diffContent.slice(0, 8000) + "\n... (truncated)"
@@ -1961,10 +2266,15 @@ export function buildCommitMessagePrompt(
     "",
     "Rules:",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
+    "- Choosing the type: feat = new capability or behavior; fix = correcting a bug; refactor = restructuring without behavior change; test = tests only; docs = documentation only; chore = build/config/tooling; perf = performance; style = formatting; ci = CI config; build = build system; revert = undoing a previous change.",
     "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
     "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- NEVER write generic filler. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes', 'update exposure: config'. The header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
     "- Body: explain what changed and WHY in a short paragraph, referencing specific code from the diff. Never restate the header verbatim.",
+    "- Example of a GOOD message:",
+    "  feat(api): add retry with exponential backoff",
+    "",
+    "  Retries failed requests up to 3 times with exponential backoff, surfacing the last error after exhausting attempts.",
     "- Max 72 chars for the header line (type + scope + description combined).",
     "- Output ONLY the commit message, nothing else.",
   ];
@@ -1979,6 +2289,13 @@ export function buildCommitMessagePrompt(
       "",
       "User message request — the commit message MUST cover these points (where they apply to the diff):",
       requestText,
+    );
+  }
+  if (context) {
+    lines.push(
+      "",
+      "Session context — what the user is working on. Align the commit message with this intent where it applies to the diff, but NEVER claim changes the diff does not contain:",
+      context,
     );
   }
   lines.push("", "Diff stat:", diffStat, "", "Full diff:", truncatedDiff);
@@ -2048,7 +2365,7 @@ export function resolveCommitMessage(
   style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
   allowDeterministic = false,
 ): string | undefined {
-  if (isValidCommitMessage(message)) return message;
+  if (isValidCommitMessage(message, true)) return message;
 
   if (!allowDeterministic) {
     console.error(
@@ -2062,6 +2379,8 @@ export function resolveCommitMessage(
   );
   const fallback = deterministicCommitMessage(diffStat, diffContent, files, style);
   if (!fallback || !isValidCommitMessage(fallback)) {
+    // (Lenient check: the deterministic generator's headers may legitimately
+    // end in the enforceHeaderLimit truncation marker "…".)
     console.error(
       "[pi-committer] DIAG: deterministic regeneration produced no detailed valid message — blocking commit",
     );
@@ -2668,9 +2987,10 @@ async function tryCommitAsync(
   __asyncCommitStarted = true;
   __asyncCommitFileCount = allFiles.length;
 
-  // Resolve model for the subprocess
+  // Resolve model for the subprocess — the full serializable pi Model is
+  // structured-cloned over IPC so the worker can pass it to createAgentSession
+  // as-is (mirrors the sync path's resolveSubagentModel).
   const model = resolveSubagentModel(ctx);
-  const modelStr = model ? `${model.provider}/${model.id}` : undefined;
 
   try {
     const child = resolveFork()(__workerPath, [], {
@@ -2854,7 +3174,8 @@ async function tryCommitAsync(
         stagedCommits: config.stagedCommits,
         excludePatterns: config.excludePatterns,
         minChanges: config.minChanges,
-        subagentModel: modelStr,
+        subagentModel: model ?? undefined,
+        sessionContext: config.contextEnabled ? collectSessionContext(ctx) : "",
         subagentGroupingMinFiles: config.subagentGroupingMinFiles,
         subagentMessageMinFiles: config.subagentMessageMinFiles,
         subagentThinkingLevel: config.subagentThinkingLevel,
@@ -3089,10 +3410,33 @@ export function isDirtyRepo(repoDir: string): boolean {
 }
 
 /** Concurrent variant used by commitAllRepos — git subprocesses run in parallel. */
-async function isDirtyRepoAsync(repoDir: string): Promise<boolean> {
+/**
+ * Promisified execFile. Node has no node:child_process/promises submodule
+ * (importing it throws ERR_UNKNOWN_BUILTIN_MODULE at runtime); the previous
+ * dynamic import was silently swallowed by the catch, so isDirtyRepoAsync
+ * never actually detected dirty repos.
+ */
+function execFileAsync(
+  file: string,
+  args: string[],
+  options: { cwd: string; maxBuffer: number },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      { ...options, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        if (err) reject(err);
+        else resolve({ stdout, stderr });
+      },
+    );
+  });
+}
+
+export async function isDirtyRepoAsync(repoDir: string): Promise<boolean> {
   try {
-    const { execFile } = await import("node:child_process/promises");
-    const { stdout } = await execFile("git", ["status", "--porcelain"], {
+    const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
       cwd: repoDir,
       maxBuffer: 10 * 1024 * 1024,
     });

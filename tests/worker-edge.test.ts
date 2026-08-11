@@ -36,6 +36,8 @@ import {
   filterGitignoredFiles,
   unstageExcludedFiles,
   deterministicCommitMessage,
+  generateCommitMessage,
+  generateCommitGroups,
   resolveCommitMessage,
   parseDiffHunks,
   sampleRepoCommitStyle,
@@ -45,9 +47,11 @@ import {
   isValidCommitMessage,
   parseCommitGroups,
   sendResultAndExit,
+  __setCreateAgentSessionFn,
   type CommitLogEntry,
   type WorkerProgress,
   type CommitCallbacks,
+  type WorkerSubagentModel,
 } from "../async-commit-worker.ts";
 import { resolveWorkerExecArgv } from "../index.ts";
 
@@ -294,6 +298,136 @@ describe("worker exported deterministicCommitMessage (content-driven)", () => {
     assert.ok(msg.startsWith("feat"), `feat content should produce feat type, got: ${msg}`);
   });
 
+  it("REGRESSION: feature code with test files is feat, not test", () => {
+    // The motivating bug: the old test-regex-first ordering stamped "test:"
+    // on a feature commit because the change set contained test files
+    // (e.g. `test: add # ntfy push (optional): ...`).
+    const diff = makeDiff({
+      "src/api.ts": { added: ["export function sendNotification(): void {"] },
+      "src/api.test.ts": { added: ["assert sendNotification is callable"] },
+    });
+    const msg = deterministicCommitMessage(
+      "src/api.ts | 1 +, src/api.test.ts | 1 +",
+      diff,
+      ["src/api.ts", "src/api.test.ts"],
+    );
+    assert.ok(msg.startsWith("feat"), `feature+tests should be feat, got: ${msg}`);
+  });
+
+  it("fix content with test files is fix, not test", () => {
+    const diff = makeDiff({
+      "src/main.ts": { added: ["fix the flaky retry by adding backoff"] },
+      "src/main.test.ts": { added: ["assert retry backoff is applied"] },
+    });
+    const msg = deterministicCommitMessage(
+      "src/main.ts | 1 +, src/main.test.ts | 1 +",
+      diff,
+      ["src/main.ts", "src/main.test.ts"],
+    );
+    assert.ok(msg.startsWith("fix"), `fix+tests should be fix, got: ${msg}`);
+  });
+
+  it("test-only change is test", () => {
+    const diff = makeDiff({ "tests/foo.test.ts": { added: ["assert.equal(2, 2);"] } });
+    const msg = deterministicCommitMessage("tests/foo.test.ts | 1 +", diff, ["tests/foo.test.ts"]);
+    assert.ok(msg.startsWith("test"), `test-only should be test, got: ${msg}`);
+  });
+
+  it("test-dominated change set (no code content signal) is test", () => {
+    // A test-suite overhaul: more test files than code files, and the code
+    // edits carry no feat/fix vocabulary.
+    const diff = makeDiff({
+      "tests/a.test.ts": { added: ["assert case a"] },
+      "tests/b.test.ts": { added: ["assert case b"] },
+      "src/helpers.ts": { added: ["return input.trim();"] },
+    });
+    const msg = deterministicCommitMessage(
+      "tests/a.test.ts | 1 +, tests/b.test.ts | 1 +, src/helpers.ts | 1 +",
+      diff,
+      ["tests/a.test.ts", "tests/b.test.ts", "src/helpers.ts"],
+    );
+    assert.ok(msg.startsWith("test"), `test-dominated should be test, got: ${msg}`);
+  });
+
+  it("config/dotfile-only change is chore", () => {
+    const diff = makeDiff({ ".envrc.example": { added: ["export NTFY_TOPIC=ntfy.sh/check_gp"] } });
+    const msg = deterministicCommitMessage(".envrc.example | 1 +", diff, [".envrc.example"]);
+    assert.ok(msg.startsWith("chore"), `dotfile-only should be chore, got: ${msg}`);
+  });
+
+  it("skips comment/config noise to find the first informative snippet", () => {
+    // The motivating bad-message shape: the first added line was a `#`
+    // comment in .envrc.example; the old code used it verbatim as the
+    // description (`test: add # ntfy push (optional): ...`).
+    const diff = makeDiff({
+      ".envrc.example": { added: ["# ntfy push (optional): bare topic -> ntfy.sh", "export NTFY_TOPIC=ntfy.sh/check_gp"] },
+      "src/api.ts": { added: ["export function sendNotification(): void {"] },
+    });
+    const msg = deterministicCommitMessage(
+      ".envrc.example | 2 ++, src/api.ts | 1 +",
+      diff,
+      [".envrc.example", "src/api.ts"],
+    );
+    assert.ok(
+      msg.includes("sendNotification"),
+      `description should come from the informative code line, got: ${msg.split("\n")[0]}`,
+    );
+    assert.ok(
+      !msg.includes("# ntfy push"),
+      `comment noise must not leak into the description, got: ${msg.split("\n")[0]}`,
+    );
+  });
+
+  it("blocks when the diff contains only noise (comments/imports/boilerplate)", () => {
+    const diff = makeDiff({
+      "src/notes.txt": { added: ["# just a comment"] },
+      "src/api.ts": { added: ["import { request } from 'node:http'"] },
+      "package.json": { added: ['"version": "1.0.0"'] },
+    });
+    const msg = deterministicCommitMessage(
+      "src/notes.txt | 1 +, src/api.ts | 1 +, package.json | 1 +",
+      diff,
+      ["src/notes.txt", "src/api.ts", "package.json"],
+    );
+    assert.strictEqual(
+      msg,
+      "",
+      "nothing informative to describe → block signal, never a filler message",
+    );
+  });
+
+  it("never double-prefixes a leading verb (add add → add)", () => {
+    const diff = makeDiff({ "src/main.ts": { added: ["add retry logic with backoff"] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    const header = msg.split("\n")[0];
+    assert.ok(
+      header.includes("add retry logic with backoff"),
+      `header should read naturally, got: ${header}`,
+    );
+    assert.ok(
+      !header.includes("add add"),
+      `no doubled verb, got: ${header}`,
+    );
+  });
+
+  it("truncates the description at a word boundary, never mid-word", () => {
+    const longLine =
+      "handle the case where the upstream service returns a partial response with incomplete headers and a truncated payload";
+    const diff = makeDiff({ "src/main.ts": { added: [longLine] } });
+    const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
+    const header = msg.split("\n")[0];
+    assert.ok(header.endsWith("\u2026"), `long descriptions should be ellipsized, got: ${header}`);
+    const truncated = header.slice(0, header.indexOf("\u2026"));
+    assert.ok(
+      truncated.length < longLine.length && truncated.endsWith(" ") === false,
+      `truncation should cut at a word boundary: ...${truncated.slice(-20)}`,
+    );
+    assert.ok(
+      !/\u2026[a-z]/.test(header),
+      `no content after the ellipsis, got: ${header}`,
+    );
+  });
+
   it("always includes a structured body with per-file details", () => {
     const diff = makeDiff({ "src/main.ts": { added: ["const retryCount = 3;"] } });
     const msg = deterministicCommitMessage("src/main.ts | 1 +", diff, ["src/main.ts"]);
@@ -375,9 +509,254 @@ describe("worker exported resolveCommitMessage", () => {
       "@@ -1 +1,3 @@\n" +
       "+const retryCount = 3;\n" +
       " context line\n";
-    const resolved = resolveCommitMessage("not valid", "src/main.ts | 1 +", diff, ["src/main.ts"], undefined, true);
+    const resolved = resolveCommitMessage("not valid", "src/main.ts | 1 +", diff, ["src/main.ts"], { allowDeterministic: true });
     assert.ok(resolved, "should regenerate a valid message");
     assert.ok(isValidCommitMessage(resolved!), `should be valid, got: ${resolved}`);
+  });
+});
+
+describe("worker generateCommitMessage gate (regression: request must not enable deterministic)", () => {
+  const diff =
+    "diff --git a/src/main.ts b/src/main.ts\n" +
+    "index 1111111..2222222 100644\n" +
+    "--- a/src/main.ts\n" +
+    "+++ b/src/main.ts\n" +
+    "@@ -1 +1,3 @@\n" +
+    "+const retryCount = 3;\n" +
+    " context line\n";
+  const diffStat = "src/main.ts | 1 +";
+  const files = ["src/main.ts"];
+
+  it("gate off + message request → empty (block), never deterministic", async () => {
+    // Reproduces the original bug shape: the commit_changes `request`
+    // (message/verbatim intent) used to be passed in the allowDeterministic
+    // slot, truthy-enabling the deterministic generator while the
+    // deterministic_fallback gate was off. With the options object, a truthy
+    // request can no longer leak into allowDeterministic.
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      allowDeterministic: false,
+      request: { message: "add retry handling" },
+    });
+    assert.strictEqual(msg, "");
+  });
+
+  it("gate on + message request → deterministic message is produced", async () => {
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      allowDeterministic: true,
+      request: { message: "add retry handling" },
+    });
+    assert.ok(msg && msg.length > 0, "deterministic fallback should produce a message");
+    assert.ok(isValidCommitMessage(msg), `deterministic output should be valid, got: ${msg}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Subagent model passing: the full session Model is forwarded from the main
+// process and the worker must attempt the subagent with it — deterministic
+// only when the deterministic_fallback gate is on.
+// ---------------------------------------------------------------------------
+describe("worker subagent model passing (seam: __setCreateAgentSessionFn)", () => {
+  const diff =
+    "diff --git a/src/api.ts b/src/api.ts\n" +
+    "index 1111111..2222222 100644\n" +
+    "--- a/src/api.ts\n" +
+    "+++ b/src/api.ts\n" +
+    "@@ -1 +1,3 @@\n" +
+    "+export function listUsers(): string[] {\n" +
+    "+  return [\n" +
+    " context line\n";
+  const diffStat = "src/api.ts | 2 ++";
+  const files = ["src/api.ts"];
+
+  // Full serializable Model shape as sent by the main process (JSON-safe
+  // subset of pi's Model — api is a string, cost is plain data).
+  const sessionModel: WorkerSubagentModel = {
+    provider: "openai",
+    id: "gpt-4o-mini",
+    name: "GPT-4o mini",
+    api: "openai-completions",
+    baseUrl: "https://api.openai.com/v1",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 128000,
+    maxTokens: 16384,
+    cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
+  };
+
+  function mockSession(text: string) {
+    return {
+      prompt: async () => {},
+      subscribe: (cb: (event: any) => void) => {
+        // Fire synchronously so output is captured before prompt resolves.
+        cb({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text }],
+          },
+        });
+        return () => {};
+      },
+      abort: () => {},
+    };
+  }
+
+  afterEach(() => __setCreateAgentSessionFn(undefined));
+
+  it("attempts the subagent with the session model and returns its valid message", async () => {
+    const calls: any[] = [];
+    __setCreateAgentSessionFn(async (opts: any) => {
+      calls.push(opts);
+      return { session: mockSession("feat(api): add user listing\n\nReal body from the model.") };
+    });
+
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: false,
+      request: { message: "expose user listing" },
+    });
+
+    assert.strictEqual(
+      msg,
+      "feat(api): add user listing\n\nReal body from the model.",
+      "the subagent's message should be returned",
+    );
+    assert.strictEqual(calls.length, 1, "exactly one session should be created");
+    assert.strictEqual(calls[0].model, sessionModel, "full model must be passed through as-is");
+    assert.strictEqual(calls[0].cwd, "/tmp");
+    assert.deepStrictEqual(calls[0].tools, [], "message sessions run with no tools");
+    assert.ok(
+      calls[0].resourceLoader?.getSystemPromptSource !== undefined &&
+        calls[0].resourceLoader?.getAppendSystemPromptSources !== undefined,
+      "resource loader should satisfy the 0.84.1 ResourceLoader contract",
+    );
+  });
+
+  it("subagent empty output + gate off → '' (block), never deterministic", async () => {
+    let called = false;
+    __setCreateAgentSessionFn(async () => {
+      called = true;
+      return { session: mockSession("") };
+    });
+
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: false,
+      request: { message: "user intent that must not leak into deterministic output" },
+    });
+
+    assert.strictEqual(called, true, "subagent should be attempted when a model is present");
+    assert.strictEqual(msg, "", "gate off → block, never deterministic");
+  });
+
+  it("subagent empty output + gate on → deterministic message (legitimate fallback)", async () => {
+    __setCreateAgentSessionFn(async () => ({ session: mockSession("") }));
+
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: true,
+    });
+
+    assert.ok(msg && msg.length > 0, "deterministic fallback should produce a message");
+    assert.ok(isValidCommitMessage(msg), `deterministic output should be valid, got: ${msg}`);
+  });
+
+  it("no model → subagent skipped even when a session mock is set", async () => {
+    let called = false;
+    __setCreateAgentSessionFn(async () => {
+      called = true;
+      return { session: mockSession("feat(api): never used") };
+    });
+
+    const msg = await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      allowDeterministic: false,
+    });
+
+    assert.strictEqual(called, false, "without a model the subagent must not be attempted");
+    assert.strictEqual(msg, "", "gate off → block");
+  });
+
+  it("forwards session context into the subagent prompt (single commit)", async () => {
+    const prompts: string[] = [];
+    __setCreateAgentSessionFn(async () => ({
+      session: {
+        prompt: async (p: string) => {
+          prompts.push(p);
+        },
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    const context = "Goal / current task:\nFinish the session-context feature.";
+    await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: false,
+      context,
+    });
+
+    assert.strictEqual(prompts.length, 1, "one session prompt expected");
+    assert.ok(prompts[0].includes("Session context"), "prompt should include the Session context section");
+    assert.ok(
+      prompts[0].includes("Finish the session-context feature."),
+      "prompt should include the context text",
+    );
+  });
+
+  it("omits session context from the prompt when none is provided", async () => {
+    const prompts: string[] = [];
+    __setCreateAgentSessionFn(async () => ({
+      session: {
+        prompt: async (p: string) => {
+          prompts.push(p);
+        },
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    await generateCommitMessage(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: false,
+    });
+
+    assert.strictEqual(prompts.length, 1);
+    assert.ok(!prompts[0].includes("Session context"), "no session context section without context");
+  });
+
+  it("forwards session context into the grouped prompt", async () => {
+    const prompts: string[] = [];
+    __setCreateAgentSessionFn(async () => ({
+      session: {
+        prompt: async (p: string) => {
+          prompts.push(p);
+        },
+        subscribe: () => () => {},
+        abort: () => {},
+      },
+    }));
+
+    const context = "Goal / current task:\nSplit the migration into logical commits.";
+    await generateCommitGroups(diffStat, diff, files, "/tmp", {
+      subagentModel: sessionModel,
+      allowDeterministic: false,
+      context,
+    });
+
+    assert.strictEqual(prompts.length, 1, "one grouping prompt expected");
+    assert.ok(prompts[0].includes("Session context"), "grouped prompt should include the Session context section");
+    assert.ok(
+      prompts[0].includes("Split the migration into logical commits."),
+      "grouped prompt should include the context text",
+    );
+    assert.ok(
+      prompts[0].includes("Choosing each group's type"),
+      "grouped prompt should include type-choice guidance",
+    );
+    assert.ok(
+      prompts[0].includes("Example of a GOOD group header+body"),
+      "grouped prompt should include a good example",
+    );
   });
 });
 
@@ -444,6 +823,7 @@ describe("worker exported isValidDiffStat", () => {
 describe("worker exported isValidCommitMessage", () => {
   it("accepts a valid conventional commit message", () => {
     assert.ok(isValidCommitMessage("feat(api): add user endpoint\n\nNew endpoint."));
+    assert.ok(isValidCommitMessage("feat(api): add user endpoint\n\nNew endpoint.", true));
   });
 
   it("rejects garbled content", () => {
@@ -452,6 +832,43 @@ describe("worker exported isValidCommitMessage", () => {
 
   it("rejects very short messages", () => {
     assert.ok(!isValidCommitMessage("short"));
+  });
+
+  it("rejects comment-quoted descriptions (the motivating bad-message class)", () => {
+    // A generated message that opens with a comment char is always garbage.
+    assert.ok(!isValidCommitMessage("feat: # comment quoted"));
+    assert.ok(!isValidCommitMessage("feat: // add retry logic"));
+    // The exact bad-message shape is rejected in strict mode (truncation),
+    // while lenient (verbatim) mode still accepts user-supplied text that is
+    // conventionally valid.
+    const badMessage =
+      "test: add # ntfy push (optional): bare topic -> ntfy.sh, or a full URL…";
+    assert.ok(!isValidCommitMessage(badMessage, true), "strict: bad message rejected");
+  });
+
+  it("rejects punctuation-only and near-empty descriptions", () => {
+    assert.ok(!isValidCommitMessage("feat: ---"));
+    assert.ok(!isValidCommitMessage("feat: . . ."));
+    assert.ok(!isValidCommitMessage("feat: …"));
+  });
+
+  it("rejects messages containing raw diff artifacts", () => {
+    assert.ok(!isValidCommitMessage("feat: add stuff\n\ndiff --git a/x b/x"));
+    assert.ok(!isValidCommitMessage("feat: add stuff\n\n@@ -1 +1 @@"));
+  });
+
+  it("strict mode rejects generic filler, lenient (verbatim) accepts it", () => {
+    assert.ok(!isValidCommitMessage("chore: update files", true), "strict: filler rejected");
+    assert.ok(!isValidCommitMessage("feat: misc changes", true), "strict: misc rejected");
+    assert.ok(!isValidCommitMessage("chore: update 3 files", true), "strict: update N files rejected");
+    // A user's verbatim message is still accepted when conventionally valid.
+    assert.ok(isValidCommitMessage("chore: update deps", false), "lenient: user verbatim accepted");
+    assert.ok(isValidCommitMessage("docs: minor fix", false), "lenient: user verbatim accepted");
+  });
+
+  it("strict mode rejects over-truncated descriptions", () => {
+    assert.ok(!isValidCommitMessage("feat: add the retry logic with backoff and exponential…", true));
+    assert.ok(isValidCommitMessage("feat: add the retry logic with backoff", true));
   });
 });
 
@@ -743,7 +1160,7 @@ describe("worker git failure modes", () => {
     writeFileSync(hookPath, "#!/bin/sh\nexit 1\n");
     fs.chmodSync(hookPath, 0o755);
 
-    writeFileSync(path.join(dir, "hook-test.ts"), "// hook test\n");
+    writeFileSync(path.join(dir, "hook-test.ts"), "export function hookTest(): void {}\n");
     execSync("git add hook-test.ts", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {
@@ -783,8 +1200,8 @@ describe("worker git failure modes", () => {
   it("skips files that fail git add (simulating subagent hallucination)", async () => {
     const dir = createTempRepo();
 
-    writeFileSync(path.join(dir, "real1.ts"), "// real 1\n");
-    writeFileSync(path.join(dir, "real2.ts"), "// real 2\n");
+    writeFileSync(path.join(dir, "real1.ts"), "export const realOne = 1;\n");
+    writeFileSync(path.join(dir, "real2.ts"), "export const realTwo = 2;\n");
     execSync("git add -A", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {
@@ -895,7 +1312,7 @@ describe("worker IPC edge cases", () => {
   it("sends result before exit (exit code 0)", async () => {
     const dir = createTempRepo();
 
-    writeFileSync(path.join(dir, "ipc-edge.ts"), "// ipc edge\n");
+    writeFileSync(path.join(dir, "ipc-edge.ts"), "export const ipcEdge = 1;\n");
     execSync("git add ipc-edge.ts", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {
@@ -1110,6 +1527,174 @@ describe("worker message request (verbatim)", () => {
       cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
     }).trim().split("\n").filter(Boolean);
     assert.deepStrictEqual(staged, ["bad-v.ts"], "blocked changes remain staged");
+  });
+});
+
+// ===========================================================================
+// Deterministic gate on the REAL worker commit path (regression: a truthy
+// messageRequest must never enable deterministic output while the gate is off)
+// ===========================================================================
+
+describe("worker deterministic gate on the real commit path", () => {
+  /** Build a realistic unified git diff per file. */
+  function makeDiff(files: Record<string, { added?: string[]; removed?: string[] }>): string {
+    const out: string[] = [];
+    for (const [file, change] of Object.entries(files)) {
+      out.push(`diff --git a/${file} b/${file}`);
+      out.push("index 1111111..2222222 100644");
+      out.push(`--- a/${file}`);
+      out.push(`+++ b/${file}`);
+      out.push("@@ -1 +1,3 @@");
+      for (const l of change.removed ?? []) out.push(`-${l}`);
+      for (const l of change.added ?? []) out.push(`+${l}`);
+      out.push(" context line");
+    }
+    return out.join("\n");
+  }
+
+  function stageAndSummarize(dir: string, files: Record<string, string>) {
+    for (const [f, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+      writeFileSync(path.join(dir, f), content);
+    }
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+    const diffStat = execSync("git diff --cached --stat", {
+      cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const diffContent = execSync("git diff --cached", {
+      cwd: dir, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const allFiles = diffStat
+      .split("\n").filter((l) => l.includes("|"))
+      .map((l) => l.match(/^(.+?)\s+\|/)?.[1]?.trim() ?? "")
+      .filter(Boolean);
+    return { diffStat, diffContent, allFiles };
+  }
+
+  it("single commit: gate off + messageRequest + no model → blocked, changes staged, NO deterministic text", async () => {
+    const dir = createTempRepo();
+    const { diffStat, diffContent, allFiles } = stageAndSummarize(dir, {
+      "src/ntfy.ts": "export function push(topic: string): void {}\n",
+      "src/ntfy.test.ts": "import { test } from 'node:test';\n",
+    });
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir, diffStat, diffContent, allFiles,
+      stagedCommits: false,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 15,
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: false,
+      messageRequest: { message: "add ntfy push support" },
+    });
+
+    assert.strictEqual(exitCode, 0);
+    assert.ok(msg, "should send a result");
+    assert.strictEqual(msg.type, "result");
+    assert.strictEqual(msg.commitCount, 0, "gate off must NOT commit via the deterministic generator");
+    // No deterministic "Summary: … — N files" body anywhere in the result.
+    const serialized = JSON.stringify(msg);
+    assert.ok(
+      !/Summary:.*\u2014 \d+ files?/.test(serialized),
+      `deterministic Summary body must not appear: ${serialized}`,
+    );
+    // Changes remain staged for a retry.
+    const staged = execSync("git diff --cached --stat", { cwd: dir, encoding: "utf-8" });
+    assert.ok(staged.trim().length > 0, "changes must remain staged");
+    // No new commit beyond the initial one.
+    const log = execSync("git log --oneline", { cwd: dir, encoding: "utf-8" }).trim();
+    assert.strictEqual(log.split("\n").length, 1, "no commit should have been created");
+  });
+
+  it("single commit: gate on + messageRequest → deterministic message is committed", async () => {
+    const dir = createTempRepo();
+    const { diffStat, diffContent, allFiles } = stageAndSummarize(dir, {
+      "src/ntfy.ts": "export function push(topic: string): void {}\n",
+    });
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir, diffStat, diffContent, allFiles,
+      stagedCommits: false,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 15,
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: true,
+      messageRequest: { message: "add ntfy push support" },
+    });
+
+    assert.strictEqual(exitCode, 0);
+    assert.ok(msg);
+    assert.strictEqual(msg.commitCount, 1, "gate on allows the deterministic fallback");
+    const committed = execSync("git log -1 --format=%B", { cwd: dir, encoding: "utf-8" }).trim();
+    assert.ok(committed.length > 0, "a commit must exist");
+    assert.ok(
+      isValidCommitMessage(committed.split("\n\n")[0]),
+      `header should be valid conventional format, got: ${committed}`,
+    );
+  });
+
+  it("grouped path: gate off + messageRequest + no model → no crash, no commit, changes staged (pre-fix ReferenceError regression)", async () => {
+    const dir = createTempRepo();
+    const { diffStat, diffContent, allFiles } = stageAndSummarize(dir, {
+      "src/a.ts": "export const a = 1;\n",
+      "src/b.ts": "export const b = 2;\n",
+    });
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir, diffStat, diffContent, allFiles,
+      stagedCommits: true,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 2, // force the grouped path
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: false,
+      messageRequest: { message: "add a and b" },
+    });
+
+    assert.strictEqual(exitCode, 0);
+    assert.ok(msg);
+    assert.strictEqual(msg.type, "result");
+    assert.ok(!msg.error, `no crash: pre-fix this path died with ReferenceError 'request is not defined' — got error: ${msg.error ?? ""}`);
+    assert.strictEqual(msg.commitCount, 0, "gate off must not commit in grouped mode");
+    const staged = execSync("git diff --cached --stat", { cwd: dir, encoding: "utf-8" });
+    assert.ok(staged.trim().length > 0, "changes must remain staged");
+  });
+
+  it("grouped path: gate on + messageRequest → deterministic single-group commit succeeds", async () => {
+    const dir = createTempRepo();
+    const { diffStat, diffContent, allFiles } = stageAndSummarize(dir, {
+      "src/a.ts": "export const a = 1;\n",
+      "src/b.ts": "export const b = 2;\n",
+    });
+
+    const { msg, exitCode } = await forkWorker(dir, {
+      dir, diffStat, diffContent, allFiles,
+      stagedCommits: true,
+      excludePatterns: [],
+      minChanges: 1,
+      subagentModel: undefined,
+      subagentGroupingMinFiles: 2, // force the grouped path
+      subagentMessageMinFiles: 3,
+      subagentThinkingLevel: "off",
+      deterministicFallback: true,
+      messageRequest: { message: "add a and b" },
+    });
+
+    assert.strictEqual(exitCode, 0);
+    assert.ok(msg);
+    assert.ok(!msg.error, `no crash — error: ${msg.error ?? ""}`);
+    assert.strictEqual(msg.commitCount, 1, "gate on commits in grouped mode");
+    const committed = execSync("git log -1 --format=%B", { cwd: dir, encoding: "utf-8" }).trim();
+    assert.ok(committed.length > 0, "a commit must exist");
   });
 });
 

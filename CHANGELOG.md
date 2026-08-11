@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Misleading commit messages are now structurally impossible.** The async
+  worker's single-commit call site passed the `commit_changes` request object
+  positionally where the `allowDeterministic` boolean was expected — a truthy
+  request silently bypassed the `deterministic_fallback` gate and shipped
+  garbage headers like `test: add # ntfy push (optional): ...`. Message
+  generation helpers (`generateCommitMessage`, `generateCommitGroups`,
+  `resolveCommitMessage`, `buildCommitMessagePrompt`) now take an options
+  object for trailing params, so a `MessageRequest` can never bind to a
+  boolean again; the grouped path forwards the request too. Fork-based
+  worker-edge regression tests drive the real worker commit command (single +
+  grouped) and assert a blocked commit + staged changes under the gate-off
+  path.
+
+- **The project now typechecks against the SDK the pi runtime actually loads**
+  (0.84.1): `@earendil-works/pi-coding-agent` devDep bumped from ^0.74.0,
+  `tsc --noEmit` wired into `npm test`/`test:all`, and pre-existing type
+  errors fixed — including a latent runtime bug where
+  `import("node:child_process/promises")` (which does not exist in Node) made
+  `isDirtyRepoAsync` silently return `false`; it now uses a promisified
+  `execFile`. A boolean/MessageRequest mismatch is a compile error from now
+  on.
+
+- **Deterministic generator quality (gate-on defense):** `detectCommitType`
+  is content-evidence-first (feature + tests → `feat`; test only for
+  test-only/test-dominated diffs); the description skips comment/import/
+  config/lockfile noise, prefers informative code lines, truncates at word
+  boundaries, never double-prefixes verbs, and returns "" (block, changes
+  stay staged) when nothing informative exists. `isValidCommitMessage`
+  rejects comment-quoted descriptions, diff artifacts, generic filler, and
+  over-truncated output for generated messages (verbatim user messages stay
+  lenient). Subagent prompts gained type-choice guidance and a good example.
+
+### Added
+
+- **Session context for the commit-message subagent** (new `context_enabled`
+  config key, default `true`): when no verbatim message is supplied, the
+  subagent prompt includes the active goal objective/task context (extracted
+  from the system prompt; omitted gracefully when the goals extension is not
+  active) plus a trimmed recent-conversation tail, so generated messages
+  align with what the user is working on. Works in both the sync and async
+  (worker) paths.
+
 ## [0.15.0] — 2026-08-08
 
 ### Added

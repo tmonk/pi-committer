@@ -103,6 +103,15 @@ exclude_patterns  = ["*.log", "node_modules/"]
 # Default: true.
 # notify_async_completion = true
 
+# When true (default), the commit-message subagent prompt includes your session
+# context whenever no verbatim message is supplied: the active goal objective /
+# task context (when a goal is active) plus a trimmed recent-conversation tail.
+# The subagent uses it to align the commit message with what you're working on —
+# it never fabricates diff content. Robust when no goal is active or the
+# conversation is unavailable (those parts are simply omitted). Set to false to
+# keep the prompt diff-only.
+# context_enabled = true
+
 # Optional: extend conventional commit types / restrict scopes
 # custom_types    = ["api", "wip"]
 # allowed_scopes  = ["api", "cli", "core"]

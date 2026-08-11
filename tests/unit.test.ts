@@ -29,6 +29,7 @@ import piCommitter, {
   gitRoot,
   isGitRepo,
   isDirtyRepo,
+  isDirtyRepoAsync,
   stageAll,
   getChangedFiles,
   filterGitignoredFiles,
@@ -79,6 +80,7 @@ import piCommitter, {
   hasGoalsExtension,
   hasActiveGoal,
   ensureGoalsExtension,
+  collectSessionContext,
   _resetWarnedMissingGoals,
   _clearGoalStatuses,
   _resetGoalScanCount,
@@ -165,6 +167,33 @@ describe("config loading", () => {
     assert.deepStrictEqual(cfg.excludePatterns, []);
     assert.strictEqual(cfg.minChanges, 1);
     assert.strictEqual(cfg.deferToGoalAudit, false);
+    assert.strictEqual(cfg.contextEnabled, true, "context_enabled should default to on");
+  });
+
+  it("parses context_enabled from .pi-committer.toml", () => {
+    const toml = `[committer]
+enabled = true
+context_enabled = false
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.contextEnabled, false);
+    assert.strictEqual(cfg.enabled, true);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
+  });
+
+  it("defaults context_enabled to true when not in config", () => {
+    const toml = `[committer]
+enabled = true
+`;
+    writeFileSync(path.join(dir, ".pi-committer.toml"), toml, "utf-8");
+
+    const cfg = loadConfig(dir);
+    assert.strictEqual(cfg.contextEnabled, true);
+
+    fs.rmSync(path.join(dir, ".pi-committer.toml"));
   });
 
   it("parses defer_to_goal_audit from .pi-committer.toml", () => {
@@ -463,6 +492,26 @@ describe("isDirtyRepo", () => {
   });
 });
 
+describe("isDirtyRepoAsync (promisified execFile variant)", () => {
+  let dir: string;
+  before(() => { dir = createTempRepo(); });
+  after(() => removeDir(dir));
+
+  it("returns true for a dirty repo", async () => {
+    writeFileSync(path.join(dir, "async-dirty.ts"), "// dirty\n");
+    assert.strictEqual(await isDirtyRepoAsync(dir), true);
+  });
+
+  it("returns false for a clean repo", async () => {
+    execSync("git add -A && git commit -m 'clean for async' -q", { cwd: dir, stdio: "ignore" });
+    assert.strictEqual(await isDirtyRepoAsync(dir), false);
+  });
+
+  it("returns false for a non-existent directory", async () => {
+    assert.strictEqual(await isDirtyRepoAsync("/nonexistent/path"), false);
+  });
+});
+
 describe("getChangedFiles", () => {
   it("parses git diff --cached --stat output", () => {
     const stat = ` src/main.ts | 5 +++++\n tests/main.test.ts | 10 ++++++++++\n 2 files changed, 15 insertions(+)`;
@@ -756,6 +805,34 @@ describe("deterministicCommitMessage (content-driven)", () => {
     assert.ok(msg.startsWith("feat"), `expected feat type, got: ${msg}`);
   });
 
+  it("REGRESSION: feature code with test files is feat, not test", () => {
+    // The motivating bug: the old test-regex-first ordering stamped "test:"
+    // on a feature commit because the change set contained test files
+    // (e.g. `test: add # ntfy push (optional): ...`).
+    const diff = makeDiff({
+      "src/api.ts": { added: ["export function sendNotification(): void {"] },
+      "src/api.test.ts": { added: ["assert sendNotification is callable"] },
+    });
+    const msg = deterministicCommitMessage(
+      statFor("src/api.ts", "src/api.test.ts"),
+      diff,
+    );
+    assert.ok(msg.startsWith("feat"), `feature+tests should be feat, got: ${msg}`);
+  });
+
+  it("test-dominated change set (no code content signal) is test", () => {
+    const diff = makeDiff({
+      "tests/a.test.ts": { added: ["assert case a"] },
+      "tests/b.test.ts": { added: ["assert case b"] },
+      "src/helpers.ts": { added: ["return input.trim();"] },
+    });
+    const msg = deterministicCommitMessage(
+      statFor("tests/a.test.ts", "tests/b.test.ts", "src/helpers.ts"),
+      diff,
+    );
+    assert.ok(msg.startsWith("test"), `test-dominated should be test, got: ${msg}`);
+  });
+
   it("uses smart scope (longest common ancestor)", () => {
     const diff = makeDiff({
       "experiments/exposure/src/adaptation_panel.py": { added: ["handle new config keys"] },
@@ -947,6 +1024,14 @@ describe("buildCommitMessagePrompt", () => {
     assert.ok(prompt.includes("what changed and WHY"));
   });
 
+  it("includes type-choice guidance and a good example", () => {
+    const prompt = buildCommitMessagePrompt("a.ts | 1 +", "diff");
+    assert.ok(prompt.includes("Choosing the type"), "type-choice guidance should be present");
+    assert.ok(prompt.includes("feat = new capability or behavior"), "feat guidance should be present");
+    assert.ok(prompt.includes("Example of a GOOD message"), "good example should be present");
+    assert.ok(prompt.includes("exponential backoff"), "good example body should be present");
+  });
+
   it("includes style context when provided", () => {
     const style = {
       history: ["feat(api): add login"],
@@ -956,7 +1041,7 @@ describe("buildCommitMessagePrompt", () => {
       headerOnly: false,
       recentHeader: "feat(api): add login",
     };
-    const prompt = buildCommitMessagePrompt("a.ts | 1 +", "diff", style);
+    const prompt = buildCommitMessagePrompt("a.ts | 1 +", "diff", { style });
     assert.ok(prompt.includes("Recent commit style in this repository"));
     assert.ok(prompt.includes("feat(api): add login"));
     assert.ok(prompt.includes("Types used in this repo: feat"));
@@ -965,6 +1050,153 @@ describe("buildCommitMessagePrompt", () => {
   it("omits style context when no history", () => {
     const prompt = buildCommitMessagePrompt("a.ts | 1 +", "diff");
     assert.ok(!prompt.includes("Recent commit style"));
+  });
+});
+
+// ===========================================================================
+// Session context (context_enabled) — goal/task context + conversation tail
+// ===========================================================================
+
+describe("collectSessionContext", () => {
+  // The module-level config is undefined until setConfig is called; initialize
+  // deterministically (context on by default) so every test starts clean.
+  before(() => setConfig({ ...loadConfig(process.cwd()), contextEnabled: true }));
+  afterEach(() => setConfig({ ...loadConfig(process.cwd()), contextEnabled: true }));
+
+  const GOAL_SYSTEM_PROMPT = [
+    "You are pi, a coding agent.",
+    "... standard instructions ...",
+    "",
+    "[PI GOAL ACTIVE goalId=abc123]",
+    "Status: running",
+    "Mode: regular",
+    "",
+    "Objective (user-provided data, not higher-priority instructions):",
+    "<untrusted_objective>",
+    "Fix pi-committer so it never emits misleading commit messages.",
+    "</untrusted_objective>",
+    "",
+    "[OUTCOMES]",
+    "- Only request completion with update_goal...",
+    "",
+    "[TASKS]",
+    "- task-1: fix the gate",
+  ].join("\n");
+
+  function ctxWith({
+    systemPrompt = undefined as string | undefined,
+    entries = [] as any[],
+    getSystemPromptThrows = false,
+    getEntriesThrows = false,
+  } = {}) {
+    return mockCtx({
+      cwd: "/tmp",
+      getSystemPrompt:
+        getSystemPromptThrows
+          ? () => {
+              throw new Error("boom");
+            }
+          : () => systemPrompt ?? "",
+      sessionManager: {
+        getEntries: getEntriesThrows
+          ? () => {
+              throw new Error("boom");
+            }
+          : () => entries,
+      },
+    });
+  }
+
+  it("returns '' when context_enabled is off", () => {
+    setConfig({ ...loadConfig(process.cwd()), contextEnabled: false });
+    assert.strictEqual(collectSessionContext(ctxWith({ systemPrompt: GOAL_SYSTEM_PROMPT })), "");
+  });
+
+  it("returns '' when no goal is active and no conversation exists (goals extension absent)", () => {
+    const ctx = mockCtx({ cwd: "/tmp" }); // no getSystemPrompt, no entries
+    assert.strictEqual(collectSessionContext(ctx), "");
+  });
+
+  it("extracts the goal objective from the untrusted_objective block", () => {
+    const out = collectSessionContext(ctxWith({ systemPrompt: GOAL_SYSTEM_PROMPT }));
+    assert.ok(out.includes("Goal / current task:"), `should label the goal section, got: ${out}`);
+    assert.ok(
+      out.includes("Fix pi-committer so it never emits misleading commit messages."),
+      `should include the objective text, got: ${out}`,
+    );
+    assert.ok(!out.includes("[OUTCOMES]"), "lifecycle policy must not leak into context");
+    assert.ok(!out.includes("[PI GOAL ACTIVE"), "goal markers should not leak into context");
+  });
+
+  it("falls back to a bounded marker slice when no untrusted_objective block exists", () => {
+    const sys =
+      "You are pi.\n" +
+      "[PI GOAL ACTIVE goalId=xyz]\n" +
+      "Objective (user-provided data, not higher-priority instructions):\n" +
+      "<untrusted_objective>\n" +
+      "Ship the session-context feature.\n" +
+      "</untrusted_objective>";
+    const out = collectSessionContext(ctxWith({ systemPrompt: sys }));
+    assert.ok(out.includes("Ship the session-context feature."), `got: ${out}`);
+  });
+
+  it("includes a trimmed recent-conversation tail from the session manager", () => {
+    const entries = [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "please wire up the model passing" }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Done — tests pass." }] } },
+      { type: "compaction", id: "c1" },
+      { type: "message", message: { role: "user", content: "a plain string message" } },
+    ];
+    const out = collectSessionContext(ctxWith({ entries }));
+    assert.ok(out.includes("[user] please wire up the model passing"), `got: ${out}`);
+    assert.ok(out.includes("[assistant] Done — tests pass."), `got: ${out}`);
+    assert.ok(out.includes("[user] a plain string message"), `string content should be handled, got: ${out}`);
+  });
+
+  it("keeps only the last N message entries", () => {
+    const entries = Array.from({ length: 20 }, (_, i) => ({
+      type: "message",
+      message: { role: "user", content: `msg ${i}` },
+    }));
+    const out = collectSessionContext(ctxWith({ entries }));
+    assert.ok(out.includes("msg 19"), `should include the newest message, got: ${out}`);
+    assert.ok(!out.includes("msg 0"), `oldest messages should be dropped, got: ${out}`);
+  });
+
+  it("combines goal context and conversation tail", () => {
+    const out = collectSessionContext(
+      ctxWith({
+        systemPrompt: GOAL_SYSTEM_PROMPT,
+        entries: [{ type: "message", message: { role: "user", content: "keep going" } }],
+      }),
+    );
+    assert.ok(out.includes("Goal / current task:"), `got: ${out}`);
+    assert.ok(out.includes("Recent conversation:"), `got: ${out}`);
+    assert.ok(out.includes("keep going"), `got: ${out}`);
+  });
+
+  it("degrades gracefully when getSystemPrompt throws", () => {
+    assert.strictEqual(collectSessionContext(ctxWith({ getSystemPromptThrows: true })), "");
+  });
+
+  it("degrades gracefully when getEntries throws", () => {
+    assert.strictEqual(collectSessionContext(ctxWith({ getEntriesThrows: true })), "");
+  });
+});
+
+describe("buildCommitMessagePrompt session context", () => {
+  it("includes the Session context section when context is provided", () => {
+    const prompt = buildCommitMessagePrompt("a.ts | 1 +", "+export const x = 1", {
+      context: "Goal / current task:\nFinish the SDK bump.",
+    });
+    assert.match(prompt, /Session context/);
+    assert.match(prompt, /Finish the SDK bump\./);
+    assert.match(prompt, /NEVER claim changes the diff does not contain/);
+  });
+
+  it("omits the Session context section when no context is provided", () => {
+    const prompt = buildCommitMessagePrompt("a.ts | 1 +", "+export const x = 1");
+    assert.ok(!prompt.includes("Session context"), "no session context without context");
   });
 });
 
@@ -1951,7 +2183,7 @@ describe("gitignore commit integration", () => {
     after(() => removeDir(repoDir));
 
     // Create and stage a file
-    writeFileSync(path.join(repoDir, "feat.ts"), "// new feature");
+    writeFileSync(path.join(repoDir, "feat.ts"), "export const newFeature = true;\n");
     execSync("git add feat.ts", { cwd: repoDir, stdio: "ignore" });
 
     // With the deterministic_fallback gate ON, the output-less mock subagent
@@ -2075,7 +2307,7 @@ describe("match_repo_style behavior (opt-in style sampling)", () => {
 
     setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: false, deterministicFallback: true });
 
-    writeFileSync(path.join(dir, "feature.ts"), "// add retry logic\n");
+    writeFileSync(path.join(dir, "feature.ts"), "export function retryWithBackoff(): void {}\n");
     const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
     assert.strictEqual(result, 1, "should commit");
 
@@ -2091,7 +2323,7 @@ describe("match_repo_style behavior (opt-in style sampling)", () => {
 
     setConfig({ ...originalConfig, stagedCommits: false, matchRepoStyle: true, deterministicFallback: true });
 
-    writeFileSync(path.join(dir, "feature.ts"), "// add retry logic\n");
+    writeFileSync(path.join(dir, "feature.ts"), "export function retryWithBackoff(): void {}\n");
     const result = await tryCommit(dir, mockCtx({ cwd: dir }), true, undefined);
     assert.strictEqual(result, 1, "should commit");
 
@@ -2108,7 +2340,7 @@ describe("session shutdown cleanup", () => {
   it("cancels delayed widget cleanup before the extension context becomes stale", async () => {
     const dir = createTempRepo();
     after(() => removeDir(dir));
-    writeFileSync(path.join(dir, "shutdown-fix.ts"), "// shutdown cleanup\n");
+    writeFileSync(path.join(dir, "shutdown-fix.ts"), "export function shutdownCleanup(): void {}\n");
 
     const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void>>();
     piCommitter({
@@ -2354,15 +2586,16 @@ describe("async commit threshold", () => {
     mockChild.exitCode = null;
     mockChild.killed = false;
 
-    // Capture the Esc handler
-    let capturedEscHandler: ((data: any) => any) | null = null;
+    // Capture the Esc handler (array holder: a closure-captured let with a
+    // literal-null initializer narrows to never under strictNullChecks)
+    const capturedEscHandlers: Array<(data: any) => any> = [];
     const ctxWithUI = mockCtx({
       cwd: dir,
       hasUI: true,
       ui: {
         notify: () => {},
         onTerminalInput: (handler: (data: any) => any) => {
-          capturedEscHandler = handler;
+          capturedEscHandlers.push(handler);
           return () => {}; // unsubscribe
         },
         setWidget: () => {},
@@ -2378,10 +2611,11 @@ describe("async commit threshold", () => {
       assert.strictEqual(result, -1, "should return -1 when async started");
 
       // The Esc handler should have been registered
-      assert.ok(capturedEscHandler, "Esc handler should be registered");
+      const escHandler = capturedEscHandlers[0];
+      assert.ok(escHandler, "Esc handler should be registered");
 
       // Simulate Esc key press with raw terminal escape character
-      const consumeResult = capturedEscHandler!("\x1b");
+      const consumeResult = escHandler!("\x1b");
       assert.ok(consumeResult, "Esc handler should return a result");
       assert.ok(consumeResult?.consume, "Esc should consume the event");
 
@@ -2421,9 +2655,11 @@ describe("async commit threshold", () => {
     mockChild.exitCode = null;
     mockChild.killed = false;
 
-    let capturedSend: ((msg: any) => boolean) | null = null;
-    mockChild.send = (msg: any) => {
-      capturedSend = msg;
+    // Capture the IPC start message (array holder: a closure-captured let
+    // with a literal-null initializer narrows to never under strictNullChecks)
+    const capturedSends: Array<{ type: string; params: any }> = [];
+    mockChild.send = (msg: { type: string; params: any }) => {
+      capturedSends.push(msg);
       return true;
     };
 
@@ -2445,13 +2681,172 @@ describe("async commit threshold", () => {
       assert.strictEqual(result, -1, "should return -1");
 
       // Verify the start message was sent to the worker
-      assert.ok(capturedSend, "child.send should be called");
-      assert.strictEqual(capturedSend!.type, "start", "should send 'start' message");
-      assert.ok(capturedSend!.params, "should include params");
-      assert.strictEqual(capturedSend!.params.dir, dir, "params should include dir");
-      assert.ok(Array.isArray(capturedSend!.params.allFiles), "params should include allFiles array");
-      assert.strictEqual(capturedSend!.params.stagedCommits, originalConfig.stagedCommits, "params should include stagedCommits");
-      assert.ok(capturedSend!.params.allFiles.length >= 5, "should have at least 5 files");
+      const sent = capturedSends[0];
+      assert.ok(sent, "child.send should be called");
+      assert.strictEqual(sent.type, "start", "should send 'start' message");
+      assert.ok(sent.params, "should include params");
+      assert.strictEqual(sent.params.dir, dir, "params should include dir");
+      assert.ok(Array.isArray(sent.params.allFiles), "params should include allFiles array");
+      assert.strictEqual(sent.params.stagedCommits, originalConfig.stagedCommits, "params should include stagedCommits");
+      assert.ok(sent.params.allFiles.length >= 5, "should have at least 5 files");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("forwards the resolved session model to the async worker", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `model-${i}.ts`), `// model ${i}\n`);
+    }
+
+    const sessionModel = {
+      provider: "openai",
+      id: "gpt-4o-mini",
+      name: "GPT-4o mini",
+      api: "openai-completions",
+      baseUrl: "https://api.openai.com/v1",
+      reasoning: false,
+      input: ["text"],
+      contextWindow: 128000,
+      maxTokens: 16384,
+      cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
+    };
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99993;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    const capturedSends: Array<{ type: string; params: any }> = [];
+    mockChild.send = (msg: { type: string; params: any }) => {
+      capturedSends.push(msg);
+      return true;
+    };
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    // No subagent_model config — the session model (ctx.model) must be
+    // resolved and forwarded to the worker (mirrors the sync path's
+    // resolveSubagentModel fallback to ctx.model).
+    const ctxWithModel = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      model: sessionModel,
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithModel, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      const sent = capturedSends[0];
+      assert.ok(sent, "child.send should be called");
+      assert.strictEqual(sent.type, "start", "should send 'start' message");
+      assert.deepStrictEqual(
+        sent.params.subagentModel,
+        sessionModel,
+        "full session model should be forwarded in the worker params",
+      );
+      // This ctx has no goal/conversation hooks — context must degrade to an
+      // empty string rather than crash the spawn.
+      assert.strictEqual(sent.params.sessionContext, "", "no context sources → empty sessionContext");
+    } finally {
+      _cancelPendingCommitterHide();
+      __setForkMock(undefined);
+      setConfig(originalConfig);
+    }
+  });
+
+  it("forwards the collected session context to the async worker", async () => {
+    const dir = createTempRepo();
+    after(() => removeDir(dir));
+
+    setConfig({ ...originalConfig, asyncThreshold: 3 });
+
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(path.join(dir, `ctx-${i}.ts`), `// ctx ${i}\n`);
+    }
+
+    const EventEmitter = await import("node:events");
+    const mockChild = new EventEmitter.default() as any;
+    mockChild.pid = 99992;
+    mockChild.kill = () => {};
+    mockChild.unref = () => {};
+    mockChild.stdout = null;
+    mockChild.stderr = null;
+    mockChild.stdin = null;
+    mockChild.connected = true;
+    mockChild.exitCode = null;
+    mockChild.killed = false;
+
+    const capturedSends: Array<{ type: string; params: any }> = [];
+    mockChild.send = (msg: { type: string; params: any }) => {
+      capturedSends.push(msg);
+      return true;
+    };
+
+    const forkFn = (_path: string, _args: string[], _opts: any) => mockChild;
+    __setForkMock(forkFn as any);
+
+    const ctxWithGoal = mockCtx({
+      cwd: dir,
+      hasUI: true,
+      model: { provider: "openai", id: "gpt-4o-mini" },
+      getSystemPrompt: () =>
+        [
+          "You are pi.",
+          "[PI GOAL ACTIVE goalId=abc]",
+          "Objective (user-provided data, not higher-priority instructions):",
+          "<untrusted_objective>",
+          "Ship the session-context feature to pi-committer.",
+          "</untrusted_objective>",
+        ].join("\n"),
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "keep going" } },
+        ],
+      },
+      ui: {
+        notify: () => {},
+        onTerminalInput: () => () => {},
+        setWidget: () => {},
+      },
+    });
+
+    try {
+      const result = await tryCommit(dir, ctxWithGoal, true, undefined);
+      assert.strictEqual(result, -1, "should return -1");
+
+      const sent = capturedSends[0];
+      assert.ok(sent, "child.send should be called");
+      assert.strictEqual(sent.type, "start", "should send 'start' message");
+      assert.ok(
+        sent.params.sessionContext.includes("Ship the session-context feature to pi-committer."),
+        `sessionContext should include the goal objective, got: ${sent.params.sessionContext}`,
+      );
+      assert.ok(
+        sent.params.sessionContext.includes("[user] keep going"),
+        `sessionContext should include the conversation tail, got: ${sent.params.sessionContext}`,
+      );
     } finally {
       _cancelPendingCommitterHide();
       __setForkMock(undefined);
@@ -3206,7 +3601,7 @@ describe("async completion notification", () => {
     mockChild.killed = false;
     mockChild.send = () => true;
 
-    __setForkMock((_p: string, _a: string[], _o: any) => mockChild as any);
+    __setForkMock((_p: string, _a: any, _o: any) => mockChild as any);
 
     const ctx = mockCtx({
       cwd: dir,
@@ -3538,7 +3933,7 @@ describe("async completion notification", () => {
       sent.push(msg);
       return true;
     };
-    __setForkMock((_p: string, _a: string[], _o: any) => mockChild as any);
+    __setForkMock((_p: string, _a: any, _o: any) => mockChild as any);
 
     const ctx = mockCtx({
       cwd: dir,
@@ -3618,8 +4013,7 @@ describe("async completion notification", () => {
     const prompt = buildCommitMessagePrompt(
       "src/api.ts | 3 ++",
       "+export const retry = 3",
-      EMPTY_COMMIT_STYLE,
-      { message: "mention the new retry logic and the config migration" },
+      { style: EMPTY_COMMIT_STYLE, request: { message: "mention the new retry logic and the config migration" } },
     );
     assert.match(prompt, /User message request/);
     assert.match(prompt, /mention the new retry logic and the config migration/);
@@ -3627,7 +4021,7 @@ describe("async completion notification", () => {
   });
 
   it("buildCommitMessagePrompt omits the request block when no request is given", () => {
-    const prompt = buildCommitMessagePrompt("src/api.ts | 3 ++", "+export const retry = 3", EMPTY_COMMIT_STYLE);
+    const prompt = buildCommitMessagePrompt("src/api.ts | 3 ++", "+export const retry = 3");
     assert.ok(!prompt.includes("User message request"), "no request block without a request");
     assert.ok(!prompt.includes("MUST cover these points"));
   });
@@ -4732,7 +5126,7 @@ Files: module.test.ts, nonexistent.ts`,
 
     setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: true });
 
-    writeFileSync(path.join(dir, "real.ts"), "// real\n");
+    writeFileSync(path.join(dir, "real.ts"), "export const real = 1;\n");
 
     // Mock subagent that fires message_end synchronously
     __setCreateAgentSessionMock(async (_opts: any) => ({
@@ -5223,8 +5617,8 @@ Files: file-y.ts`,
 
     setConfig({ ...originalConfig, stagedCommits: true, deterministicFallback: true });
 
-    writeFileSync(path.join(dir, "only-one.ts"), "// only one\n");
-    writeFileSync(path.join(dir, "only-two.ts"), "// only two\n");
+    writeFileSync(path.join(dir, "only-one.ts"), "export const onlyOne = 1;\n");
+    writeFileSync(path.join(dir, "only-two.ts"), "export const onlyTwo = 2;\n");
 
     let subagentCalled = false;
 
@@ -5239,7 +5633,7 @@ Files: file-y.ts`,
             type: "message_end",
             message: {
               role: "assistant",
-              content: [{ type: "text", text: "chore: update files" }],
+              content: [{ type: "text", text: "feat: add onlyOne and onlyTwo constants\n\nExpose two new module constants." }],
             },
           });
           return () => {};
@@ -5266,8 +5660,8 @@ Files: file-y.ts`,
 
     setConfig({ ...originalConfig, stagedCommits: true, subagentGroupingMinFiles: 1 });
 
-    writeFileSync(path.join(dir, "only-one.ts"), "// only one\n");
-    writeFileSync(path.join(dir, "only-two.ts"), "// only two\n");
+    writeFileSync(path.join(dir, "only-one.ts"), "export const onlyOne = 1;\n");
+    writeFileSync(path.join(dir, "only-two.ts"), "export const onlyTwo = 2;\n");
 
     let subagentCalled = false;
 
@@ -5281,7 +5675,7 @@ Files: file-y.ts`,
             type: "message_end",
             message: {
               role: "assistant",
-              content: [{ type: "text", text: "chore: update files" }],
+              content: [{ type: "text", text: "feat: add onlyOne and onlyTwo constants\n\nExpose two new module constants." }],
             },
           });
           return () => {};
@@ -5308,8 +5702,17 @@ Files: file-y.ts`,
 
     writeFileSync(path.join(dir, "blocked.ts"), "// blocked\n");
 
-    // No subagent mock — no agent message can be produced
-    __setCreateAgentSessionMock(undefined);
+    // No agent message can be produced: mock a subagent session that yields
+    // no assistant output. (Leaving the mock unset would invoke the real SDK,
+    // which with pi's auth configured can actually generate a message — the
+    // test must not depend on the environment.)
+    __setCreateAgentSessionMock(async () => ({
+      session: {
+        prompt: async () => {},
+        abort: () => {},
+        subscribe: () => () => {},
+      },
+    }));
     let warningText = "";
     const ctx = mockCtx({
       cwd: dir,
@@ -5468,9 +5871,9 @@ describe("async worker IPC integration", () => {
     execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
 
     // Create some changes
-    writeFileSync(path.join(dir, "file1.ts"), "// file1\n");
-    writeFileSync(path.join(dir, "file2.ts"), "// file2\n");
-    writeFileSync(path.join(dir, "file3.ts"), "// file3\n");
+    writeFileSync(path.join(dir, "file1.ts"), "export const fileOne = 1;\n");
+    writeFileSync(path.join(dir, "file2.ts"), "export const fileTwo = 2;\n");
+    writeFileSync(path.join(dir, "file3.ts"), "export const fileThree = 3;\n");
 
     // Stage all
     execSync("git add -A", { cwd: dir, stdio: "ignore" });
@@ -5576,7 +5979,7 @@ describe("async worker IPC integration", () => {
     execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
 
     // Single change
-    writeFileSync(path.join(dir, "single.ts"), "// single\n");
+    writeFileSync(path.join(dir, "single.ts"), "export const single = 1;\n");
     execSync("git add -A", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {
@@ -5638,8 +6041,8 @@ describe("async worker IPC integration", () => {
     writeFileSync(path.join(dir, "README.md"), "# test\n");
     execSync("git add -A && git commit -m initial", { cwd: dir, stdio: "ignore" });
 
-    writeFileSync(path.join(dir, "a.ts"), "// a\n");
-    writeFileSync(path.join(dir, "b.ts"), "// b\n");
+    writeFileSync(path.join(dir, "a.ts"), "export const alpha = 1;\n");
+    writeFileSync(path.join(dir, "b.ts"), "export const beta = 2;\n");
     execSync("git add -A", { cwd: dir, stdio: "ignore" });
 
     const diffStat = execSync("git diff --cached --stat", {
@@ -5712,7 +6115,7 @@ describe("batchStageFilesForGroup warning routing", () => {
     const dir = makeRepo();
 
     // Create a real file
-    writeFileSync(path.join(dir, "real.ts"), "// real\n");
+    writeFileSync(path.join(dir, "real.ts"), "export const real = 1;\n");
     execSync("git add real.ts", { cwd: dir, stdio: "ignore" });
 
     // onWarning simulates addUnstageableFileWarning — tracks the warning

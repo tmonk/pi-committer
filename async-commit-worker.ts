@@ -18,6 +18,22 @@ import * as path from "node:path";
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolved subagent model forwarded from the main process over IPC.
+ *
+ * The main process resolves the full pi `Model` (mirroring the sync path's
+ * resolveSubagentModel) and structured-clones it into the worker params; the
+ * worker passes it to createAgentSession as-is. Only `provider`/`id` are
+ * required by the worker contract, but the full serializable Model travels
+ * with it so the session gets every field (api, baseUrl, reasoning, ...).
+ */
+export interface WorkerSubagentModel {
+  provider: string;
+  id: string;
+  /** Remaining full pi Model fields (name, api, baseUrl, reasoning, cost, ...). */
+  [key: string]: unknown;
+}
+
 interface CommitWorkerParams {
   /** Git repo directory */
   dir: string;
@@ -33,8 +49,14 @@ interface CommitWorkerParams {
   excludePatterns: string[];
   /** Minimum changes threshold */
   minChanges: number;
-  /** Resolved model for the subagent (provider/id string, e.g. "openai/gpt-4o-mini") */
-  subagentModel?: string;
+  /** Resolved subagent model (full pi Model, JSON-safe) from the main process */
+  subagentModel?: WorkerSubagentModel;
+  /**
+   * Session context (goal/task + recent conversation) collected by the main
+   * process when context_enabled is on and no verbatim message is supplied.
+   * Empty string = no context (setting off, unavailable, or not collected).
+   */
+  sessionContext?: string;
   /** Minimum changed files to use the subagent for grouping */
   subagentGroupingMinFiles: number;
   /** Minimum changed files to use the subagent for a single commit message */
@@ -69,13 +91,13 @@ interface MessageRequest {
   verbatim?: string;
 }
 
-interface CommitLogEntry {
+export interface CommitLogEntry {
   hash: string;
   message: string;
   success: boolean;
 }
 
-interface WorkerProgress {
+export interface WorkerProgress {
   phase: "analyzing" | "committing" | "done" | "cancelled";
   fileCount?: number;
   statusMessage?: string;
@@ -228,10 +250,40 @@ export function isValidDiffStat(stat: string): boolean {
 /**
  * Validate that a commit message looks like a legitimate conventional commit.
  */
-export function isValidCommitMessage(message: string): boolean {
+export function isValidCommitMessage(message: string, strict = false): boolean {
+  if (typeof message !== "string") return false;
   if (message.length < 10) return false;
+
   const firstLine = message.split("\n")[0];
-  return /^[a-z]+(\([^)]+\))?: .+/.test(firstLine);
+  const header = /^([a-z]+)(\([^)]+\))?: (.*)$/.exec(firstLine);
+  if (!header) return false;
+
+  const desc = header[3].trim();
+  if (!desc) return false;
+  // Comment-quoted or diff-artifact descriptions are always garbage
+  // (e.g. `test: add # ntfy push (optional): ...`).
+  if (/^[#\/\*+\-]/.test(desc)) return false;
+  if (/^[\u2026.\-_\s]+$/.test(desc)) return false;
+  const wordy = desc.replace(/[^\p{L}\p{N}]+/gu, "");
+  if (wordy.length < 3) return false;
+
+  // Raw diff lines must never appear inside a commit message.
+  if (/^diff --git |^@@ |^index [0-9a-f]+\.\.[0-9a-f]+/m.test(message)) return false;
+
+  if (strict) {
+    // Over-truncated descriptions (ellipsis-terminated) are never committed.
+    if (/\u2026\s*$/.test(desc) || /\.\.\.\s*$/.test(desc)) return false;
+    // Generic filler — the description must say WHAT changed, not just
+    // that files were touched. (Verbatim user messages skip this check.)
+    if (
+      /^(update|updated?|modify|modified?|change[d]?|adjust(ed)?|tweak(ed)?|cleanup|clean up|misc|various|stuff|things?|minor|small|improve[ds]?|bump|refresh|sync)\s*(\d+\s+)?(files?|modules?|things?|stuff|changes?|deps|dependencies?|config|settings?|code|all)?(\s+and\s+(more|other|misc))?\s*$/i.test(
+        desc,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function getDiffContent(dir: string): string {
@@ -558,20 +610,78 @@ export function hasBinaryChanges(diffContent: string): boolean {
 }
 
 /** First meaningful snippet across changed files (added preferred, then removed). */
+/** Lines that carry no semantic content for a commit description. */
+function isNoiseLine(line: string): boolean {
+  const t = line.trim().toLowerCase();
+  if (!t) return true;
+  // Punctuation/formatting only.
+  if (/^[{}()\[\];,=+\-*/\\"'`|<>!?.@#%^&]+$/.test(t)) return true;
+  // Comments.
+  if (/^(\/\/|#|\/\*|\*|\*\/|<!--)/.test(t)) return true;
+  // Markdown table rows / diff-format separators.
+  if (/^\|/.test(t) || /^\|[-\s|]+\|$/.test(t)) return true;
+  // Imports / re-exports.
+  if (/^(import\s|from\s+["']|require\s*\(|export\s*\{)/.test(t)) return true;
+  // JS/React pragmas ("use strict", "use client", ...).
+  if (/^["']?use (strict|client|server)["']?;?$/.test(t)) return true;
+  // Config noise: JSON key: value (boilerplate keys), lockfile metadata.
+  // Meaningful key=value assignments (e.g. `export NTFY_TOPIC=...`) are
+  // informative — they ARE the content of a config change.
+  if (/^["']?[a-z_][a-z0-9_]*["']?\s*:/.test(t)) return true; // JSON key
+  if (/^(lockfile|package-lock|node_modules|resolved|integrity|sha512|version\s*=|dependencies\s*:|devDependencies\s*:|scripts\s*:)/.test(t)) return true;
+  return false;
+}
+
+/** Paths whose lines should not dominate the description (config/dotfiles). */
+function isConfigPath(file: string): boolean {
+  return (
+    /(^|\/)\.[a-z0-9-]+(\.example)?$/.test(file) ||
+    /\.(json|toml|ya?ml|lock)$/.test(file) ||
+    file.includes("config") ||
+    file.includes("package")
+  );
+}
+
+/** First informative line in a set of added/removed lines (skips noise). */
+function firstInformativeLine(lines: string[]): string | undefined {
+  for (const line of lines) {
+    if (!isNoiseLine(line)) return line;
+  }
+  return undefined;
+}
+
+/** First meaningful snippet across changed files (added preferred, then removed). */
 function firstMeaningfulSnippet(
   changes: DiffFileChange[],
 ): { snippet: string; verb: "add" | "remove" } | undefined {
-  for (const c of changes) {
-    if (c.added.length > 0) {
-      return { snippet: c.added[0], verb: "add" };
-    }
+  // Prefer informative content from CODE files; config/dotfile-only changes
+  // still fall back to their own lines.
+  const codeChanges = changes.filter((c) => !isConfigPath(c.file));
+  for (const c of codeChanges) {
+    const line = firstInformativeLine(c.added);
+    if (line) return { snippet: line, verb: "add" };
+  }
+  for (const c of codeChanges) {
+    const line = firstInformativeLine(c.removed);
+    if (line) return { snippet: line, verb: "remove" };
   }
   for (const c of changes) {
-    if (c.removed.length > 0) {
-      return { snippet: c.removed[0], verb: "remove" };
-    }
+    const line = firstInformativeLine(c.added);
+    if (line) return { snippet: line, verb: "add" };
+  }
+  for (const c of changes) {
+    const line = firstInformativeLine(c.removed);
+    if (line) return { snippet: line, verb: "remove" };
   }
   return undefined;
+}
+
+/** Strip a leading action verb so headers never double-prefix ("add add ..."). */
+function stripLeadingAction(snippet: string): string {
+  return snippet.replace(
+    /^(add(ed|s)?|remove(d|s)?|fix(ed|es)?|update[d]?|change[d]?|refactor(ed)?|implement(ed)?|new|support[s]?|enable[d]?|disable[d]?)\s+/i,
+    "",
+  );
 }
 
 /**
@@ -593,8 +703,19 @@ function describeDiffContent(
   }
   const first = firstMeaningfulSnippet(hunks);
   if (!first) return "";
-  let snippet = first.snippet.replace(/[;,.!?]+$/, "").trim();
-  if (snippet.length > 55) snippet = snippet.slice(0, 55).trim() + "\u2026";
+  // Drop declaration prefixes so headers read naturally ("add sendNotification()",
+  // never "add def sendNotification()" or "add const retryCount = 3;").
+  const declStripped = first.snippet.replace(
+    /^(export\s+)?(async\s+)?(function|def|const|let|var|class|interface|type)\s+/,
+    "",
+  );
+  const stripped = stripLeadingAction(declStripped);
+  let snippet = (stripped || first.snippet).replace(/[;,.!?]+$/, "").trim();
+  // Truncate cleanly at a word boundary (never mid-word).
+  if (snippet.length > 58) {
+    const cut = snippet.lastIndexOf(" ", 58);
+    snippet = (cut > 30 ? snippet.slice(0, cut) : snippet.slice(0, 58)).trim() + "\u2026";
+  }
   return `${first.verb} ${snippet}`;
 }
 
@@ -622,8 +743,12 @@ function buildDeterministicBody(
   lines.push(`Summary: ${desc} — ${files.length} ${fileWord}, +${totalAdd}/-${totalDel}.`);
   for (const h of hunks.slice(0, 15)) {
     const bits: string[] = [];
-    if (h.added.length > 0) bits.push(`+${h.addedCount} ${h.added[0]}`);
-    if (h.removed.length > 0) bits.push(`-${h.removedCount} ${h.removed[0]}`);
+    const addLine = firstInformativeLine(h.added);
+    const remLine = firstInformativeLine(h.removed);
+    if (addLine) bits.push(`+${h.addedCount} ${addLine}`);
+    if (remLine) bits.push(`-${h.removedCount} ${remLine}`);
+    if (bits.length === 0 && h.addedCount > 0) bits.push(`+${h.addedCount} lines`);
+    if (bits.length === 0 && h.removedCount > 0) bits.push(`-${h.removedCount} lines`);
     lines.push(`- ${h.file}: ${bits.join(", ")}`);
   }
   if (hunks.length > 15) lines.push(`- ... and ${hunks.length - 15} more files`);
@@ -636,17 +761,63 @@ function detectCommitType(
   files: string[],
   style: RepoCommitStyle,
 ): string {
-  let type = "chore";
-  if (files.some((f) => /\.(test|spec|e2e)\./.test(f) || f.startsWith("test")))
-    type = "test";
-  else if (files.some((f) => /\.(md|txt|rst)$/.test(f) || f.includes("doc")))
-    type = "docs";
-  else if (files.some((f) => f.includes("config") || f.includes("package")))
-    type = "chore";
-  else if (/(^|[^a-z])(fix|bug|error|crash|issue)([^a-z]|$)/i.test(diffContent))
-    type = "fix";
-  else if (/(^|[^a-z])(feat|feature|add|new|implement)([^a-z]|$)/i.test(diffContent))
+  const isTestFile = (f: string) =>
+    /\.(test|spec|e2e)\./.test(f) || /(^|\/)(test|tests|__tests__)(\/|$)/.test(f);
+  const isDocFile = (f: string) => /\.(md|txt|rst)$/.test(f) || f.includes("doc");
+  const isConfigFile = (f: string) =>
+    f.includes("config") ||
+    f.includes("package") ||
+    /\.(json|toml|ya?ml)$/.test(f) ||
+    // Dotfiles like .envrc, .gitignore, .envrc.example
+    /(^|\/)\.[a-z0-9-]+(\.example)?$/.test(f);
+
+  const testFiles = files.filter(isTestFile);
+  const docFiles = files.filter(isDocFile);
+  const codeFiles = files.filter(
+    (f) => !isTestFile(f) && !isDocFile(f) && !isConfigFile(f),
+  );
+
+  // Content evidence FIRST: analyze the actual added lines of the diff,
+  // never the file names alone. A feature that ships with its tests is a
+  // feat, not a test — the old test-regex-first ordering caused "test:"
+  // headers on feature commits (e.g. `test: add # ntfy push ...`).
+  const hunks = parseDiffHunks(diffContent).filter(
+    (h) => files.length === 0 || files.includes(h.file),
+  );
+  const addedText = hunks.flatMap((h) => h.added).join("\n").toLowerCase();
+
+  const hasFeatureSignal =
+    /(^|\b)(feat|feature|implement|implemented|implements|introduce|introduces|introduced|adds?\b|new (api|endpoint|module|function|class|feature|command|flag))(\b|$)/.test(
+      addedText,
+    ) ||
+    // New definitions/symbols in code lines.
+    /^\s*(export\s+)?(async\s+)?function\s+|^\s*(export\s+)?class\s+|^\s*(export\s+)?(const|let|var)\s+[a-z_$][\w$]*\s*=\s*(async\s*)?\(|^\s*(export\s+)?interface\s+|^\s*def\s+[a-z_]\w*\s*\(/m.test(
+      addedText,
+    );
+
+  const hasFixSignal =
+    /(^|\b)(fix(es|ed|ing)?|bug|bugfix|crash|regression|workaround)(\b|$)/.test(addedText);
+
+  let type: string;
+  if (hasFeatureSignal && codeFiles.length > 0) {
     type = "feat";
+  } else if (hasFixSignal && codeFiles.length > 0) {
+    type = "fix";
+  } else if (testFiles.length > 0 && codeFiles.length === 0) {
+    // Test-only change: no production code touched.
+    type = "test";
+  } else if (testFiles.length > 0 && testFiles.length > codeFiles.length) {
+    // Test-dominated change set (e.g. a test-suite overhaul with small
+    // supporting edits) and no stronger code-content signal.
+    type = "test";
+  } else if (docFiles.length > 0 && codeFiles.length === 0 && testFiles.length === 0) {
+    type = "docs";
+  } else if (files.length > 0 && codeFiles.length === 0 && testFiles.length === 0 && docFiles.length === 0) {
+    // Config/dotfile-only change.
+    type = "chore";
+  } else {
+    type = "chore";
+  }
 
   // Constrain to types the repo actually uses when style sampling is enabled:
   // if the heuristic type never appears in recent history, use the dominant one.
@@ -792,9 +963,9 @@ export function formatStyleContext(style: RepoCommitStyle): string {
 export function buildCommitMessagePrompt(
   diffStat: string,
   diffContent: string,
-  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
-  request?: MessageRequest,
+  opts: { style?: RepoCommitStyle; request?: MessageRequest; context?: string } = {},
 ): string {
+  const { style = EMPTY_COMMIT_STYLE, request, context } = opts;
   const truncatedDiff =
     diffContent.length > 8000
       ? diffContent.slice(0, 8000) + "\n... (truncated)"
@@ -810,10 +981,15 @@ export function buildCommitMessagePrompt(
     "",
     "Rules:",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
+    "- Choosing the type: feat = new capability or behavior; fix = correcting a bug; refactor = restructuring without behavior change; test = tests only; docs = documentation only; chore = build/config/tooling; perf = performance; style = formatting; ci = CI config; build = build system; revert = undoing a previous change.",
     "- Scope: use the single most-specific directory that groups the changes (e.g. 'api', 'config', 'exposure'). NEVER comma-join multiple scopes. If files span unrelated directories, OMIT scope entirely.",
     "- Description: a SHORT imperative phrase summarizing what was done. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- NEVER write generic filler. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes', 'update exposure: config'. The header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
     "- Body: explain what changed and WHY in a short paragraph, referencing specific code from the diff. Never restate the header verbatim.",
+    "- Example of a GOOD message:",
+    "  feat(api): add retry with exponential backoff",
+    "",
+    "  Retries failed requests up to 3 times with exponential backoff, surfacing the last error after exhausting attempts.",
     "- Max 72 chars for the header line (type + scope + description combined).",
     "- Output ONLY the commit message, nothing else.",
   ];
@@ -828,6 +1004,13 @@ export function buildCommitMessagePrompt(
       "",
       "User message request — the commit message MUST cover these points (where they apply to the diff):",
       requestText,
+    );
+  }
+  if (context) {
+    lines.push(
+      "",
+      "Session context — what the user is working on. Align the commit message with this intent where it applies to the diff, but NEVER claim changes the diff does not contain:",
+      context,
     );
   }
   lines.push("", "Diff stat:", diffStat, "", "Full diff:", truncatedDiff);
@@ -894,10 +1077,10 @@ export function resolveCommitMessage(
   diffStat: string,
   diffContent: string,
   files: string[],
-  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
-  allowDeterministic = false,
+  opts: { style?: RepoCommitStyle; allowDeterministic?: boolean } = {},
 ): string | undefined {
-  if (isValidCommitMessage(message)) return message;
+  const { style = EMPTY_COMMIT_STYLE, allowDeterministic = false } = opts;
+  if (isValidCommitMessage(message, true)) return message;
 
   if (!allowDeterministic) {
     console.error(
@@ -911,6 +1094,8 @@ export function resolveCommitMessage(
   );
   const fallback = deterministicCommitMessage(diffStat, diffContent, files, style);
   if (!fallback || !isValidCommitMessage(fallback)) {
+    // (Lenient check: the deterministic generator's headers may legitimately
+    // end in the enforceHeaderLimit truncation marker "…".)
     console.error(
       "[pi-committer] DIAG: deterministic regeneration produced no detailed valid message — blocking commit",
     );
@@ -956,6 +1141,25 @@ async function tryLoadSDK(): Promise<boolean> {
   }
 }
 
+/**
+ * Test seam (mirrors index.ts __setCreateAgentSessionMock): override the
+ * SDK's createAgentSession in-process so subagent message generation can be
+ * tested without real model calls. Passing undefined restores SDK loading.
+ */
+export function __setCreateAgentSessionFn(
+  fn:
+    | ((options?: Record<string, unknown>) => Promise<{ session: any }>)
+    | undefined,
+): void {
+  if (fn) {
+    createAgentSessionFn = fn;
+    sdkAvailable = true;
+  } else {
+    createAgentSessionFn = null;
+    sdkAvailable = false;
+  }
+}
+
 function makeResourceLoader() {
   return {
     getExtensions: () => ({
@@ -970,6 +1174,8 @@ function makeResourceLoader() {
     getSystemPrompt: () =>
       "You write clear, specific, detailed conventional git commit messages that describe exactly what changed and why.",
     getAppendSystemPrompt: () => [],
+    getSystemPromptSource: () => undefined,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };
@@ -982,39 +1188,25 @@ function makeResourceLoader() {
 async function runWorkerMessageSession(
   prompt: string,
   repoDir: string,
-  subagentModel?: string,
+  subagentModel?: WorkerSubagentModel,
   onProgress?: (output: string[]) => void,
   subagentThinkingLevel?: string,
 ): Promise<string> {
   try {
     if (aborted) return "";
 
-    // Resolve model
-    let model: any = undefined;
-    if (subagentModel) {
-      const slash = subagentModel.indexOf("/");
-      if (slash > 0) {
-        const provider = subagentModel.slice(0, slash);
-        const id = subagentModel.slice(slash + 1);
-        model = { provider, id };
-      }
-    }
+    // The full model object was resolved in the main process (mirrors the
+    // sync path's resolveSubagentModel); pass it through as-is.
+    const model: any = subagentModel;
 
     const cas = createAgentSessionFn;
     const result = await cas({
       cwd: repoDir,
       model,
       thinkingLevel: subagentThinkingLevel as any,
-      modelRegistry: {
-        getAvailable: () => (model ? [model] : []),
-        find: (p: string, i: string) => {
-          if (model && model.provider === p && model.id === i) return model;
-          return undefined;
-        },
-      },
       resourceLoader: makeResourceLoader(),
       sessionManager: SessionManagerCls.inMemory(repoDir),
-      settingsManager: SessionManagerCls.inMemory({
+      settingsManager: SettingsManagerCls.inMemory({
         compaction: { enabled: false },
       }),
       tools: [],
@@ -1082,18 +1274,41 @@ async function runWorkerMessageSession(
  * instructions before escalating to the content-driven deterministic
  * fallback.
  */
+/** Options for subagent/deterministic message generation. An options object
+ *  (rather than positional trailing args) makes it impossible to pass a
+ *  MessageRequest where `allowDeterministic` is expected — the exact bug that
+ *  once silently enabled deterministic messages while deterministic_fallback
+ *  was off. */
+interface MessageGenerationOptions {
+  /** Resolved session model for the subagent; unset skips the subagent. */
+  subagentModel?: WorkerSubagentModel;
+  onProgress?: (output: string[]) => void;
+  subagentThinkingLevel?: string;
+  style?: RepoCommitStyle;
+  /** Mirrors deterministic_fallback: deterministic output only when true. */
+  allowDeterministic?: boolean;
+  /** User commit-message intent (message/verbatim) forwarded to the prompt. */
+  request?: MessageRequest;
+  /** Session context (goal/task + recent conversation) for intent alignment. */
+  context?: string;
+}
+
 export async function generateCommitMessage(
   diffStat: string,
   diffContent: string,
   files: string[],
   repoDir: string,
-  subagentModel?: string,
-  onProgress?: (output: string[]) => void,
-  subagentThinkingLevel?: string,
-  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
-  allowDeterministic = false,
-  request?: MessageRequest,
+  opts: MessageGenerationOptions = {},
 ): Promise<string> {
+  const {
+    subagentModel,
+    onProgress,
+    subagentThinkingLevel,
+    style = EMPTY_COMMIT_STYLE,
+    allowDeterministic = false,
+    request,
+    context,
+  } = opts;
   const _sdkOk = await tryLoadSDK();
   if (!_sdkOk || !subagentModel) {
     console.error(
@@ -1101,10 +1316,10 @@ export async function generateCommitMessage(
         !_sdkOk ? "SDK unavailable" : "no model configured"
       }${allowDeterministic ? " — falling back to deterministic" : " — blocking commit (deterministic fallback disabled)"}`,
     );
-    return gatedDeterministicMessage(diffStat, diffContent, files, style, allowDeterministic);
+    return gatedDeterministicMessage({ diffStat, diffContent, files, style, allowDeterministic });
   }
 
-  const prompt = buildCommitMessagePrompt(diffStat, diffContent, style, request);
+  const prompt = buildCommitMessagePrompt(diffStat, diffContent, { style, request, context });
 
   let generated = await runWorkerMessageSession(
     prompt,
@@ -1113,7 +1328,7 @@ export async function generateCommitMessage(
     onProgress,
     subagentThinkingLevel,
   );
-  if (generated && !isValidCommitMessage(generated)) {
+  if (generated && !isValidCommitMessage(generated, true)) {
     console.error(
       "[pi-committer] DIAG: worker subagent output is not a valid conventional commit — retrying once with stricter instructions",
     );
@@ -1127,25 +1342,26 @@ export async function generateCommitMessage(
     );
   }
 
-  if (generated && isValidCommitMessage(generated)) return generated;
+  if (generated && isValidCommitMessage(generated, true)) return generated;
 
   console.error(
     "[pi-committer] DIAG: worker subagent output empty/invalid after retry" +
       (allowDeterministic ? " — escalating to deterministic content analysis" : " — blocking commit (deterministic fallback disabled)"),
   );
-  return gatedDeterministicMessage(diffStat, diffContent, files, style, allowDeterministic);
+  return gatedDeterministicMessage({ diffStat, diffContent, files, style, allowDeterministic });
 }
 
 /** Deterministic message when the deterministic_fallback gate is on, else ""
  *  (the caller's resolveCommitMessage then blocks the commit — the agent is
  *  required for every commit when the gate is off). */
-function gatedDeterministicMessage(
-  diffStat: string,
-  diffContent: string,
-  files: string[],
-  style: RepoCommitStyle,
-  allowDeterministic: boolean,
-): string {
+function gatedDeterministicMessage(opts: {
+  diffStat: string;
+  diffContent: string;
+  files: string[];
+  style: RepoCommitStyle;
+  allowDeterministic: boolean;
+}): string {
+  const { diffStat, diffContent, files, style, allowDeterministic } = opts;
   return allowDeterministic ? deterministicCommitMessage(diffStat, diffContent, files, style) : "";
 }
 
@@ -1157,13 +1373,17 @@ export async function generateCommitGroups(
   diffContent: string,
   allFiles: string[],
   repoDir: string,
-  subagentModel?: string,
-  onProgress?: (output: string[]) => void,
-  subagentThinkingLevel?: string,
-  style: RepoCommitStyle = EMPTY_COMMIT_STYLE,
-  allowDeterministic = false,
-  request?: MessageRequest,
+  opts: MessageGenerationOptions = {},
 ): Promise<Array<{ message: string; files: string[] }>> {
+  const {
+    subagentModel,
+    onProgress,
+    subagentThinkingLevel,
+    style = EMPTY_COMMIT_STYLE,
+    allowDeterministic = false,
+    request,
+    context,
+  } = opts;
   // Fallback: single group (SDK not available or no model configured)
   const _sdkOk = await tryLoadSDK();
   if (!_sdkOk || !subagentModel) {
@@ -1172,7 +1392,7 @@ export async function generateCommitGroups(
         !_sdkOk ? "SDK unavailable" : "no model configured"
       } — falling back to single commit`,
     );
-    const message = gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic);
+    const message = gatedDeterministicMessage({ diffStat, diffContent, files: allFiles, style, allowDeterministic });
     return [{ message, files: [...allFiles] }];
   }
 
@@ -1191,10 +1411,15 @@ export async function generateCommitGroups(
     "- Split unrelated changes into separate commits",
     "- Each commit must use conventional commit format: <type>(<scope>): <description>",
     "- Type must be one of: feat, fix, chore, docs, refactor, test, style, perf, ci, build, revert",
+    "- Choosing each group's type: feat = new capability or behavior; fix = correcting a bug; refactor = restructuring without behavior change; test = tests only; docs = documentation only; chore = build/config/tooling; perf = performance; style = formatting; ci = CI config; build = build system; revert = undoing a previous change.",
     "- Scope: use the single most-specific directory for each group (e.g. 'api', 'exposure', 'config'). NEVER comma-join multiple scopes. If files in a group span unrelated directories, OMIT scope.",
     "- Description: a SHORT imperative phrase summarizing what each group does. Be specific: 'add regression pipeline and tests', not 'update 27 modules'.",
     "- NEVER write generic filler in any group's header. Rejected examples: 'update file.ts', 'chore: update 3 files', 'feat: misc changes'. Each header must say exactly WHAT changed, referencing actual functions/symbols/values from the diff.",
     "- Body: for each group, write a short paragraph explaining what changed and WHY. Never restate the header verbatim.",
+    "- Example of a GOOD group header+body:",
+    "  feat(api): add retry with exponential backoff",
+    "",
+    "  Retries failed requests up to 3 times with exponential backoff, surfacing the last error after exhausting attempts.",
     "- Max 72 chars per header line (type + scope + description combined).",
     "- Assign each file to EXACTLY ONE group",
     "- Cover ALL files listed below in your groups",
@@ -1209,6 +1434,14 @@ export async function generateCommitGroups(
       "",
       "User message request — each commit message MUST cover these points where they apply to its group:",
       requestText,
+    );
+  }
+
+  if (context) {
+    prompt.push(
+      "",
+      "Session context — what the user is working on. Align each group's commit message with this intent where it applies to that group's diff, but NEVER claim changes the diff does not contain:",
+      context,
     );
   }
 
@@ -1241,29 +1474,14 @@ export async function generateCommitGroups(
   const promptStr = prompt.join("\n");
 
   try {
-    let model: any = undefined;
-    if (subagentModel) {
-      const slash = subagentModel.indexOf("/");
-      if (slash > 0) {
-        model = {
-          provider: subagentModel.slice(0, slash),
-          id: subagentModel.slice(slash + 1),
-        };
-      }
-    }
+    // Full model object resolved in the main process; pass through as-is.
+    const model: any = subagentModel;
 
     const cas = createAgentSessionFn;
     const result = await cas({
       cwd: repoDir,
       model,
       thinkingLevel: subagentThinkingLevel as any,
-      modelRegistry: {
-        getAvailable: () => (model ? [model] : []),
-        find: (p: string, i: string) => {
-          if (model && model.provider === p && model.id === i) return model;
-          return undefined;
-        },
-      },
       resourceLoader: makeResourceLoader(),
       sessionManager: SessionManagerCls.inMemory(repoDir),
       settingsManager: SettingsManagerCls.inMemory({
@@ -1308,7 +1526,7 @@ export async function generateCommitGroups(
 
     try {
       if (aborted) {
-        return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
+        return [{ message: gatedDeterministicMessage({ diffStat, diffContent, files: allFiles, style, allowDeterministic }), files: [...allFiles] }];
       }
       await session.prompt(promptStr);
     } finally {
@@ -1320,7 +1538,7 @@ export async function generateCommitGroups(
       console.error(
         `[pi-committer] DIAG: worker subagent grouping returned empty/short output (${output.length} chars) — falling back to single commit`,
       );
-      return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
+      return [{ message: gatedDeterministicMessage({ diffStat, diffContent, files: allFiles, style, allowDeterministic }), files: [...allFiles] }];
     }
 
     // Parse commit groups
@@ -1342,7 +1560,7 @@ export async function generateCommitGroups(
       console.error(
         `[pi-committer] DIAG: worker subagent grouping produced 0 parseable groups — falling back to single commit`,
       );
-      return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
+      return [{ message: gatedDeterministicMessage({ diffStat, diffContent, files: allFiles, style, allowDeterministic }), files: [...allFiles] }];
     }
 
     return groups;
@@ -1351,7 +1569,7 @@ export async function generateCommitGroups(
     console.error(
       `[pi-committer] DIAG: worker subagent grouping threw — falling back to single commit (${msg})`,
     );
-    return [{ message: gatedDeterministicMessage(diffStat, diffContent, allFiles, style, allowDeterministic), files: [...allFiles] }];
+    return [{ message: gatedDeterministicMessage({ diffStat, diffContent, files: allFiles, style, allowDeterministic }), files: [...allFiles] }];
   }
 }
 
@@ -1513,20 +1731,24 @@ export async function doSingleCommit(
     diffContent,
     files,
     dir,
-    skipSubagent ? undefined : params.subagentModel,
-    (output) => {
-      const onProg = ipc?.onProgress ?? sendProgress;
-      onProg({
-        phase: "committing",
-        statusMessage: `Generating commit message for ${files.length} file(s)...`,
-        subagent: { recentOutput: output },
-        totalCommits: 1,
-        completedCommits: 0,
-      });
+    {
+      subagentModel: skipSubagent ? undefined : params.subagentModel,
+      context: params.sessionContext ?? "",
+      onProgress: (output) => {
+        const onProg = ipc?.onProgress ?? sendProgress;
+        onProg({
+          phase: "committing",
+          statusMessage: `Generating commit message for ${files.length} file(s)...`,
+          subagent: { recentOutput: output },
+          totalCommits: 1,
+          completedCommits: 0,
+        });
+      },
+      subagentThinkingLevel: params.subagentThinkingLevel,
+      style,
+      allowDeterministic: params.deterministicFallback,
+      request,
     },
-    params.subagentThinkingLevel,
-    style,
-    request,
   );
 
   if (aborted) {
@@ -1542,8 +1764,7 @@ export async function doSingleCommit(
     diffStat,
     diffContent,
     files,
-    style,
-    params.deterministicFallback,
+    { style, allowDeterministic: params.deterministicFallback },
   );
   if (finalMessage === undefined) {
     console.error(
@@ -1578,6 +1799,7 @@ export async function doGroupedCommits(
   allFiles: string[],
   params: CommitWorkerParams,
   ipc?: CommitCallbacks,
+  request?: MessageRequest,
 ): Promise<{ commitCount: number; commitLog: CommitLogEntry[]; warnings: string[] }> {
   // Opt-in repo-style sampling: only when match_repo_style is enabled do we
   // read the repo's git history for style context (default: no git-log calls).
@@ -1588,20 +1810,23 @@ export async function doGroupedCommits(
     params.diffContent,
     allFiles,
     dir,
-    params.subagentModel,
-    (output) => {
-      const onProgAnalyze = ipc?.onProgress ?? sendProgress;
-      onProgAnalyze({
-        phase: "analyzing",
-        fileCount: allFiles.length,
-        statusMessage: `Analyzing ${allFiles.length} file(s) for logical commit grouping...`,
-        subagent: { recentOutput: output },
-      });
+    {
+      subagentModel: params.subagentModel,
+      context: params.sessionContext ?? "",
+      onProgress: (output) => {
+        const onProgAnalyze = ipc?.onProgress ?? sendProgress;
+        onProgAnalyze({
+          phase: "analyzing",
+          fileCount: allFiles.length,
+          statusMessage: `Analyzing ${allFiles.length} file(s) for logical commit grouping...`,
+          subagent: { recentOutput: output },
+        });
+      },
+      subagentThinkingLevel: params.subagentThinkingLevel,
+      style,
+      allowDeterministic: params.deterministicFallback,
+      request,
     },
-    params.subagentThinkingLevel,
-    style,
-    params.deterministicFallback,
-    request,
   );
 
   if (aborted) {
@@ -1665,20 +1890,24 @@ export async function doGroupedCommits(
         diffContent,
         stagedFiles,
         dir,
-        params.subagentModel,
-        (output) => {
-          const onProgGroup = ipc?.onProgress ?? sendProgress;
-          onProgGroup({
-            phase: "committing",
-            subagent: { recentOutput: output },
-            totalCommits: groups.length,
-            completedCommits: commitCount,
-            statusMessage: `Committing group ${commitCount + 1}/${groups.length}...`,
-          });
+        {
+          subagentModel: params.subagentModel,
+          context: params.sessionContext ?? "",
+          onProgress: (output) => {
+            const onProgGroup = ipc?.onProgress ?? sendProgress;
+            onProgGroup({
+              phase: "committing",
+              subagent: { recentOutput: output },
+              totalCommits: groups.length,
+              completedCommits: commitCount,
+              statusMessage: `Committing group ${commitCount + 1}/${groups.length}...`,
+            });
+          },
+          subagentThinkingLevel: params.subagentThinkingLevel,
+          style,
+          allowDeterministic: params.deterministicFallback,
+          request,
         },
-        params.subagentThinkingLevel,
-        style,
-        params.deterministicFallback,
       );
 
       if (aborted) {
@@ -1694,8 +1923,7 @@ export async function doGroupedCommits(
         diffStat,
         diffContent,
         stagedFiles,
-        style,
-        params.deterministicFallback,
+        { style, allowDeterministic: params.deterministicFallback },
       );
       if (finalMessage === undefined) {
         warnings.push(

@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.16.0] — 2026-08-11
+
+### Changed
+
+- **The commit pipeline was rewritten around immutable Git transactions**
+  (the reliability overhaul; see `docs/reliability-overhaul.md` and
+  `docs/reliability-overhaul-plan.md`). Every commit starts by capturing the
+  repository into a private alternate `GIT_INDEX_FILE`, so the user's real
+  index is never used as scratch space. Commit groups are then materialized
+  from Git objects with `git commit-tree`, and the target ref moves with
+  compare-and-swap `git update-ref <ref> <new> <expected-old>` — a concurrent
+  commit wins instead of being overwritten, and later worktree edits are
+  never absorbed into an in-flight commit.
+
+- **One commit engine for every execution path.** The sync path, the
+  background worker, tests, and grouping all call the same implementation
+  (`src/snapshot-engine.mjs` + `src/message-engine.mjs`); the mirrored logic
+  previously carried in `index.ts` and `async-commit-worker.ts` is no longer
+  loaded by Pi (the files remain temporarily as regression fixtures).
+
+- **File grouping is deterministic.** Files are split into code/test/docs/CI/
+  tooling groups; a model can only write message text for an already-fixed
+  immutable group, never decide which files belong to it. Plan validation
+  rejects unknown, duplicated, or omitted files.
+
+- **Background worker redesign.** The worker is plain `.mjs` (no jiti, no
+  TypeScript stripping) and receives the immutable snapshot, so it can safely
+  outlive the parent session. Results are journaled under
+  `.git/pi-committer-v2/results/` before IPC and recovered by later sessions;
+  cancellation is journaled and checked before the ref transaction point.
+
+- **Index reconciliation preserves concurrent work.** After a successful ref
+  move, unrelated concurrently staged paths and newer staged versions of the
+  same path are preserved; the index is replaced via Git's `index.lock`
+  protocol with an exact SHA-256 fingerprint check.
+
+### Added
+
+- **CI workflow** (`.github/workflows/ci.yml`): syntax checks + the
+  reliability suite on Node 20/22/24, and a regression job (typecheck +
+  historical suites) on Node 22/24.
+
+- **Deterministic test suites** that exercise real temporary git repositories
+  without models: race/cancellation guarantees of the snapshot engine, a
+  message-engine suite covering grouping invariants (every path exactly
+  once), deterministic message validity, private-index exclusions, and
+  model-free plan generation, plus sync/background e2e tests against the real
+  Pi extension entry.
+
+### Fixed
+
+- **Directory-style exclude patterns now match at any depth.** A pattern like
+  `node_modules/` excludes `src/node_modules/…` as well as a root
+  `node_modules/` (gitignore semantics), restoring the behavior of the
+  previous runtime.
+
 ## [0.15.1] — 2026-08-11
 
 ### Fixed

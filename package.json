@@ -24,8 +24,10 @@
     "automation"
   ],
   "dependencies": {
-    "smol-toml": "^1.3.0",
-    "typebox": "^1.3.12"
+    "smol-toml": "^1.3.0"
+  },
+  "peerDependencies": {
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
